@@ -10,7 +10,7 @@ use crate::render::lookup::resolve_module;
 use crate::render::util::{escape_label, mermaid_id};
 use ingester_core::{Atom, Relation};
 use polystore::{Direction, EntityId, GraphStore};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::Write as _;
 
 /// Render the module-zoom view of `target` against `store`.
@@ -20,6 +20,7 @@ use std::fmt::Write as _;
 /// - [`AstToMermaidError::InvalidInput`] when `target` doesn't resolve to a
 ///   unique module.
 /// - Any storage-layer error during the traversal.
+#[allow(clippy::too_many_lines)] // bulk fetch + render ordering reads cleaner inline
 pub async fn render<S>(store: &S, target: &str) -> Result<String>
 where
     S: GraphStore<Atom, Relation>,
@@ -37,64 +38,89 @@ where
         .unwrap_or("?")
         .to_owned();
 
-    // 1. Items inside the module via `contains` outgoing edges.
-    let mut item_ids: BTreeMap<String, EntityId> = BTreeMap::new();
-    let mut item_kinds: BTreeMap<String, String> = BTreeMap::new();
+    // 1. Items inside the module via `contains` outgoing edges, then bulk
+    //    fetch their atoms in one shot.
     let outs = store.neighbors(&module_id, Direction::Outgoing).await?;
+    let mut item_ids: BTreeMap<String, EntityId> = BTreeMap::new();
+    let mut contains_order: Vec<EntityId> = Vec::new();
     for (item_id, rel) in outs {
         if rel.kind != "contains" {
             continue;
         }
-        if let Some(atom) = store.get_node(&item_id).await? {
-            item_ids.insert(item_id.as_str().to_owned(), item_id.clone());
-            item_kinds.insert(item_id.as_str().to_owned(), atom.kind);
+        item_ids.insert(item_id.as_str().to_owned(), item_id.clone());
+        contains_order.push(item_id);
+    }
+    let item_atoms = store.get_nodes_bulk(&contains_order).await?;
+    let mut item_kinds: BTreeMap<String, String> = BTreeMap::new();
+    let mut item_atom_by_id: BTreeMap<String, Atom> = BTreeMap::new();
+    for (id, opt) in contains_order.iter().zip(item_atoms) {
+        if let Some(atom) = opt {
+            item_kinds.insert(id.as_str().to_owned(), atom.kind.clone());
+            item_atom_by_id.insert(id.as_str().to_owned(), atom);
         }
     }
+    // Drop ids without atoms (vanished entities).
+    item_ids.retain(|key, _| item_atom_by_id.contains_key(key));
     let inside_set: HashSet<String> = item_ids.values().map(|id| id.as_str().to_owned()).collect();
 
-    // 2. Outgoing call edges (item → function in other module).
+    // 2. Bulk-walk outgoing + incoming neighbors of all function items at
+    //    once, then bulk-fetch the external atoms referenced.
+    let function_items: Vec<EntityId> = item_ids
+        .iter()
+        .filter(|(k, _)| item_kinds.get(*k).is_some_and(|kind| kind == "function"))
+        .map(|(_, id)| id.clone())
+        .collect();
+    let out_neighbors = store
+        .neighbors_bulk(&function_items, Direction::Outgoing)
+        .await?;
+    let in_neighbors = store
+        .neighbors_bulk(&function_items, Direction::Incoming)
+        .await?;
+
+    let mut external_ids: Vec<EntityId> = Vec::new();
+    let mut outgoing_keys: Vec<(String, EntityId)> = Vec::new();
+    for (item_id, edges) in &out_neighbors {
+        let key = item_id.as_str().to_owned();
+        for (target_id, rel) in edges {
+            if rel.kind != "calls" || inside_set.contains(target_id.as_str()) {
+                continue;
+            }
+            external_ids.push(target_id.clone());
+            outgoing_keys.push((key.clone(), target_id.clone()));
+        }
+    }
+    let mut incoming_keys: Vec<(EntityId, String)> = Vec::new();
+    for (item_id, edges) in &in_neighbors {
+        let key = item_id.as_str().to_owned();
+        for (caller_id, rel) in edges {
+            if rel.kind != "calls" || inside_set.contains(caller_id.as_str()) {
+                continue;
+            }
+            external_ids.push(caller_id.clone());
+            incoming_keys.push((caller_id.clone(), key.clone()));
+        }
+    }
+    let external_atoms = store.get_nodes_bulk(&external_ids).await?;
+    let external_atom_by_id: HashMap<EntityId, Atom> = external_ids
+        .iter()
+        .zip(external_atoms)
+        .filter_map(|(id, opt)| opt.map(|a| (id.clone(), a)))
+        .collect();
+
     let mut outgoing: BTreeMap<(String, String), Atom> = BTreeMap::new();
-    for (key, item_id) in &item_ids {
-        let kind = item_kinds.get(key).cloned().unwrap_or_default();
-        if kind != "function" {
-            continue;
-        }
-        let calls_out = store.neighbors(item_id, Direction::Outgoing).await?;
-        for (target_id, rel) in calls_out {
-            if rel.kind != "calls" {
-                continue;
-            }
-            if inside_set.contains(target_id.as_str()) {
-                continue; // intra-module call, not an external arrow
-            }
-            if let Some(atom) = store.get_node(&target_id).await? {
-                outgoing.insert((key.clone(), target_id.as_str().to_owned()), atom);
-            }
+    for (key, ext_id) in outgoing_keys {
+        if let Some(atom) = external_atom_by_id.get(&ext_id) {
+            outgoing.insert((key, ext_id.as_str().to_owned()), atom.clone());
         }
     }
-
-    // 3. Incoming call edges (external function → item in module).
     let mut incoming: BTreeMap<(String, String), Atom> = BTreeMap::new();
-    for (key, item_id) in &item_ids {
-        let kind = item_kinds.get(key).cloned().unwrap_or_default();
-        if kind != "function" {
-            continue;
-        }
-        let callers = store.neighbors(item_id, Direction::Incoming).await?;
-        for (caller_id, rel) in callers {
-            if rel.kind != "calls" {
-                continue;
-            }
-            if inside_set.contains(caller_id.as_str()) {
-                continue;
-            }
-            if let Some(atom) = store.get_node(&caller_id).await? {
-                incoming.insert((caller_id.as_str().to_owned(), key.clone()), atom);
-            }
+    for (ext_id, key) in incoming_keys {
+        if let Some(atom) = external_atom_by_id.get(&ext_id) {
+            incoming.insert((ext_id.as_str().to_owned(), key), atom.clone());
         }
     }
 
-    // 4. Render Mermaid.
+    // 3. Render Mermaid.
     let subgraph_id = mermaid_id(&module_path);
     let mut mermaid = format!("graph TD\n    subgraph {subgraph_id}[\"");
     let header = escape_label(&format!("{module_label} ({module_path})"));
@@ -102,7 +128,7 @@ where
     mermaid.push_str("\"]\n");
     for (key, item_id) in &item_ids {
         let kind = item_kinds.get(key).cloned().unwrap_or_default();
-        if let Some(atom) = store.get_node(item_id).await? {
+        if let Some(atom) = item_atom_by_id.get(key) {
             let id = mermaid_id(item_id.as_str());
             let label = escape_label(&format!("{} {}", short_kind(&kind), atom.name));
             let shape = node_shape(&kind, &id, &label);
