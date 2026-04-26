@@ -52,58 +52,94 @@ pub async fn render<S>(store: &S) -> Result<String>
 where
     S: GraphStore<Atom, Relation>,
 {
-    // 1. Modules: gather (file_path, name, counts).
-    let module_ids = store.list_by_kind("module").await?;
-    // Keyed by file_path so two `mod.rs`-style modules don't collapse.
-    let mut modules: BTreeMap<String, (String, ModuleCounts)> = BTreeMap::new();
-    for mid in &module_ids {
-        let Some(matom) = store.get_node(mid).await? else {
-            continue;
-        };
-        let Some(path) = file_path_of(&matom).map(str::to_owned) else {
-            continue;
-        };
-        modules.insert(path, (matom.name.clone(), ModuleCounts::default()));
+    // 1. Bulk-list modules + functions in one shot. The contains-edge pass
+    //    needs the items themselves, so we fetch them via neighbors_bulk
+    //    rather than re-querying by kind.
+    let kind_groups = store.list_by_kinds(&["module", "function"]).await?;
+    let mut module_ids: Vec<EntityId> = Vec::new();
+    let mut function_ids: Vec<EntityId> = Vec::new();
+    for (kind, ids) in &kind_groups {
+        match kind.as_str() {
+            "module" => module_ids = ids.clone(),
+            "function" => function_ids = ids.clone(),
+            _ => {}
+        }
     }
 
-    // 2. Bump counts via outgoing `contains` edges from each module atom.
-    for mid in &module_ids {
-        let Some(matom) = store.get_node(mid).await? else {
-            continue;
-        };
+    // 2. Bulk-fetch modules + their contained items (via neighbors_bulk on
+    //    the module set). One round-trip each on a backend that overrides.
+    let module_atoms = store.get_nodes_bulk(&module_ids).await?;
+    let module_neighbors = store
+        .neighbors_bulk(&module_ids, Direction::Outgoing)
+        .await?;
+
+    // Collect all item ids referenced by `contains` so we can fetch their
+    // kinds in one more bulk get.
+    let mut item_ids: Vec<EntityId> = Vec::new();
+    for (_, outs) in &module_neighbors {
+        for (item_id, rel) in outs {
+            if rel.kind == "contains" {
+                item_ids.push(item_id.clone());
+            }
+        }
+    }
+    let item_atoms = store.get_nodes_bulk(&item_ids).await?;
+    let item_kind: HashMap<EntityId, String> = item_ids
+        .iter()
+        .zip(item_atoms)
+        .filter_map(|(id, opt)| opt.map(|a| (id.clone(), a.kind)))
+        .collect();
+
+    // Build modules map keyed by file_path (collapses by file).
+    let mut modules: BTreeMap<String, (String, ModuleCounts)> = BTreeMap::new();
+    let mut id_to_path: HashMap<EntityId, String> = HashMap::new();
+    for (mid, opt) in module_ids.iter().zip(module_atoms) {
+        let Some(matom) = opt else { continue };
         let Some(path) = file_path_of(&matom).map(str::to_owned) else {
             continue;
         };
-        let outs = store.neighbors(mid, Direction::Outgoing).await?;
+        id_to_path.insert(mid.clone(), path.clone());
+        modules
+            .entry(path)
+            .or_insert_with(|| (matom.name.clone(), ModuleCounts::default()));
+    }
+
+    // 3. Bump counts using the cached item kinds.
+    for (mid, outs) in &module_neighbors {
+        let Some(path) = id_to_path.get(mid) else {
+            continue;
+        };
+        let Some((_, counts)) = modules.get_mut(path) else {
+            continue;
+        };
         for (item_id, rel) in outs {
             if rel.kind != "contains" {
                 continue;
             }
-            let Some(item) = store.get_node(&item_id).await? else {
-                continue;
-            };
-            if let Some((_, counts)) = modules.get_mut(&path) {
-                counts.bump(&item.kind);
+            if let Some(kind) = item_kind.get(item_id) {
+                counts.bump(kind);
             }
         }
     }
 
-    // 3. Cross-module call edges.
+    // 4. Cross-module call edges. Bulk-fetch function atoms + their outgoing
+    //    edges to build a function_id → file_path cache and then aggregate.
+    let function_atoms = store.get_nodes_bulk(&function_ids).await?;
+    let fn_path_cache: HashMap<EntityId, String> = function_ids
+        .iter()
+        .zip(function_atoms)
+        .filter_map(|(id, opt)| {
+            opt.and_then(|a| file_path_of(&a).map(|p| (id.clone(), p.to_owned())))
+        })
+        .collect();
+    let function_neighbors = store
+        .neighbors_bulk(&function_ids, Direction::Outgoing)
+        .await?;
     let mut edges: BTreeMap<(String, String), usize> = BTreeMap::new();
-    let function_ids = store.list_by_kind("function").await?;
-    let mut fn_path_cache: HashMap<EntityId, String> = HashMap::new();
-    for fid in &function_ids {
-        if let Some(atom) = store.get_node(fid).await?
-            && let Some(p) = file_path_of(&atom)
-        {
-            fn_path_cache.insert(fid.clone(), p.to_owned());
-        }
-    }
-    for caller_id in &function_ids {
-        let Some(from_path) = fn_path_cache.get(caller_id).cloned() else {
+    for (caller_id, outs) in function_neighbors {
+        let Some(from_path) = fn_path_cache.get(&caller_id).cloned() else {
             continue;
         };
-        let outs = store.neighbors(caller_id, Direction::Outgoing).await?;
         for (target_id, rel) in outs {
             if rel.kind != "calls" {
                 continue;

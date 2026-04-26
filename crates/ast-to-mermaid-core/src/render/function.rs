@@ -7,7 +7,7 @@ use crate::error::Result;
 use crate::render::lookup::resolve_function;
 use crate::render::util::{escape_label, mermaid_id};
 use ingester_core::{Atom, Relation};
-use polystore::{Direction, GraphStore};
+use polystore::{Direction, EntityId, GraphStore};
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
@@ -26,23 +26,41 @@ where
         .await?
         .expect("resolve_function vouched the id exists");
 
+    // Walk both directions, collect every counterpart id with a `calls`
+    // edge, then bulk-fetch their atoms in a single round-trip.
+    let in_edges = store.neighbors(&center_id, Direction::Incoming).await?;
+    let out_edges = store.neighbors(&center_id, Direction::Outgoing).await?;
+
+    let incoming_ids: Vec<EntityId> = in_edges
+        .iter()
+        .filter(|(_, rel)| rel.kind == "calls")
+        .map(|(id, _)| id.clone())
+        .collect();
+    let outgoing_ids: Vec<EntityId> = out_edges
+        .iter()
+        .filter(|(_, rel)| rel.kind == "calls")
+        .map(|(id, _)| id.clone())
+        .collect();
+
+    let mut all_ids = incoming_ids.clone();
+    all_ids.extend(outgoing_ids.iter().cloned());
+    let atoms = store.get_nodes_bulk(&all_ids).await?;
+    let id_to_atom: std::collections::HashMap<EntityId, Atom> = all_ids
+        .iter()
+        .zip(atoms)
+        .filter_map(|(id, opt)| opt.map(|a| (id.clone(), a)))
+        .collect();
+
     let mut who_calls: BTreeMap<String, Atom> = BTreeMap::new();
-    for (other_id, rel) in store.neighbors(&center_id, Direction::Incoming).await? {
-        if rel.kind != "calls" {
-            continue;
-        }
-        if let Some(atom) = store.get_node(&other_id).await? {
-            who_calls.insert(other_id.as_str().to_owned(), atom);
+    for id in &incoming_ids {
+        if let Some(atom) = id_to_atom.get(id) {
+            who_calls.insert(id.as_str().to_owned(), atom.clone());
         }
     }
-
     let mut whom_called: BTreeMap<String, Atom> = BTreeMap::new();
-    for (other_id, rel) in store.neighbors(&center_id, Direction::Outgoing).await? {
-        if rel.kind != "calls" {
-            continue;
-        }
-        if let Some(atom) = store.get_node(&other_id).await? {
-            whom_called.insert(other_id.as_str().to_owned(), atom);
+    for id in &outgoing_ids {
+        if let Some(atom) = id_to_atom.get(id) {
+            whom_called.insert(id.as_str().to_owned(), atom.clone());
         }
     }
 

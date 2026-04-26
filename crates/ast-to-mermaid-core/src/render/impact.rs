@@ -36,25 +36,29 @@ where
 
     let paths = store.reverse_path(&target_id, hops).await?;
 
-    // Collect distinct nodes (with their atoms) and edges (caller → callee).
-    let mut nodes: BTreeMap<String, Option<Atom>> = BTreeMap::new();
+    // First pass: collect every distinct predecessor id seen across all paths
+    // + the edges. Second pass: bulk-fetch the atoms in one round-trip.
     let mut edges: BTreeSet<(String, String)> = BTreeSet::new();
-    nodes.insert(target_id.as_str().to_owned(), Some(target_atom.clone()));
-
+    let mut predecessor_ids: Vec<EntityId> = Vec::new();
+    let mut seen_predecessor: BTreeSet<String> = BTreeSet::new();
     for path in &paths {
-        // path[0] is the target; path[i+1] is a caller (predecessor) of path[i].
         for window in path.windows(2) {
             let downstream = &window[0];
             let predecessor = &window[1];
-            if !nodes.contains_key(predecessor.as_str()) {
-                let atom = store.get_node(predecessor).await?;
-                nodes.insert(predecessor.as_str().to_owned(), atom);
+            if seen_predecessor.insert(predecessor.as_str().to_owned()) {
+                predecessor_ids.push(predecessor.clone());
             }
             edges.insert((
                 predecessor.as_str().to_owned(),
                 downstream.as_str().to_owned(),
             ));
         }
+    }
+    let predecessor_atoms = store.get_nodes_bulk(&predecessor_ids).await?;
+    let mut nodes: BTreeMap<String, Option<Atom>> = BTreeMap::new();
+    nodes.insert(target_id.as_str().to_owned(), Some(target_atom.clone()));
+    for (id, opt) in predecessor_ids.iter().zip(predecessor_atoms) {
+        nodes.insert(id.as_str().to_owned(), opt);
     }
 
     let mut mermaid = String::from("graph BT\n");

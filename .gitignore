@@ -5,3 +5,4 @@ coverage/
 lcov.info
 *.profraw
 Cargo.lock
+.cargo/config.toml

@@ -6,9 +6,11 @@
 
 use crate::render::util::{crate_name, escape_label, mermaid_id};
 use ingester_core::{Atom, Relation};
-use polystore::{Direction, GraphStore, Result};
-use std::collections::BTreeMap;
+use polystore::{Direction, EntityId, GraphStore, Result};
+use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write as _;
+
+const KINDS: &[&str] = &["module", "function", "struct", "trait", "impl", "enum"];
 
 #[derive(Default, Debug, Clone, PartialEq, Eq)]
 struct CrateCounts {
@@ -60,38 +62,71 @@ pub async fn render<S>(store: &S) -> Result<String>
 where
     S: GraphStore<Atom, Relation>,
 {
-    // 1. Count entities per crate by walking each kind once.
-    let mut counts: BTreeMap<String, CrateCounts> = BTreeMap::new();
-    for kind in ["module", "function", "struct", "trait", "impl", "enum"] {
-        let ids = store.list_by_kind(kind).await?;
-        for id in &ids {
-            if let Some(atom) = store.get_node(id).await?
-                && let Some(c) = crate_of_atom(&atom)
-            {
-                counts.entry(c).or_default().bump(kind);
+    // 1. Bulk-list ids per kind (1 query for backends that override
+    //    list_by_kinds; falls back to N for default impls).
+    let kind_groups = store.list_by_kinds(KINDS).await?;
+
+    // Flatten + remember which ids are functions for the edge pass.
+    let mut all_ids = Vec::new();
+    let mut id_to_kind: HashMap<EntityId, &'static str> = HashMap::new();
+    let mut function_ids = Vec::new();
+    for (kind, ids) in &kind_groups {
+        let kind_lit = match kind.as_str() {
+            "module" => "module",
+            "function" => "function",
+            "struct" => "struct",
+            "trait" => "trait",
+            "impl" => "impl",
+            "enum" => "enum",
+            _ => continue,
+        };
+        for id in ids {
+            id_to_kind.insert(id.clone(), kind_lit);
+            if kind_lit == "function" {
+                function_ids.push(id.clone());
             }
+            all_ids.push(id.clone());
         }
     }
 
-    // 2. Aggregate cross-crate call edges (function → function across crates).
+    // 2. Bulk-fetch every node we need (1 query for backends that override).
+    let nodes = store.get_nodes_bulk(&all_ids).await?;
+    let id_to_atom: HashMap<EntityId, Atom> = all_ids
+        .iter()
+        .zip(nodes)
+        .filter_map(|(id, opt)| opt.map(|a| (id.clone(), a)))
+        .collect();
+
+    // 3. Counts per crate (purely from the in-memory map — zero queries).
+    let mut counts: BTreeMap<String, CrateCounts> = BTreeMap::new();
+    for (id, kind) in &id_to_kind {
+        if let Some(atom) = id_to_atom.get(id)
+            && let Some(c) = crate_of_atom(atom)
+        {
+            counts.entry(c).or_default().bump(kind);
+        }
+    }
+
+    // 4. Cross-crate edges (1 bulk neighbors query for the function set).
     let mut edges: BTreeMap<(String, String), usize> = BTreeMap::new();
-    let function_ids = store.list_by_kind("function").await?;
-    for caller_id in &function_ids {
-        let Some(caller_atom) = store.get_node(caller_id).await? else {
+    let neighbor_groups = store
+        .neighbors_bulk(&function_ids, Direction::Outgoing)
+        .await?;
+    for (caller_id, outs) in neighbor_groups {
+        let Some(caller_atom) = id_to_atom.get(&caller_id) else {
             continue;
         };
-        let Some(caller_crate) = crate_of_atom(&caller_atom) else {
+        let Some(caller_crate) = crate_of_atom(caller_atom) else {
             continue;
         };
-        let outs = store.neighbors(caller_id, Direction::Outgoing).await?;
         for (target_id, rel) in outs {
             if rel.kind != "calls" {
                 continue;
             }
-            let Some(target_atom) = store.get_node(&target_id).await? else {
+            let Some(target_atom) = id_to_atom.get(&target_id) else {
                 continue;
             };
-            let Some(target_crate) = crate_of_atom(&target_atom) else {
+            let Some(target_crate) = crate_of_atom(target_atom) else {
                 continue;
             };
             if target_crate != caller_crate {
