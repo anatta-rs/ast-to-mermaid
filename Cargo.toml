@@ -1,0 +1,38 @@
+[workspace]
+members = ["crates/*"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+authors = ["Anatta <noreply@anatta.dev>"]
+license = "Apache-2.0"
+repository = "https://github.com/anatta-rs/ast-to-mermaid"
+
+[workspace.dependencies]
+# Internal — bin crates depend on the core lib via path.
+ast-to-mermaid-core = { path = "crates/ast-to-mermaid-core" }
+
+# External — pinned at workspace level.
+polystore = { git = "https://github.com/anatta-rs/polystore", branch = "main" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2"
+tracing = "0.1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std", "io-util"] }
+
+# Dev-dep shared across crates.
+pretty_assertions = "1"
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+correctness = { level = "deny", priority = -1 }
+suspicious = { level = "warn", priority = -1 }
+complexity = { level = "warn", priority = -1 }
+perf = { level = "warn", priority = -1 }
+style = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"

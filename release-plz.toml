@@ -1,0 +1,50 @@
+# release-plz configuration
+# Docs: https://release-plz.dev/docs/config
+
+[workspace]
+publish = false
+git_release_enable = true
+git_release_type = "auto"
+changelog_update = true
+semver_check = false
+
+# All three crates move in lockstep — release-plz creates one Release PR.
+dependencies_update = true
+
+[changelog]
+header = """# Changelog
+
+All notable changes to this project will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+"""
+body = """
+
+## [{{ version | trim_start_matches(pat="v") }}]\
+  {%- if release_link -%}\
+    ({{ release_link }})\
+  {% endif %} - {{ timestamp | date(format="%Y-%m-%d") }}
+{% for group, commits in commits | group_by(attribute="group") %}
+### {{ group | upper_first }}
+{% for commit in commits %}
+- {% if commit.scope %}*({{ commit.scope }})* {% endif %}\
+    {{ commit.message | upper_first }}\
+{% endfor %}
+{% endfor %}
+"""
+commit_parsers = [
+  { message = "^feat", group = "Features" },
+  { message = "^fix", group = "Bug fixes" },
+  { message = "^perf", group = "Performance" },
+  { message = "^refactor", group = "Refactor" },
+  { message = "^doc", group = "Documentation" },
+  { message = "^test", group = "Tests" },
+  { message = "^chore\\(deps\\)", group = "Dependencies" },
+  { message = "^chore", skip = true },
+  { message = "^style", skip = true },
+  { message = "^ci", skip = true },
+  { body = ".*BREAKING CHANGE.*", group = "Breaking changes" },
+]
+filter_commits = false

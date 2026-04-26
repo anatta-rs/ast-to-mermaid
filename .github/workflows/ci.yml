@@ -1,0 +1,74 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all --check
+
+  clippy:
+    name: clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --all-targets --all-features -- -D warnings
+
+  test:
+    name: cargo test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --all-features --workspace
+
+  coverage:
+    name: coverage (>= 95%)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      - uses: Swatinem/rust-cache@v2
+      - name: Generate lcov + JSON summary
+        # Exclude bin crate `main.rs` files — 3-line wrappers, untestable without subprocess.
+        run: |
+          cargo llvm-cov --all-features --workspace --ignore-filename-regex 'main\.rs$' --lcov --output-path lcov.info
+          cargo llvm-cov --all-features --workspace --ignore-filename-regex 'main\.rs$' --json --summary-only > coverage.json
+      - name: Enforce coverage gate
+        run: |
+          PCT=$(jq -r '.data[0].totals.lines.percent' coverage.json)
+          echo "Line coverage: ${PCT}%"
+          python3 - <<EOF
+          import sys
+          pct = float("${PCT}")
+          threshold = 95.0
+          if pct < threshold:
+              print(f"::error::coverage {pct}% < {threshold}%")
+              sys.exit(1)
+          print(f"OK: {pct}% >= {threshold}%")
+          EOF
+      - uses: codecov/codecov-action@v4
+        with:
+          files: lcov.info
+          fail_ci_if_error: false
