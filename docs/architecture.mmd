@@ -1,0 +1,6 @@
+graph TD
+    ast_to_mermaid_cli["ast-to-mermaid-cli — 1 mod, 1 fn, 0 struct"]
+    ast_to_mermaid_core["ast-to-mermaid-core — 12 mod, 23 fn, 8 struct"]
+    ast_to_mermaid_mcp["ast-to-mermaid-mcp — 1 mod, 1 fn, 0 struct"]
+    ast_to_mermaid_cli -->|"1 calls"| ast_to_mermaid_core
+    ast_to_mermaid_mcp -->|"1 calls"| ast_to_mermaid_core
