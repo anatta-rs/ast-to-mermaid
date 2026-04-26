@@ -5,4 +5,4 @@
 
 pub mod memory;
 
-pub use memory::InMemoryStore;
+pub use memory::{InMemoryStore, ingest_parse_output};
