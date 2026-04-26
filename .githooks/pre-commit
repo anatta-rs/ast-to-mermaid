@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# Pre-commit hook — mirrors the fast CI checks for instant feedback.
+#
+# Runs: rustfmt + clippy pedantic + test (no coverage, that runs on pre-push).
+# Bypass with `git commit --no-verify` if you absolutely need to.
+set -e
+
+echo "[pre-commit] cargo fmt --check"
+cargo fmt --all --check
+
+echo "[pre-commit] cargo clippy"
+cargo clippy --all-targets --all-features -- -D warnings
+
+echo "[pre-commit] cargo test"
+cargo test --all-features --workspace
+
+echo "[pre-commit] OK"
