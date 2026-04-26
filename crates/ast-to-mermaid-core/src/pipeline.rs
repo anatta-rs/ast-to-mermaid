@@ -20,6 +20,10 @@ pub struct AnalyzeOptions {
     /// Required for `module` / `function` / `impact` levels: a module path
     /// or name, or a function name. Ignored by `project` / `overview`.
     pub target: Option<String>,
+    /// Extra directory names (matched on the basename) to skip during the
+    /// walk. Always combined with the built-in skip set
+    /// (`target`, `node_modules`, `.git`, any dotfile dir).
+    pub exclude: Vec<String>,
     /// Tenant scope to attribute the in-memory store to. Defaults aren't
     /// useful for analysis output, but downstream tooling may surface it.
     pub scope: Scope,
@@ -30,6 +34,7 @@ impl Default for AnalyzeOptions {
         Self {
             level: Level::Project,
             target: None,
+            exclude: Vec::new(),
             scope: Scope::new("local", "local", "main"),
         }
     }
@@ -68,7 +73,7 @@ pub async fn analyze(root: &Path, opts: &AnalyzeOptions) -> Result<AnalyzeReport
         )));
     }
 
-    let files = walk_for_languages(root)?;
+    let files = walk_for_languages_with_exclude(root, &opts.exclude)?;
     let store = InMemoryStore::new(opts.scope.clone());
 
     let mut atoms_indexed = 0;
@@ -110,13 +115,35 @@ pub async fn analyze(root: &Path, opts: &AnalyzeOptions) -> Result<AnalyzeReport
 ///
 /// Propagates any I/O error from the walk.
 pub fn walk_for_languages(root: &Path) -> Result<Vec<(PathBuf, Language)>> {
+    walk_for_languages_with_exclude::<&str>(root, &[])
+}
+
+/// Same as [`walk_for_languages`] but skips any directory whose basename
+/// matches an entry in `extra_exclude`. The built-in skip set
+/// (`target`, `node_modules`, `.git`, any dotfile dir) is always applied
+/// on top.
+///
+/// # Errors
+///
+/// Propagates any I/O error from the walk.
+pub fn walk_for_languages_with_exclude<S: AsRef<str>>(
+    root: &Path,
+    extra_exclude: &[S],
+) -> Result<Vec<(PathBuf, Language)>> {
+    let extra: Vec<&str> = extra_exclude.iter().map(AsRef::as_ref).collect();
     let mut out = Vec::new();
-    walk_into(root, &mut out)?;
+    walk_into(root, &extra, &mut out)?;
     out.sort_by(|a, b| a.0.cmp(&b.0));
     Ok(out)
 }
 
-fn walk_into(dir: &Path, out: &mut Vec<(PathBuf, Language)>) -> Result<()> {
+fn is_excluded(name: &str, extra_exclude: &[&str]) -> bool {
+    matches!(name, "target" | "node_modules" | ".git")
+        || name.starts_with('.')
+        || extra_exclude.contains(&name)
+}
+
+fn walk_into(dir: &Path, extra_exclude: &[&str], out: &mut Vec<(PathBuf, Language)>) -> Result<()> {
     if dir.is_file() {
         if let Some(lang) = language_for(dir) {
             out.push((dir.to_path_buf(), lang));
@@ -134,10 +161,10 @@ fn walk_into(dir: &Path, out: &mut Vec<(PathBuf, Language)>) -> Result<()> {
         let path = entry.path();
         let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
         if path.is_dir() {
-            if matches!(name, "target" | "node_modules" | ".git") || name.starts_with('.') {
+            if is_excluded(name, extra_exclude) {
                 continue;
             }
-            walk_into(&path, out)?;
+            walk_into(&path, extra_exclude, out)?;
         } else if path.is_file()
             && let Some(lang) = language_for(&path)
         {
@@ -293,6 +320,7 @@ mod tests {
             &AnalyzeOptions {
                 level: Level::Project,
                 target: None,
+                exclude: Vec::new(),
                 scope: Scope::new("ns", "repo", "branch"),
             },
         )
@@ -348,6 +376,65 @@ mod tests {
             .await
             .expect_err("must reject");
         assert!(matches!(err, AstToMermaidError::InvalidInput(_)));
+    }
+
+    #[test]
+    fn walk_exclude_skips_named_dir() {
+        let tmp = tempdir().expect("tmp");
+        let root = tmp.path();
+        write(root, "src/a.rs", "fn a() {}");
+        write(root, "vendor/junk.rs", "fn dont_parse() {}");
+        write(root, "workspaces/inner.rs", "fn dont_parse() {}");
+
+        // Default: vendor/ + workspaces/ are walked (not in built-in skip set).
+        let default = walk_for_languages(root).expect("walk");
+        assert_eq!(default.len(), 3, "default should walk all 3");
+
+        // With exclude: skip vendor + workspaces.
+        let filtered =
+            walk_for_languages_with_exclude(root, &["vendor", "workspaces"]).expect("walk");
+        assert_eq!(filtered.len(), 1);
+        assert!(filtered[0].0.to_string_lossy().ends_with("a.rs"));
+    }
+
+    #[test]
+    fn walk_exclude_does_not_override_builtin_skip_set() {
+        let tmp = tempdir().expect("tmp");
+        let root = tmp.path();
+        write(root, "src/a.rs", "fn a() {}");
+        write(root, "target/junk.rs", "fn dont_parse() {}");
+
+        // target/ is always skipped, with or without explicit exclude.
+        let no_exclude = walk_for_languages(root).expect("walk");
+        let with_exclude = walk_for_languages_with_exclude(root, &["unrelated"]).expect("walk");
+        assert_eq!(no_exclude.len(), 1);
+        assert_eq!(with_exclude.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn analyze_with_exclude_skips_directory() {
+        let tmp = tempdir().expect("tmp");
+        let root = tmp.path();
+        write(root, "src/main.rs", "pub fn main() {}");
+        write(root, "vendor/lib.rs", "pub fn vendored() {}");
+
+        // Without exclude: 2 files.
+        let report = analyze(root, &AnalyzeOptions::default())
+            .await
+            .expect("analyze");
+        assert_eq!(report.files_parsed, 2);
+
+        // With exclude: 1 file (vendored skipped).
+        let report = analyze(
+            root,
+            &AnalyzeOptions {
+                exclude: vec!["vendor".to_owned()],
+                ..AnalyzeOptions::default()
+            },
+        )
+        .await
+        .expect("analyze");
+        assert_eq!(report.files_parsed, 1);
     }
 
     #[test]

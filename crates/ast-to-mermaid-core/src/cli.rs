@@ -88,6 +88,7 @@ fn run_analyze(args: &[String]) -> ExitCode {
     let opts = AnalyzeOptions {
         level: parsed.level,
         target: parsed.target.clone(),
+        exclude: parsed.exclude.clone(),
         ..AnalyzeOptions::default()
     };
 
@@ -126,6 +127,7 @@ struct AnalyzeArgs {
     path: PathBuf,
     level: Level,
     target: Option<String>,
+    exclude: Vec<String>,
     out: Option<PathBuf>,
 }
 
@@ -134,6 +136,7 @@ impl AnalyzeArgs {
         let mut path: Option<PathBuf> = None;
         let mut level = Level::Project;
         let mut target: Option<String> = None;
+        let mut exclude: Vec<String> = Vec::new();
         let mut out: Option<PathBuf> = None;
 
         let mut i = 0;
@@ -154,6 +157,18 @@ impl AnalyzeArgs {
                         .get(i + 1)
                         .ok_or_else(|| format!("{arg} requires a value"))?;
                     target = Some(val.clone());
+                    i += 2;
+                }
+                "--exclude" | "-x" => {
+                    let val = args
+                        .get(i + 1)
+                        .ok_or_else(|| format!("{arg} requires a value"))?;
+                    exclude.extend(
+                        val.split(',')
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                            .map(str::to_owned),
+                    );
                     i += 2;
                 }
                 "--out" | "-o" => {
@@ -184,6 +199,7 @@ impl AnalyzeArgs {
             path,
             level,
             target,
+            exclude,
             out,
         })
     }
@@ -200,13 +216,18 @@ fn print_usage() {
 }
 
 fn print_analyze_usage() {
-    println!("usage: ast-to-mermaid analyze <path> [--level LVL] [--target NAME] [--out FILE]");
+    println!(
+        "usage: ast-to-mermaid analyze <path> [--level LVL] [--target NAME] [--exclude DIRS] [--out FILE]"
+    );
     println!();
     println!("flags:");
     println!("  -l, --level    project | overview | module | function | impact");
     println!("                 (default: project)");
     println!("  -t, --target   required for module/function/impact:");
     println!("                 module path/name or function name/id");
+    println!("  -x, --exclude  comma-separated dir basenames to skip on top of");
+    println!("                 the built-in skip set (target, node_modules, .git,");
+    println!("                 dotfile dirs). E.g. --exclude workspaces,vendor");
     println!("  -o, --out      write to FILE instead of stdout");
 }
 
