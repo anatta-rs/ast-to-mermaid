@@ -13,12 +13,17 @@ repository = "https://github.com/anatta-rs/ast-to-mermaid"
 # Internal — bin crates depend on the core lib via path.
 ast-to-mermaid-core = { path = "crates/ast-to-mermaid-core" }
 
-# External — pinned at workspace level.
+# External anatta-rs deps — pinned to main branch for fast iteration pre-1.0.
 polystore = { git = "https://github.com/anatta-rs/polystore", branch = "main" }
+ingester-core = { git = "https://github.com/anatta-rs/ingester", branch = "main" }
+ingester-code = { git = "https://github.com/anatta-rs/ingester", branch = "main" }
+
+# Foundational external deps.
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 thiserror = "2"
 tracing = "0.1"
+async-trait = "0.1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std", "io-util"] }
 
 # Dev-dep shared across crates.
