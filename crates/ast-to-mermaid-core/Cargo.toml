@@ -1,0 +1,21 @@
+[package]
+name = "ast-to-mermaid-core"
+description = "Core library: parser, renderer, resolver, and storage impls for ast-to-mermaid"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+polystore = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+pretty_assertions = { workspace = true }
+
+[lints]
+workspace = true

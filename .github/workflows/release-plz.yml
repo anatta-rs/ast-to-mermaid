@@ -1,0 +1,39 @@
+name: Release-plz
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+env:
+  CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+
+concurrency:
+  group: release-plz-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release-plz:
+    name: release-plz
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.POLYSTORE_DEPLOY_KEY }}
+
+      - name: Use SSH for anatta-rs private deps
+        run: git config --global url."git@github.com:anatta-rs/".insteadOf "https://github.com/anatta-rs/"
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: MarcoIeni/release-plz-action@v0.5
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
