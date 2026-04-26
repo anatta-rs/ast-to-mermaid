@@ -1,14 +1,23 @@
 //! Mermaid renderers driven by a [`polystore::GraphStore`] populated with
 //! ingester atoms.
 //!
-//! v0.2 ships two levels:
+//! v0.3 ships five levels:
 //! - [`Level::Project`] — one node per crate with `(modules, functions,
 //!   structs)` counts, plus cross-crate `calls` edges.
 //! - [`Level::Overview`] — one node per module with `(functions, structs,
 //!   traits)` counts, plus cross-module `calls` edges.
-//!
-//! Three more levels (module / function / impact) are scheduled for v0.3.
+//! - [`Level::Module`] (target = module path or name) — one subgraph for
+//!   the target module containing all its items, plus external nodes for
+//!   incoming callers and outgoing callees.
+//! - [`Level::Function`] (target = function name or id) — central target
+//!   node with direct callers (in) and callees (out).
+//! - [`Level::Impact`] (target = function name or id) — reverse call chain
+//!   walked back N hops (default 3) — answers "who breaks if I change this?".
 
+mod function;
+mod impact;
+pub mod lookup;
+mod module;
 mod overview;
 mod project;
 pub mod util;
@@ -19,6 +28,8 @@ use polystore::GraphStore;
 use std::fmt;
 use std::str::FromStr;
 
+pub use impact::DEFAULT_HOPS;
+
 /// Which view to render.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Level {
@@ -26,6 +37,12 @@ pub enum Level {
     Project,
     /// One node per module, cross-module `calls` edges.
     Overview,
+    /// Subgraph for one module + its external in/out callers.
+    Module,
+    /// Central target function + direct callers/callees.
+    Function,
+    /// Reverse call chain from target up to N hops.
+    Impact,
 }
 
 impl Level {
@@ -35,7 +52,16 @@ impl Level {
         match self {
             Self::Project => "project",
             Self::Overview => "overview",
+            Self::Module => "module",
+            Self::Function => "function",
+            Self::Impact => "impact",
         }
+    }
+
+    /// Whether this level requires a `--target` argument from the caller.
+    #[must_use]
+    pub fn requires_target(self) -> bool {
+        matches!(self, Self::Module | Self::Function | Self::Impact)
     }
 }
 
@@ -51,30 +77,44 @@ impl FromStr for Level {
         match s {
             "project" => Ok(Self::Project),
             "overview" => Ok(Self::Overview),
+            "module" => Ok(Self::Module),
+            "function" => Ok(Self::Function),
+            "impact" => Ok(Self::Impact),
             other => Err(AstToMermaidError::InvalidInput(format!(
-                "unknown render level: {other:?} (expected: project | overview)"
+                "unknown render level: {other:?} (expected: project | overview | module | function | impact)"
             ))),
         }
     }
 }
 
-/// Render `level` against `store`. Returns the Mermaid source.
+/// Render `level` against `store`. `target` is required for module / function
+/// / impact levels and ignored for project / overview.
 ///
 /// # Errors
 ///
-/// - [`AstToMermaidError::Storage`] for any storage-layer error during
-///   the read traversal.
-/// - [`AstToMermaidError::InvalidInput`] for unknown levels (only via
-///   [`Level::from_str`]).
-pub async fn render<S>(level: Level, store: &S) -> AtmResult<String>
+/// - [`AstToMermaidError::InvalidInput`] when a target is required but absent
+///   or doesn't resolve.
+/// - Any storage-layer error during the read traversal.
+pub async fn render<S>(level: Level, store: &S, target: Option<&str>) -> AtmResult<String>
 where
     S: GraphStore<Atom, Relation>,
 {
     let s = match level {
         Level::Project => project::render(store).await?,
         Level::Overview => overview::render(store).await?,
+        Level::Module => module::render(store, require_target(level, target)?).await?,
+        Level::Function => function::render(store, require_target(level, target)?).await?,
+        Level::Impact => {
+            impact::render(store, require_target(level, target)?, DEFAULT_HOPS).await?
+        }
     };
     Ok(s)
+}
+
+fn require_target(level: Level, target: Option<&str>) -> AtmResult<&str> {
+    target.ok_or_else(|| {
+        AstToMermaidError::InvalidInput(format!("level={level} requires a --target argument"))
+    })
 }
 
 #[cfg(test)]
@@ -89,23 +129,45 @@ mod tests {
 
     #[test]
     fn level_as_str_and_display() {
-        assert_eq!(Level::Project.as_str(), "project");
-        assert_eq!(Level::Overview.as_str(), "overview");
-        assert_eq!(Level::Project.to_string(), "project");
-        assert_eq!(format!("{}", Level::Overview), "overview");
+        for (lvl, s) in [
+            (Level::Project, "project"),
+            (Level::Overview, "overview"),
+            (Level::Module, "module"),
+            (Level::Function, "function"),
+            (Level::Impact, "impact"),
+        ] {
+            assert_eq!(lvl.as_str(), s);
+            assert_eq!(lvl.to_string(), s);
+        }
     }
 
     #[test]
     fn level_from_str_known() {
-        assert_eq!("project".parse::<Level>().expect("ok"), Level::Project);
-        assert_eq!("overview".parse::<Level>().expect("ok"), Level::Overview);
+        for (s, lvl) in [
+            ("project", Level::Project),
+            ("overview", Level::Overview),
+            ("module", Level::Module),
+            ("function", Level::Function),
+            ("impact", Level::Impact),
+        ] {
+            assert_eq!(s.parse::<Level>().expect("ok"), lvl);
+        }
     }
 
     #[test]
     fn level_from_str_unknown_errors() {
-        let err = "module".parse::<Level>().expect_err("unknown");
+        let err = "graph".parse::<Level>().expect_err("unknown");
         assert!(matches!(err, AstToMermaidError::InvalidInput(_)));
-        assert!(err.to_string().contains("module"));
+        assert!(err.to_string().contains("graph"));
+    }
+
+    #[test]
+    fn requires_target_per_variant() {
+        assert!(!Level::Project.requires_target());
+        assert!(!Level::Overview.requires_target());
+        assert!(Level::Module.requires_target());
+        assert!(Level::Function.requires_target());
+        assert!(Level::Impact.requires_target());
     }
 
     #[test]
@@ -122,12 +184,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn render_dispatches_to_correct_level() {
+    async fn render_dispatches_project_and_overview_without_target() {
         let store = InMemoryStore::new(scope());
-        let project = render(Level::Project, &store).await.expect("project");
-        let overview = render(Level::Overview, &store).await.expect("overview");
-        // Both empty stores yield only the graph header.
+        let project = render(Level::Project, &store, None).await.expect("project");
+        let overview = render(Level::Overview, &store, None)
+            .await
+            .expect("overview");
         assert_eq!(project, "graph TD\n");
         assert_eq!(overview, "graph TD\n");
+    }
+
+    #[tokio::test]
+    async fn render_target_required_for_zoom_levels() {
+        let store = InMemoryStore::new(scope());
+        for lvl in [Level::Module, Level::Function, Level::Impact] {
+            let err = render(lvl, &store, None)
+                .await
+                .expect_err("must require target");
+            assert!(err.to_string().contains("--target"));
+        }
     }
 }

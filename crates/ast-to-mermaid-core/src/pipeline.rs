@@ -17,6 +17,9 @@ use std::path::{Path, PathBuf};
 pub struct AnalyzeOptions {
     /// Mermaid view to render.
     pub level: Level,
+    /// Required for `module` / `function` / `impact` levels: a module path
+    /// or name, or a function name. Ignored by `project` / `overview`.
+    pub target: Option<String>,
     /// Tenant scope to attribute the in-memory store to. Defaults aren't
     /// useful for analysis output, but downstream tooling may surface it.
     pub scope: Scope,
@@ -26,6 +29,7 @@ impl Default for AnalyzeOptions {
     fn default() -> Self {
         Self {
             level: Level::Project,
+            target: None,
             scope: Scope::new("local", "local", "main"),
         }
     }
@@ -88,7 +92,7 @@ pub async fn analyze(root: &Path, opts: &AnalyzeOptions) -> Result<AnalyzeReport
     }
 
     let edges_resolved = resolve_cross_module_calls(&store).await?;
-    let mermaid = render(opts.level, &store).await?;
+    let mermaid = render(opts.level, &store, opts.target.as_deref()).await?;
 
     Ok(AnalyzeReport {
         mermaid,
@@ -288,6 +292,7 @@ mod tests {
             root,
             &AnalyzeOptions {
                 level: Level::Project,
+                target: None,
                 scope: Scope::new("ns", "repo", "branch"),
             },
         )
