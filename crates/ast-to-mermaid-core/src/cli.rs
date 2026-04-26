@@ -87,6 +87,7 @@ fn run_analyze(args: &[String]) -> ExitCode {
 
     let opts = AnalyzeOptions {
         level: parsed.level,
+        target: parsed.target.clone(),
         ..AnalyzeOptions::default()
     };
 
@@ -124,6 +125,7 @@ fn run_analyze(args: &[String]) -> ExitCode {
 struct AnalyzeArgs {
     path: PathBuf,
     level: Level,
+    target: Option<String>,
     out: Option<PathBuf>,
 }
 
@@ -131,6 +133,7 @@ impl AnalyzeArgs {
     fn parse(args: &[String]) -> Result<Self, String> {
         let mut path: Option<PathBuf> = None;
         let mut level = Level::Project;
+        let mut target: Option<String> = None;
         let mut out: Option<PathBuf> = None;
 
         let mut i = 0;
@@ -144,6 +147,13 @@ impl AnalyzeArgs {
                     level = val
                         .parse::<Level>()
                         .map_err(|e| format!("invalid --level: {e}"))?;
+                    i += 2;
+                }
+                "--target" | "-t" => {
+                    let val = args
+                        .get(i + 1)
+                        .ok_or_else(|| format!("{arg} requires a value"))?;
+                    target = Some(val.clone());
                     i += 2;
                 }
                 "--out" | "-o" => {
@@ -167,7 +177,15 @@ impl AnalyzeArgs {
         }
 
         let path = path.ok_or_else(|| "missing <path>".to_owned())?;
-        Ok(Self { path, level, out })
+        if level.requires_target() && target.is_none() {
+            return Err(format!("level={level} requires --target"));
+        }
+        Ok(Self {
+            path,
+            level,
+            target,
+            out,
+        })
     }
 }
 
@@ -182,11 +200,14 @@ fn print_usage() {
 }
 
 fn print_analyze_usage() {
-    println!("usage: ast-to-mermaid analyze <path> [--level project|overview] [--out FILE]");
+    println!("usage: ast-to-mermaid analyze <path> [--level LVL] [--target NAME] [--out FILE]");
     println!();
     println!("flags:");
-    println!("  -l, --level   Mermaid view to render (default: project)");
-    println!("  -o, --out     Write to FILE instead of stdout");
+    println!("  -l, --level    project | overview | module | function | impact");
+    println!("                 (default: project)");
+    println!("  -t, --target   required for module/function/impact:");
+    println!("                 module path/name or function name/id");
+    println!("  -o, --out      write to FILE instead of stdout");
 }
 
 #[cfg(test)]
