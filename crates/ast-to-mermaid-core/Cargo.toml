@@ -16,10 +16,12 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 async-trait = { workspace = true }
+tokio = { workspace = true }
 
 [dev-dependencies]
 pretty_assertions = { workspace = true }
 tokio = { workspace = true }
+tempfile = "3"
 
 [lints]
 workspace = true
