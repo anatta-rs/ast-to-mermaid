@@ -19,6 +19,7 @@
 pub mod cli;
 pub mod error;
 pub mod mcp;
+pub mod render;
 pub mod resolve;
 pub mod store;
 
@@ -26,5 +27,6 @@ pub use error::{AstToMermaidError, Result};
 pub use ingester_code::CodeParser;
 pub use ingester_core::{Atom, AtomId, Origin, ParseOutput, Parser, Relation};
 pub use polystore::{Direction, EntityId, GraphStore, KvStore, Scope, VectorHit, VectorStore};
+pub use render::{Level, render};
 pub use resolve::resolve_cross_module_calls;
 pub use store::InMemoryStore;
