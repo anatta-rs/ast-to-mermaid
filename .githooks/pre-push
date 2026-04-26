@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# Pre-push hook — mirrors full CI including the coverage gate (>= 95%).
+#
+# Slower than pre-commit (runs llvm-cov instrumentation). Bypass with
+# `git push --no-verify` if you need to push WIP for backup.
+set -e
+
+echo "[pre-push] make ci"
+make ci
+
+echo "[pre-push] OK"

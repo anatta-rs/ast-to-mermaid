@@ -39,6 +39,20 @@ make coverage-gate  # fails if line coverage < 95%
 make ci             # everything
 ```
 
+## Local git hooks
+
+Mirror CI checks before they hit the server:
+
+```bash
+make hooks    # one-time setup after clone
+```
+
+This sets `core.hooksPath` to `.githooks/`, installing:
+- **pre-commit**: `cargo fmt --check`, `cargo clippy -D warnings`, `cargo test --workspace` (~5–15 s)
+- **pre-push**: `make ci` (above + coverage gate ≥ 95%) (~30–60 s)
+
+Bypass with `git commit --no-verify` / `git push --no-verify` only if absolutely needed.
+
 ## Branch policy
 
 - `main` is always shippable. CI must be green.
