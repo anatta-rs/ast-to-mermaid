@@ -1,0 +1,22 @@
+graph TD
+    crates_ast_to_mermaid_cli_src_main_rs["main — 1 fn"]
+    crates_ast_to_mermaid_core_src_cli_rs["cli — 4 fn, 1 struct, 0 trait"]
+    crates_ast_to_mermaid_core_src_error_rs["error — 0 fn"]
+    crates_ast_to_mermaid_core_src_lib_rs["lib — 0 fn"]
+    crates_ast_to_mermaid_core_src_mcp_rs["mcp — 1 fn"]
+    crates_ast_to_mermaid_core_src_pipeline_rs["pipeline — 5 fn, 2 struct, 0 trait"]
+    crates_ast_to_mermaid_core_src_render_mod_rs["mod — 1 fn"]
+    crates_ast_to_mermaid_core_src_render_overview_rs["overview — 2 fn, 1 struct, 0 trait"]
+    crates_ast_to_mermaid_core_src_render_project_rs["project — 2 fn, 1 struct, 0 trait"]
+    crates_ast_to_mermaid_core_src_render_util_rs["util — 3 fn"]
+    crates_ast_to_mermaid_core_src_resolve_rs["resolve — 3 fn"]
+    crates_ast_to_mermaid_core_src_store_memory_rs["memory — 2 fn, 3 struct, 0 trait"]
+    crates_ast_to_mermaid_core_src_store_mod_rs["mod — 0 fn"]
+    crates_ast_to_mermaid_mcp_src_main_rs["main — 1 fn"]
+    crates_ast_to_mermaid_cli_src_main_rs -->|"1"| crates_ast_to_mermaid_core_src_cli_rs
+    crates_ast_to_mermaid_core_src_cli_rs -->|"1"| crates_ast_to_mermaid_core_src_pipeline_rs
+    crates_ast_to_mermaid_core_src_pipeline_rs -->|"1"| crates_ast_to_mermaid_core_src_resolve_rs
+    crates_ast_to_mermaid_core_src_pipeline_rs -->|"1"| crates_ast_to_mermaid_core_src_store_memory_rs
+    crates_ast_to_mermaid_core_src_render_overview_rs -->|"2"| crates_ast_to_mermaid_core_src_render_util_rs
+    crates_ast_to_mermaid_core_src_render_project_rs -->|"3"| crates_ast_to_mermaid_core_src_render_util_rs
+    crates_ast_to_mermaid_mcp_src_main_rs -->|"1"| crates_ast_to_mermaid_core_src_mcp_rs
