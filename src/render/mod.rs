@@ -120,7 +120,7 @@ fn require_target(level: Level, target: Option<&str>) -> AtmResult<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::InMemoryStore;
+    use crate::graph::InMemoryStore;
     use polystore::Scope;
 
     fn scope() -> Scope {

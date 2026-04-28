@@ -194,7 +194,7 @@ fn node_shape(kind: &str, id: &str, label: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::{InMemoryStore, ingest_parse_output};
+    use crate::graph::{InMemoryStore, ingest_parse_output};
     use ingester_core::{AtomId, ParseOutput};
     use polystore::Scope;
 

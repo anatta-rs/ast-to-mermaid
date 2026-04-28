@@ -242,7 +242,7 @@ fn crate_root(atom: &Atom) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::{InMemoryStore, ingest_parse_output};
+    use crate::graph::{InMemoryStore, ingest_parse_output};
     use ingester_core::ParseOutput;
     use polystore::Scope;
 

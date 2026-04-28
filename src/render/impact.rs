@@ -88,7 +88,7 @@ fn _ensure_id_used(_: EntityId) {}
 mod tests {
     use super::*;
     use crate::error::AstToMermaidError;
-    use crate::store::{InMemoryStore, ingest_parse_output};
+    use crate::graph::{InMemoryStore, ingest_parse_output};
     use ingester_core::{AtomId, ParseOutput};
     use polystore::{EntityId, Scope};
 

@@ -1,39 +1,58 @@
-[workspace]
-members = ["crates/*"]
-resolver = "2"
-
-[workspace.package]
+[package]
+name = "ast-to-mermaid"
+description = "Mermaid diagram renderer for code ASTs — 5 levels (project/overview/module/function/impact) with cross-language support"
 version = "0.1.0"
 edition = "2024"
 authors = ["Anatta <noreply@anatta.dev>"]
 license = "Apache-2.0"
 repository = "https://github.com/anatta-rs/ast-to-mermaid"
 
-[workspace.dependencies]
-# Internal — bin crates depend on the core lib via path.
-ast-to-mermaid-core = { path = "crates/ast-to-mermaid-core" }
-
-# External anatta-rs deps — pinned to main branch for fast iteration pre-1.0.
+[dependencies]
 polystore = { git = "https://github.com/anatta-rs/polystore", branch = "main" }
 ingester-core = { git = "https://github.com/anatta-rs/ingester", branch = "main" }
 ingester-code = { git = "https://github.com/anatta-rs/ingester", branch = "main" }
-
-# Foundational external deps.
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 thiserror = "2"
 tracing = "0.1"
 async-trait = "0.1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std", "io-util"] }
+clap = { version = "4", features = ["derive"] }
 
-# Dev-dep shared across crates.
+[dev-dependencies]
 pretty_assertions = "1"
+tempfile = "3"
+tokio = { version = "1", features = ["macros", "rt"] }
 
-[workspace.lints.rust]
+[[bin]]
+name = "a2m-project"
+path = "src/bin/a2m-project.rs"
+
+[[bin]]
+name = "a2m-overview"
+path = "src/bin/a2m-overview.rs"
+
+[[bin]]
+name = "a2m-module"
+path = "src/bin/a2m-module.rs"
+
+[[bin]]
+name = "a2m-function"
+path = "src/bin/a2m-function.rs"
+
+[[bin]]
+name = "a2m-impact"
+path = "src/bin/a2m-impact.rs"
+
+[[bin]]
+name = "a2m-walk"
+path = "src/bin/a2m-walk.rs"
+
+[lints.rust]
 unsafe_code = "deny"
 missing_docs = "warn"
 
-[workspace.lints.clippy]
+[lints.clippy]
 correctness = { level = "deny", priority = -1 }
 suspicious = { level = "warn", priority = -1 }
 complexity = { level = "warn", priority = -1 }

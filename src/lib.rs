@@ -1,34 +1,31 @@
-//! Core library for ast-to-mermaid.
+//! ast-to-mermaid — Mermaid diagram renderer for code ASTs.
 //!
 //! Wires the [`ingester`](https://github.com/anatta-rs/ingester) parsers into
 //! a [`polystore`](https://github.com/anatta-rs/polystore)-backed graph and
 //! renders [Mermaid](https://mermaid.js.org) diagrams from it.
 //!
-//! v0.2 ships:
-//! - Re-exports of polystore traits + ingester atom types.
-//! - [`store::InMemoryStore`] — in-memory `GraphStore<Atom, Relation>`.
-//! - CLI dispatch (still stubs — analyze lands in v0.3).
-//! - MCP entry point stub.
-//!
-//! Renderer + resolver + concrete CLI implementations land in subsequent PRs
-//! as the MVP path completes.
+//! Five rendering levels:
+//! - [`Level::Project`] — one node per crate, cross-crate calls.
+//! - [`Level::Overview`] — one node per module, cross-module calls.
+//! - [`Level::Module`] — subgraph for one module + external callers/callees.
+//! - [`Level::Function`] — central function + direct callers/callees.
+//! - [`Level::Impact`] — reverse call chain (N hops, default 3).
 
 #![warn(missing_docs)]
 #![deny(unsafe_code)]
 
-pub mod cli;
+pub mod cli_support;
 pub mod error;
-pub mod mcp;
+pub mod graph;
 pub mod pipeline;
 pub mod render;
 pub mod resolve;
-pub mod store;
 
 pub use error::{AstToMermaidError, Result};
+pub use graph::InMemoryStore;
 pub use ingester_code::CodeParser;
 pub use ingester_core::{Atom, AtomId, Origin, ParseOutput, Parser, Relation};
 pub use pipeline::{AnalyzeOptions, AnalyzeReport, analyze};
 pub use polystore::{Direction, EntityId, GraphStore, KvStore, Scope, VectorHit, VectorStore};
 pub use render::{Level, render};
 pub use resolve::resolve_cross_module_calls;
-pub use store::InMemoryStore;
