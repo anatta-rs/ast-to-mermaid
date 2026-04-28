@@ -1,8 +1,15 @@
 .PHONY: fmt fmt-check lint test coverage coverage-summary coverage-gate check ci clean hooks
 
-# Exclude `main.rs` files of bin crates from coverage — they're 3-line wrappers
-# that delegate to the core lib (which IS tested).
-COVERAGE_IGNORE := 'main\.rs$$'
+# Coverage exclusions:
+#  - main.rs / src/bin/*.rs : thin clap-parse + delegate-to-lib wrappers.
+#                             The lib IS tested.
+#  - sibling-repo paths     : when [patch] points at workspaces/ingester or
+#                             workspaces/polystore in local dev, those files
+#                             show up in the report and drag the gate down.
+#                             They have their own coverage gates in their own
+#                             repos. CI doesn't have those paths, so this is
+#                             purely a local-dev safeguard.
+COVERAGE_IGNORE := '(main|bin/[^/]+)\.rs$$|workspaces/(ingester|polystore|dork|pm)/'
 
 fmt:
 	cargo fmt --all
