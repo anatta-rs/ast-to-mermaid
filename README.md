@@ -1,39 +1,90 @@
 # ast-to-mermaid
 
-Tree-sitter → graph → Mermaid pipeline for code analysis.
+Tree-sitter-based code graph + Mermaid renderer. Five zoom levels (project / overview / module / function / impact) for multi-language code analysis.
 
-Multi-tenant (Namespace / Repo / Branch), pluggable storage via [polystore](https://github.com/anatta-rs/polystore) traits, embedded SurrealDB by default, MCP server + CLI.
+## Quick start
 
-## Status
+```bash
+# Analyze a Rust project, output Mermaid
+a2m-project ./my-rust-repo > graph.mmd
 
-`v0.1.0` — **scaffold only**. Workspace structure + CI + tooling. Parser, renderer, resolver, store impls, MCP server, CLI commands all land in subsequent PRs.
+# Focus on a single module
+a2m-module ./my-rust-repo src/lib.rs > module.mmd
+
+# Show reverse call chain into a function
+a2m-function ./my-rust-repo parse_config > callers.mmd
+
+# Show forward + backward impact from a function
+a2m-impact ./my-rust-repo execute > impact.mmd
+```
+
+Example Mermaid output:
+
+```mermaid
+graph LR
+  lib["my_lib<br/>(4 mods, 12 fns)"]
+  io["my_io<br/>(2 mods, 8 fns)"]
+  lib -->|calls| io
+```
+
+## Five zoom levels
+
+| Level | Binary | What it shows |
+|-------|--------|---------------|
+| **Project** | `a2m-project` | All crates/modules + cross-crate call edges (birds-eye) |
+| **Overview** | `a2m-overview` | Top-level module structure with function/struct/trait counts |
+| **Module** | `a2m-module <path>` | One module's items + intra-module calls + external callers/callees |
+| **Function** | `a2m-function <name>` | Central function + direct callers (reverse chain, N hops) |
+| **Impact** | `a2m-impact <name>` | Reverse + forward call chain from a function (default 3 hops) |
+
+Plus `a2m-walk` — filesystem traversal helpers for integration scripts.
+
+## Languages
+
+- **Rust** (via tree-sitter-rust)
+- **Python** (via tree-sitter-python)
+
+Parsers provided by [ingester-code](https://github.com/anatta-rs/ingester-code).
+
+## Architecture
+
+```
+ingester-code (tree-sitter)
+         ↓
+   CodeParser
+         ↓
+polystore::GraphStore<CodeAtom, CallEdge> (in-memory)
+         ↓
+   render per Level
+         ↓
+  Mermaid string
+```
+
+**Pipeline**: Parse directory → build in-memory graph via polystore traits → resolve cross-module calls → render at requested zoom level → emit Mermaid (stdout or file).
+
+**No MCP server**: CLI-only architecture. One binary per analysis level (dispatch on `Level` enum).
 
 ## Workspace
 
-```
-crates/
-  ast-to-mermaid-core/   # lib: parser + render + resolve + GraphStore impls
-  ast-to-mermaid-cli/    # bin: standalone CLI
-  ast-to-mermaid-mcp/    # bin: MCP server (stdio JSON-RPC)
-```
+| Crate | Type | Purpose |
+|-------|------|---------|
+| `ast-to-mermaid-core` | lib | Parser, renderer, resolver, in-memory store, public API |
+| `ast-to-mermaid-cli` | bin | 6 verb-named binaries (a2m-*) |
+| ~~`ast-to-mermaid-mcp`~~ | (dropped) | — |
 
-The `core` crate is the only public lib; the two bin crates are thin wrappers over `core`.
+The `core` crate is the only public lib; CLI is thin dispatch over `core::render::Level`.
 
-## Backends
+## Status
 
-Three impls of the polystore traits will ship in `core`:
+`v0.2.x` shipped with 5 zoom levels + 6 binaries.
 
-| Backend | GraphStore | KvStore | VectorStore | Use case |
-|---|---|---|---|---|
-| InMemory | ✓ | ✓ | ✓ (linear) | tests, smoke |
-| SurrealDB embedded | ✓ | ✓ | ✓ (HNSW) | default standalone |
-| External (DI) | — | — | — | downstream plugs (e.g. Anatta) |
+**Next major** (v0.3+): refactor to remove polystore internal dependency, emit rich 4-layer artifacts (AST → CFG → PDG → impact graph).
 
 ## Quality gates
 
-- `make check` → fmt + clippy (pedantic) + test
+- `make check` → cargo fmt + clippy (pedantic) + test
 - `make coverage-gate` → enforces ≥ 95% line coverage
-- CI runs all of the above + automated versioning via [release-plz](https://release-plz.dev)
+- CI: fmt, clippy, test, coverage + release-plz versioning
 
 ## License
 
