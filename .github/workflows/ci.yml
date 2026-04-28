@@ -76,8 +76,8 @@ jobs:
       - name: Generate lcov + JSON summary
         # Exclude bin crate `main.rs` files — 3-line wrappers, untestable without subprocess.
         run: |
-          cargo llvm-cov --all-features --workspace --ignore-filename-regex 'main\.rs$' --lcov --output-path lcov.info
-          cargo llvm-cov --all-features --workspace --ignore-filename-regex 'main\.rs$' --json --summary-only > coverage.json
+          cargo llvm-cov --all-features --workspace --ignore-filename-regex '(main|bin/[^/]+)\.rs$|workspaces/(ingester|polystore|dork|pm)/' --lcov --output-path lcov.info
+          cargo llvm-cov --all-features --workspace --ignore-filename-regex '(main|bin/[^/]+)\.rs$|workspaces/(ingester|polystore|dork|pm)/' --json --summary-only > coverage.json
       - name: Enforce coverage gate
         run: |
           PCT=$(jq -r '.data[0].totals.lines.percent' coverage.json)

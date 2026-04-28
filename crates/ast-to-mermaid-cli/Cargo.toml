@@ -7,12 +7,44 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[lib]
+path = "src/lib.rs"
+
 [[bin]]
 name = "ast-to-mermaid"
 path = "src/main.rs"
 
+[[bin]]
+name = "a2m-project"
+path = "src/bin/a2m-project.rs"
+
+[[bin]]
+name = "a2m-overview"
+path = "src/bin/a2m-overview.rs"
+
+[[bin]]
+name = "a2m-module"
+path = "src/bin/a2m-module.rs"
+
+[[bin]]
+name = "a2m-function"
+path = "src/bin/a2m-function.rs"
+
+[[bin]]
+name = "a2m-impact"
+path = "src/bin/a2m-impact.rs"
+
+[[bin]]
+name = "a2m-walk"
+path = "src/bin/a2m-walk.rs"
+
 [dependencies]
 ast-to-mermaid-core = { workspace = true }
+clap = { version = "4", features = ["derive"] }
+tokio = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }
 
 [lints]
 workspace = true
