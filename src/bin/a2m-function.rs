@@ -8,9 +8,8 @@
 #![warn(missing_docs)]
 #![deny(unsafe_code)]
 
-use ast_to_mermaid_cli::{AnalyzeFlags, run_analyze};
-use ast_to_mermaid_core::cli::ExitCode;
-use ast_to_mermaid_core::render::Level;
+use ast_to_mermaid::cli_support::{AnalyzeFlags, ExitCode, run_analyze};
+use ast_to_mermaid::render::Level;
 use clap::Parser;
 
 #[derive(Parser)]

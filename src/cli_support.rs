@@ -1,18 +1,35 @@
-//! Shared internals for the `a2m-*` CLI family.
+//! Shared CLI infrastructure for the `a2m-*` binary family.
 //!
 //! Each Mermaid level (project / overview / module / function / impact)
 //! ships as its own binary so users can tab-complete a verb that maps
-//! directly to a level. This library carries the bits they all share:
-//! arg shape, the analyze-and-write helper, the file walker bin's
-//! formatter.
+//! directly to a level. This module carries the bits they all share:
+//! exit codes, arg shape, and the analyze-and-write helper.
 
-#![warn(missing_docs)]
-#![deny(unsafe_code)]
-
-use ast_to_mermaid_core::cli::ExitCode;
-use ast_to_mermaid_core::pipeline::{AnalyzeOptions, analyze};
-use ast_to_mermaid_core::render::Level;
+use crate::pipeline::{AnalyzeOptions, analyze};
+use crate::render::Level;
 use std::path::PathBuf;
+use std::process;
+
+/// Exit code returned by CLI functions, convertible into [`process::ExitCode`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExitCode {
+    /// Command succeeded.
+    Success,
+    /// Command failed at runtime (e.g. parse error, IO error).
+    Failure,
+    /// User error (unknown subcommand, bad flags).
+    UsageError,
+}
+
+impl From<ExitCode> for process::ExitCode {
+    fn from(c: ExitCode) -> Self {
+        match c {
+            ExitCode::Success => Self::SUCCESS,
+            ExitCode::Failure => Self::FAILURE,
+            ExitCode::UsageError => Self::from(2),
+        }
+    }
+}
 
 /// Shared CLI args for every `a2m-*` analyze binary.
 #[derive(Debug, Clone, clap::Args)]

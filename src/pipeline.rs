@@ -4,9 +4,9 @@
 //! [`InMemoryStore`] for the v0.2 MVP.
 
 use crate::error::{AstToMermaidError, Result};
+use crate::graph::{InMemoryStore, ingest_parse_output};
 use crate::render::{Level, render};
 use crate::resolve::resolve_cross_module_calls;
-use crate::store::{InMemoryStore, ingest_parse_output};
 use ingester_code::{CodeParser, Language};
 use ingester_core::{Origin, Parser};
 use polystore::Scope;

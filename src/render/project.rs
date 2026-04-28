@@ -158,7 +158,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::{InMemoryStore, ingest_parse_output};
+    use crate::graph::{InMemoryStore, ingest_parse_output};
     use ingester_core::{AtomId, ParseOutput};
     use polystore::Scope;
 

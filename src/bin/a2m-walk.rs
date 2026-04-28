@@ -9,7 +9,7 @@
 #![warn(missing_docs)]
 #![deny(unsafe_code)]
 
-use ast_to_mermaid_core::pipeline::walk_for_languages_with_exclude;
+use ast_to_mermaid::pipeline::walk_for_languages_with_exclude;
 use clap::Parser;
 use std::path::PathBuf;
 
