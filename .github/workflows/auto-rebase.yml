@@ -1,0 +1,54 @@
+name: auto-rebase
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  rebase:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure git
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+
+      - name: Rebase all open PRs onto main
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          PRS=$(gh pr list --base main --state open --json number,headRefName --jq '.[] | "\(.number)\t\(.headRefName)"')
+          if [ -z "$PRS" ]; then
+            echo "No open PRs."
+            exit 0
+          fi
+          while IFS=$'\t' read -r num branch; do
+            echo "::group::PR #$num — branch $branch"
+            if ! git fetch origin "$branch"; then
+              gh pr comment "$num" --body "auto-rebase: cannot fetch \`$branch\` (cross-fork PR?). Skipping."
+              echo "::endgroup::"
+              continue
+            fi
+            git checkout -B "$branch" "origin/$branch"
+            if git rebase origin/main; then
+              if git push --force-with-lease origin "$branch"; then
+                echo "✓ rebased PR #$num"
+              else
+                gh pr comment "$num" --body "auto-rebase: \`force-push --force-with-lease\` refused. Manual rebase needed."
+              fi
+            else
+              git rebase --abort
+              gh pr comment "$num" --body "auto-rebase: conflict on rebase against \`main\`. Manual rebase needed."
+            fi
+            echo "::endgroup::"
+          done <<< "$PRS"
