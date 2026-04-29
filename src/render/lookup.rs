@@ -1,13 +1,13 @@
-//! Resolve user-friendly target strings to concrete atom ids.
+//! Resolve user-friendly target strings to concrete [`EntityId`]s.
 //!
 //! The CLI / MCP layer accepts targets like `"CodeParser"` or
-//! `"crates/foo/src/lib.rs"`. These helpers walk the [`GraphStore`] and
+//! `"crates/foo/src/lib.rs"`. These helpers walk the [`Store`] and
 //! return the matching `EntityId`, or an error listing the candidates when
 //! the input is ambiguous.
 
 use crate::error::{AstToMermaidError, Result};
-use ingester_core::{Atom, Relation};
-use polystore::{EntityId, GraphStore};
+use crate::graph::Store;
+use crate::model::EntityId;
 
 /// Resolve a target string to a `module` atom id.
 ///
@@ -25,46 +25,38 @@ use polystore::{EntityId, GraphStore};
 /// Panics on internal `Vec` invariants we just established (`len==1` after
 /// match) — these expects are safety nets for changes to the surrounding
 /// logic, never reachable through normal use.
-pub async fn resolve_module<S>(store: &S, target: &str) -> Result<EntityId>
-where
-    S: GraphStore<Atom, Relation>,
-{
+pub fn resolve_module(store: &Store, target: &str) -> Result<EntityId> {
     if target.is_empty() {
         return Err(AstToMermaidError::InvalidInput(
             "module target cannot be empty".to_owned(),
         ));
     }
 
-    let module_ids = store.list_by_kind("module").await?;
+    let modules = store.atoms_by_kind("module");
 
     // Pass 1: exact id.
-    for id in &module_ids {
-        if id.as_str() == target {
-            return Ok(id.clone());
+    for m in &modules {
+        if m.id.as_str() == target {
+            return Ok(m.id.clone());
         }
     }
 
     // Pass 2: file_path match (only when target looks path-like).
     if target.contains('/') {
-        for id in &module_ids {
-            if let Some(atom) = store.get_node(id).await?
-                && let Some(p) = atom.metadata.get("file_path").and_then(|v| v.as_str())
-                && p == target
-            {
-                return Ok(id.clone());
+        for m in &modules {
+            if m.file_path == target {
+                return Ok(m.id.clone());
             }
         }
     }
 
     // Pass 3: name match (must be unique).
-    let mut matches: Vec<EntityId> = Vec::new();
-    for id in &module_ids {
-        if let Some(atom) = store.get_node(id).await?
-            && atom.name == target
-        {
-            matches.push(id.clone());
-        }
-    }
+    let matches: Vec<EntityId> = modules
+        .iter()
+        .filter(|m| m.name == target)
+        .map(|m| m.id.clone())
+        .collect();
+
     match matches.len() {
         0 => Err(AstToMermaidError::InvalidInput(format!(
             "no module found matching {target:?}"
@@ -97,32 +89,27 @@ where
 ///
 /// Panics on internal `Vec` invariants we just established (`len==1` after
 /// match) — never reachable through normal use.
-pub async fn resolve_function<S>(store: &S, target: &str) -> Result<EntityId>
-where
-    S: GraphStore<Atom, Relation>,
-{
+pub fn resolve_function(store: &Store, target: &str) -> Result<EntityId> {
     if target.is_empty() {
         return Err(AstToMermaidError::InvalidInput(
             "function target cannot be empty".to_owned(),
         ));
     }
 
-    let function_ids = store.list_by_kind("function").await?;
+    let functions = store.atoms_by_kind("function");
 
-    for id in &function_ids {
-        if id.as_str() == target {
-            return Ok(id.clone());
+    for f in &functions {
+        if f.id.as_str() == target {
+            return Ok(f.id.clone());
         }
     }
 
-    let mut matches: Vec<EntityId> = Vec::new();
-    for id in &function_ids {
-        if let Some(atom) = store.get_node(id).await?
-            && atom.name == target
-        {
-            matches.push(id.clone());
-        }
-    }
+    let matches: Vec<EntityId> = functions
+        .iter()
+        .filter(|f| f.name == target)
+        .map(|f| f.id.clone())
+        .collect();
+
     match matches.len() {
         0 => Err(AstToMermaidError::InvalidInput(format!(
             "no function found matching {target:?}"
@@ -144,159 +131,156 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::graph::{InMemoryStore, ingest_parse_output};
-    use ingester_core::{AtomId, ParseOutput};
-    use polystore::Scope;
+    use crate::graph::Store;
+    use crate::model::{CodeAtom, EntityId};
 
-    fn scope() -> Scope {
-        Scope::new("ns", "repo", "branch")
-    }
-
-    fn module(file_path: &str, name: &str) -> Atom {
-        Atom::new(
-            AtomId::new(format!("code:{file_path}")),
-            "module",
-            name,
-            "h",
-        )
-        .with_metadata(serde_json::json!({"file_path": file_path}))
-    }
-
-    fn function(file_path: &str, name: &str) -> Atom {
-        Atom::new(
-            AtomId::new(format!("code:{file_path}::function::{name}")),
-            "function",
-            name,
-            "h",
-        )
-        .with_metadata(serde_json::json!({"file_path": file_path}))
-    }
-
-    fn output_with(atoms: Vec<Atom>) -> ParseOutput {
-        ParseOutput {
-            atoms,
-            ..ParseOutput::default()
+    fn module(id: &str, file_path: &str, name: &str) -> CodeAtom {
+        CodeAtom {
+            id: EntityId::new(id),
+            kind: "module".to_owned(),
+            name: name.to_owned(),
+            file_path: file_path.to_owned(),
+            line_start: 1,
+            line_end: 1,
+            doc: String::new(),
+            signature: String::new(),
+            content_hash: "h".to_owned(),
+            calls: Vec::new(),
         }
     }
 
-    async fn make_store(atoms: Vec<Atom>) -> InMemoryStore {
-        let store = InMemoryStore::new(scope());
-        ingest_parse_output(&store, &output_with(atoms))
-            .await
-            .expect("ingest");
-        store
+    fn function(id: &str, file_path: &str, name: &str) -> CodeAtom {
+        CodeAtom {
+            id: EntityId::new(id),
+            kind: "function".to_owned(),
+            name: name.to_owned(),
+            file_path: file_path.to_owned(),
+            line_start: 1,
+            line_end: 10,
+            doc: String::new(),
+            signature: String::new(),
+            content_hash: "h".to_owned(),
+            calls: Vec::new(),
+        }
     }
 
-    #[tokio::test]
-    async fn resolve_module_empty_target_errors() {
-        let store = make_store(vec![]).await;
-        let err = resolve_module(&store, "")
-            .await
-            .expect_err("empty rejected");
+    #[test]
+    fn resolve_module_empty_target_errors() {
+        let store = Store::new();
+        let err = resolve_module(&store, "").expect_err("empty rejected");
         assert!(matches!(err, AstToMermaidError::InvalidInput(_)));
     }
 
-    #[tokio::test]
-    async fn resolve_module_by_exact_id() {
-        let store = make_store(vec![module("src/foo.rs", "foo")]).await;
-        let id = resolve_module(&store, "code:src/foo.rs").await.expect("ok");
+    #[test]
+    fn resolve_module_by_exact_id() {
+        let store = Store::new();
+        store.add_atom(module("code:src/foo.rs", "src/foo.rs", "foo"));
+        let id = resolve_module(&store, "code:src/foo.rs").expect("ok");
         assert_eq!(id.as_str(), "code:src/foo.rs");
     }
 
-    #[tokio::test]
-    async fn resolve_module_by_file_path() {
-        let store = make_store(vec![module("src/foo.rs", "foo")]).await;
-        let id = resolve_module(&store, "src/foo.rs").await.expect("ok");
+    #[test]
+    fn resolve_module_by_file_path() {
+        let store = Store::new();
+        store.add_atom(module("code:src/foo.rs", "src/foo.rs", "foo"));
+        let id = resolve_module(&store, "src/foo.rs").expect("ok");
         assert_eq!(id.as_str(), "code:src/foo.rs");
     }
 
-    #[tokio::test]
-    async fn resolve_module_by_name_unique() {
-        let store = make_store(vec![module("src/foo.rs", "foo")]).await;
-        let id = resolve_module(&store, "foo").await.expect("ok");
+    #[test]
+    fn resolve_module_by_name_unique() {
+        let store = Store::new();
+        store.add_atom(module("code:src/foo.rs", "src/foo.rs", "foo"));
+        let id = resolve_module(&store, "foo").expect("ok");
         assert_eq!(id.as_str(), "code:src/foo.rs");
     }
 
-    #[tokio::test]
-    async fn resolve_module_by_name_ambiguous_errors() {
-        let store = make_store(vec![
-            module("src/a/queries.rs", "queries"),
-            module("src/b/queries.rs", "queries"),
-        ])
-        .await;
-        let err = resolve_module(&store, "queries")
-            .await
-            .expect_err("ambiguous");
+    #[test]
+    fn resolve_module_by_name_ambiguous_errors() {
+        let store = Store::new();
+        store.add_atom(module("code:a/queries.rs", "a/queries.rs", "queries"));
+        store.add_atom(module("code:b/queries.rs", "b/queries.rs", "queries"));
+        let err = resolve_module(&store, "queries").expect_err("ambiguous");
         assert!(err.to_string().contains("ambiguous"));
         assert!(err.to_string().contains("2 candidates"));
     }
 
-    #[tokio::test]
-    async fn resolve_module_no_match_errors() {
-        let store = make_store(vec![module("src/foo.rs", "foo")]).await;
-        let err = resolve_module(&store, "ghost").await.expect_err("missing");
+    #[test]
+    fn resolve_module_no_match_errors() {
+        let store = Store::new();
+        store.add_atom(module("code:src/foo.rs", "src/foo.rs", "foo"));
+        let err = resolve_module(&store, "ghost").expect_err("missing");
         assert!(err.to_string().contains("no module"));
     }
 
-    #[tokio::test]
-    async fn resolve_function_by_exact_id() {
-        let store = make_store(vec![function("src/lib.rs", "foo")]).await;
-        let id = resolve_function(&store, "code:src/lib.rs::function::foo")
-            .await
-            .expect("ok");
+    #[test]
+    fn resolve_function_by_exact_id() {
+        let store = Store::new();
+        store.add_atom(function(
+            "code:src/lib.rs::function::foo",
+            "src/lib.rs",
+            "foo",
+        ));
+        let id = resolve_function(&store, "code:src/lib.rs::function::foo").expect("ok");
         assert_eq!(id.as_str(), "code:src/lib.rs::function::foo");
     }
 
-    #[tokio::test]
-    async fn resolve_function_by_name_unique() {
-        let store = make_store(vec![function("src/lib.rs", "foo")]).await;
-        let id = resolve_function(&store, "foo").await.expect("ok");
+    #[test]
+    fn resolve_function_by_name_unique() {
+        let store = Store::new();
+        store.add_atom(function(
+            "code:src/lib.rs::function::foo",
+            "src/lib.rs",
+            "foo",
+        ));
+        let id = resolve_function(&store, "foo").expect("ok");
         assert_eq!(id.as_str(), "code:src/lib.rs::function::foo");
     }
 
-    #[tokio::test]
-    async fn resolve_function_by_name_ambiguous_errors() {
-        let store = make_store(vec![
-            function("src/a.rs", "render"),
-            function("src/b.rs", "render"),
-            function("src/c.rs", "render"),
-        ])
-        .await;
-        let err = resolve_function(&store, "render")
-            .await
-            .expect_err("ambiguous");
+    #[test]
+    fn resolve_function_by_name_ambiguous_errors() {
+        let store = Store::new();
+        for file in ["src/a.rs", "src/b.rs", "src/c.rs"] {
+            let id = format!("code:{file}::function::render");
+            store.add_atom(function(&id, file, "render"));
+        }
+        let err = resolve_function(&store, "render").expect_err("ambiguous");
         assert!(err.to_string().contains("ambiguous"));
         assert!(err.to_string().contains("3 candidates"));
     }
 
-    #[tokio::test]
-    async fn resolve_function_ambiguous_truncates_long_lists() {
-        let mut atoms = Vec::new();
-        for i in 0..6 {
-            atoms.push(function(&format!("src/m{i}.rs"), "f"));
+    #[test]
+    fn resolve_function_ambiguous_truncates_long_lists() {
+        let store = Store::new();
+        for i in 0..6_u8 {
+            let id = format!("code:src/m{i}.rs::function::f");
+            let file = format!("src/m{i}.rs");
+            store.add_atom(function(&id, &file, "f"));
         }
-        let store = make_store(atoms).await;
-        let err = resolve_function(&store, "f").await.expect_err("ambiguous");
+        let err = resolve_function(&store, "f").expect_err("ambiguous");
         let s = err.to_string();
         assert!(s.contains("6 candidates"), "got: {s}");
         assert!(s.contains("..."), "list should be truncated, got: {s}");
     }
 
-    #[tokio::test]
-    async fn resolve_function_empty_target_errors() {
-        let store = make_store(vec![]).await;
+    #[test]
+    fn resolve_function_empty_target_errors() {
+        let store = Store::new();
         assert!(matches!(
-            resolve_function(&store, "").await.expect_err("empty"),
+            resolve_function(&store, "").expect_err("empty"),
             AstToMermaidError::InvalidInput(_)
         ));
     }
 
-    #[tokio::test]
-    async fn resolve_function_no_match_errors() {
-        let store = make_store(vec![function("src/lib.rs", "foo")]).await;
-        let err = resolve_function(&store, "ghost")
-            .await
-            .expect_err("missing");
+    #[test]
+    fn resolve_function_no_match_errors() {
+        let store = Store::new();
+        store.add_atom(function(
+            "code:src/lib.rs::function::foo",
+            "src/lib.rs",
+            "foo",
+        ));
+        let err = resolve_function(&store, "ghost").expect_err("missing");
         assert!(err.to_string().contains("no function"));
     }
 }

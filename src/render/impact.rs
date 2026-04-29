@@ -5,10 +5,9 @@
 //! function, who is impacted?"
 
 use crate::error::Result;
+use crate::graph::Store;
 use crate::render::lookup::resolve_function;
 use crate::render::util::{escape_label, mermaid_id};
-use ingester_core::{Atom, Relation};
-use polystore::{EntityId, GraphStore};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
@@ -24,22 +23,17 @@ pub const DEFAULT_HOPS: u8 = 3;
 /// # Errors
 ///
 /// Same as [`crate::render::lookup::resolve_function`].
-pub async fn render<S>(store: &S, target: &str, hops: u8) -> Result<String>
-where
-    S: GraphStore<Atom, Relation>,
-{
-    let target_id = resolve_function(store, target).await?;
+pub fn render(store: &Store, target: &str, hops: u8) -> Result<String> {
+    let target_id = resolve_function(store, target)?;
     let target_atom = store
-        .get_node(&target_id)
-        .await?
+        .get_atom(&target_id)
         .expect("resolve_function vouched the id exists");
 
-    let paths = store.reverse_path(&target_id, hops).await?;
+    let paths = store.reverse_call_paths(&target_id, hops);
 
-    // First pass: collect every distinct predecessor id seen across all paths
-    // + the edges. Second pass: bulk-fetch the atoms in one round-trip.
+    // Collect distinct predecessor ids + edges.
     let mut edges: BTreeSet<(String, String)> = BTreeSet::new();
-    let mut predecessor_ids: Vec<EntityId> = Vec::new();
+    let mut predecessor_ids: Vec<crate::model::EntityId> = Vec::new();
     let mut seen_predecessor: BTreeSet<String> = BTreeSet::new();
     for path in &paths {
         for window in path.windows(2) {
@@ -54,23 +48,27 @@ where
             ));
         }
     }
-    let predecessor_atoms = store.get_nodes_bulk(&predecessor_ids).await?;
-    let mut nodes: BTreeMap<String, Option<Atom>> = BTreeMap::new();
-    nodes.insert(target_id.as_str().to_owned(), Some(target_atom.clone()));
-    for (id, opt) in predecessor_ids.iter().zip(predecessor_atoms) {
-        nodes.insert(id.as_str().to_owned(), opt);
+
+    // Build node name map.
+    let mut nodes: BTreeMap<String, String> = BTreeMap::new();
+    nodes.insert(target_id.as_str().to_owned(), target_atom.name.clone());
+    for pred_id in &predecessor_ids {
+        let name = store
+            .get_atom(pred_id)
+            .map_or_else(|| "?".to_owned(), |a| a.name.clone());
+        nodes.insert(pred_id.as_str().to_owned(), name);
     }
 
     let mut mermaid = String::from("graph BT\n");
     let target_node_id = mermaid_id(target_id.as_str());
     let target_label = escape_label(&format!("fn {} (impacted)", target_atom.name));
     writeln!(mermaid, "    {target_node_id}((\"{target_label}\"))").expect("writing");
-    for (id, atom) in &nodes {
+    for (id, name) in &nodes {
         if id == target_id.as_str() {
             continue;
         }
         let nid = mermaid_id(id);
-        let label = escape_label(atom.as_ref().map_or("?", |a| a.name.as_str()));
+        let label = escape_label(name);
         writeln!(mermaid, "    {nid}[\"{label}\"]").expect("writing");
     }
     for (from, to) in &edges {
@@ -81,154 +79,93 @@ where
     Ok(mermaid)
 }
 
-#[allow(dead_code)]
-fn _ensure_id_used(_: EntityId) {}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::error::AstToMermaidError;
-    use crate::graph::{InMemoryStore, ingest_parse_output};
-    use ingester_core::{AtomId, ParseOutput};
-    use polystore::{EntityId, Scope};
+    use crate::graph::Store;
+    use crate::model::{CodeAtom, Edge, EdgeKind, EntityId};
 
-    fn scope() -> Scope {
-        Scope::new("ns", "repo", "branch")
-    }
-
-    fn fn_atom(file_path: &str, name: &str) -> Atom {
-        Atom::new(
-            AtomId::new(format!("code:{file_path}::function::{name}")),
-            "function",
-            name,
-            "h",
-        )
-        .with_metadata(serde_json::json!({"file_path": file_path}))
-    }
-
-    fn output(atoms: Vec<Atom>) -> ParseOutput {
-        ParseOutput {
-            atoms,
-            ..ParseOutput::default()
+    fn fn_atom(file_path: &str, name: &str) -> CodeAtom {
+        CodeAtom {
+            id: EntityId::new(format!("code:{file_path}::function::{name}")),
+            kind: "function".to_owned(),
+            name: name.to_owned(),
+            file_path: file_path.to_owned(),
+            line_start: 1,
+            line_end: 10,
+            doc: String::new(),
+            signature: String::new(),
+            content_hash: "h".to_owned(),
+            calls: Vec::new(),
         }
     }
 
-    #[tokio::test]
-    async fn missing_target_errors() {
-        let store = InMemoryStore::new(scope());
-        let err = render(&store, "ghost", 3).await.expect_err("must error");
+    #[test]
+    fn missing_target_errors() {
+        let store = Store::new();
+        let err = render(&store, "ghost", 3).expect_err("must error");
         assert!(matches!(err, AstToMermaidError::InvalidInput(_)));
     }
 
-    #[tokio::test]
-    async fn isolated_function_renders_only_target() {
-        let store = InMemoryStore::new(scope());
-        ingest_parse_output(&store, &output(vec![fn_atom("src/lib.rs", "foo")]))
-            .await
-            .expect("ingest");
-        let out = render(&store, "foo", DEFAULT_HOPS).await.expect("render");
+    #[test]
+    fn isolated_function_renders_only_target() {
+        let store = Store::new();
+        store.add_atom(fn_atom("src/lib.rs", "foo"));
+        let out = render(&store, "foo", DEFAULT_HOPS).expect("render");
         assert!(out.contains("fn foo (impacted)"));
         assert_eq!(out.matches("--> ").count(), 0);
     }
 
-    #[tokio::test]
-    async fn linear_chain_walks_back_n_hops() {
-        let store = InMemoryStore::new(scope());
-        // a → b → c (a calls b, b calls c). Impact on c: walking back 2 hops
-        // reaches a.
-        ingest_parse_output(
-            &store,
-            &output(vec![
-                fn_atom("src/m.rs", "a"),
-                fn_atom("src/m.rs", "b"),
-                fn_atom("src/m.rs", "c"),
-            ]),
-        )
-        .await
-        .expect("ingest");
-
+    #[test]
+    fn linear_chain_walks_back_n_hops() {
+        let store = Store::new();
+        for n in ["a", "b", "c"] {
+            store.add_atom(fn_atom("src/m.rs", n));
+        }
         for (from, to) in [("a", "b"), ("b", "c")] {
             let f = EntityId::new(format!("code:src/m.rs::function::{from}"));
             let t = EntityId::new(format!("code:src/m.rs::function::{to}"));
-            store
-                .add_edge(
-                    &f,
-                    &t,
-                    Relation::new(AtomId::new(from), AtomId::new(to), "calls"),
-                )
-                .await
-                .expect("edge");
+            store.add_edge(Edge::new(f, t, EdgeKind::Calls));
         }
 
-        let out = render(&store, "c", 2).await.expect("render");
+        let out = render(&store, "c", 2).expect("render");
         assert!(out.contains("fn c (impacted)"));
         assert!(out.contains("\"a\""));
         assert!(out.contains("\"b\""));
-        // Two arrows: a → b, b → c
         assert_eq!(out.matches("--> ").count(), 2);
     }
 
-    #[tokio::test]
-    async fn zero_hops_renders_only_target() {
-        let store = InMemoryStore::new(scope());
-        ingest_parse_output(
-            &store,
-            &output(vec![fn_atom("src/m.rs", "a"), fn_atom("src/m.rs", "b")]),
-        )
-        .await
-        .expect("ingest");
+    #[test]
+    fn zero_hops_renders_only_target() {
+        let store = Store::new();
+        store.add_atom(fn_atom("src/m.rs", "a"));
+        store.add_atom(fn_atom("src/m.rs", "b"));
         let a = EntityId::new("code:src/m.rs::function::a");
         let b = EntityId::new("code:src/m.rs::function::b");
-        store
-            .add_edge(
-                &a,
-                &b,
-                Relation::new(AtomId::new("a"), AtomId::new("b"), "calls"),
-            )
-            .await
-            .expect("edge");
+        store.add_edge(Edge::new(a, b, EdgeKind::Calls));
 
-        let out = render(&store, "b", 0).await.expect("render");
+        let out = render(&store, "b", 0).expect("render");
         assert!(out.contains("fn b (impacted)"));
-        // Zero hops means no callers shown.
         assert!(!out.contains("\"a\""));
     }
 
-    #[tokio::test]
-    async fn diamond_dedup_unique_nodes_and_edges() {
-        // a → b → d, a → c → d. Impact on d, hops=2: reach a via two paths
-        // but a appears once.
-        let store = InMemoryStore::new(scope());
-        ingest_parse_output(
-            &store,
-            &output(vec![
-                fn_atom("src/m.rs", "a"),
-                fn_atom("src/m.rs", "b"),
-                fn_atom("src/m.rs", "c"),
-                fn_atom("src/m.rs", "d"),
-            ]),
-        )
-        .await
-        .expect("ingest");
+    #[test]
+    fn diamond_dedup_unique_nodes_and_edges() {
+        let store = Store::new();
+        for n in ["a", "b", "c", "d"] {
+            store.add_atom(fn_atom("src/m.rs", n));
+        }
         for (from, to) in [("a", "b"), ("a", "c"), ("b", "d"), ("c", "d")] {
             let f = EntityId::new(format!("code:src/m.rs::function::{from}"));
             let t = EntityId::new(format!("code:src/m.rs::function::{to}"));
-            store
-                .add_edge(
-                    &f,
-                    &t,
-                    Relation::new(AtomId::new(from), AtomId::new(to), "calls"),
-                )
-                .await
-                .expect("edge");
+            store.add_edge(Edge::new(f, t, EdgeKind::Calls));
         }
 
-        let out = render(&store, "d", 2).await.expect("render");
-        // 3 unique caller-side nodes: a, b, c
+        let out = render(&store, "d", 2).expect("render");
         for n in ["\"a\"", "\"b\"", "\"c\""] {
             assert!(out.contains(n), "missing {n} in:\n{out}");
         }
-        // 4 distinct edges (a→b, a→c, b→d, c→d).
         assert_eq!(out.matches("--> ").count(), 4);
     }
 

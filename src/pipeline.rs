@@ -1,15 +1,13 @@
-//! End-to-end orchestrator: filesystem → ingester → store → resolver → renderer.
+//! End-to-end orchestrator: filesystem → parser → store → resolver → renderer.
 //!
-//! Used by both the CLI and (later) the MCP server. Pure async; backed by an
-//! [`InMemoryStore`] for the v0.2 MVP.
+//! No external graph backend. No `async` I/O — all store operations are
+//! synchronous in-memory.
 
 use crate::error::{AstToMermaidError, Result};
-use crate::graph::{InMemoryStore, ingest_parse_output};
+use crate::graph::Store;
+use crate::parser::{CodeParser, Language};
 use crate::render::{Level, render};
 use crate::resolve::resolve_cross_module_calls;
-use ingester_code::{CodeParser, Language};
-use ingester_core::{Origin, Parser};
-use polystore::Scope;
 use std::path::{Path, PathBuf};
 
 /// Options controlling [`analyze`].
@@ -24,9 +22,6 @@ pub struct AnalyzeOptions {
     /// walk. Always combined with the built-in skip set
     /// (`target`, `node_modules`, `.git`, any dotfile dir).
     pub exclude: Vec<String>,
-    /// Tenant scope to attribute the in-memory store to. Defaults aren't
-    /// useful for analysis output, but downstream tooling may surface it.
-    pub scope: Scope,
 }
 
 impl Default for AnalyzeOptions {
@@ -35,7 +30,6 @@ impl Default for AnalyzeOptions {
             level: Level::Project,
             target: None,
             exclude: Vec::new(),
-            scope: Scope::new("local", "local", "main"),
         }
     }
 }
@@ -62,10 +56,9 @@ pub struct AnalyzeReport {
 ///
 /// # Errors
 ///
-/// Returns the first error from filesystem walk, parsing, store ingestion,
-/// resolver, or renderer. Individual files that fail to parse are propagated
-/// (callers can choose to wrap or filter via [`pre-walk`](walk_for_languages)).
-pub async fn analyze(root: &Path, opts: &AnalyzeOptions) -> Result<AnalyzeReport> {
+/// Returns the first error from filesystem walk, parsing, or renderer.
+/// Individual files that fail to parse are propagated.
+pub fn analyze(root: &Path, opts: &AnalyzeOptions) -> Result<AnalyzeReport> {
     if !root.exists() {
         return Err(AstToMermaidError::InvalidInput(format!(
             "path does not exist: {}",
@@ -74,30 +67,26 @@ pub async fn analyze(root: &Path, opts: &AnalyzeOptions) -> Result<AnalyzeReport
     }
 
     let files = walk_for_languages_with_exclude(root, &opts.exclude)?;
-    let store = InMemoryStore::new(opts.scope.clone());
+    let store = Store::new();
 
     let mut atoms_indexed = 0;
     let mut files_parsed = 0;
     for (path, lang) in &files {
-        let bytes = std::fs::read(path).map_err(|e| {
-            AstToMermaidError::InvalidInput(format!("read {}: {e}", path.display()))
-        })?;
+        let bytes = std::fs::read(path)?;
         let parser = match lang {
             Language::Rust => CodeParser::rust(),
             Language::Python => CodeParser::python(),
         };
         let display_path = display_path(root, path);
-        let origin = Origin::file(display_path, Some(lang.name()));
-        let output = parser
-            .parse(&bytes, &origin)
-            .map_err(|e| AstToMermaidError::InvalidInput(format!("parse {origin}: {e}")))?;
-        atoms_indexed += output.atoms.len();
-        ingest_parse_output(&store, &output).await?;
+        let count = parser
+            .parse_into(&bytes, &display_path, &store)
+            .map_err(|e| AstToMermaidError::InvalidInput(format!("parse {display_path}: {e}")))?;
+        atoms_indexed += count;
         files_parsed += 1;
     }
 
-    let edges_resolved = resolve_cross_module_calls(&store).await?;
-    let mermaid = render(opts.level, &store, opts.target.as_deref()).await?;
+    let edges_resolved = resolve_cross_module_calls(&store);
+    let mermaid = render(opts.level, &store, opts.target.as_deref())?;
 
     Ok(AnalyzeReport {
         mermaid,
@@ -153,11 +142,9 @@ fn walk_into(dir: &Path, extra_exclude: &[&str], out: &mut Vec<(PathBuf, Languag
     if !dir.is_dir() {
         return Ok(());
     }
-    let entries = std::fs::read_dir(dir)
-        .map_err(|e| AstToMermaidError::InvalidInput(format!("read dir {}: {e}", dir.display())))?;
+    let entries = std::fs::read_dir(dir)?;
     for entry in entries {
-        let entry = entry
-            .map_err(|e| AstToMermaidError::InvalidInput(format!("walk {}: {e}", dir.display())))?;
+        let entry = entry?;
         let path = entry.path();
         let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
         if path.is_dir() {
@@ -182,9 +169,7 @@ fn language_for(path: &Path) -> Option<Language> {
     }
 }
 
-/// Render an absolute path as `crates/...` or relative-to-root for tidier
-/// mermaid IDs. Falls back to the path's basename when no relativization
-/// is possible.
+/// Render an absolute path as relative-to-root for tidier IDs.
 fn display_path(root: &Path, file: &Path) -> String {
     file.strip_prefix(root)
         .ok()
@@ -280,34 +265,30 @@ mod tests {
         assert!(s.contains("foo.rs"));
     }
 
-    #[tokio::test]
-    async fn analyze_missing_root_errors() {
+    #[test]
+    fn analyze_missing_root_errors() {
         let err = analyze(
             Path::new("/definitely/does/not/exist/12345"),
             &AnalyzeOptions::default(),
         )
-        .await
         .expect_err("must error");
         assert!(matches!(err, AstToMermaidError::InvalidInput(_)));
     }
 
-    #[tokio::test]
-    async fn analyze_empty_dir_yields_empty_graph() {
+    #[test]
+    fn analyze_empty_dir_yields_empty_graph() {
         let tmp = tempdir().expect("tmp");
-        let report = analyze(tmp.path(), &AnalyzeOptions::default())
-            .await
-            .expect("ok");
+        let report = analyze(tmp.path(), &AnalyzeOptions::default()).expect("ok");
         assert_eq!(report.files_parsed, 0);
         assert_eq!(report.atoms_indexed, 0);
         assert_eq!(report.edges_resolved, 0);
         assert_eq!(report.mermaid, "graph TD\n");
     }
 
-    #[tokio::test]
-    async fn analyze_simple_two_crate_workspace_renders_project() {
+    #[test]
+    fn analyze_simple_two_crate_workspace_renders_project() {
         let tmp = tempdir().expect("tmp");
         let root = tmp.path();
-        // crate_a calls helper from crate_b
         write(
             root,
             "crates/crate_a/src/lib.rs",
@@ -321,17 +302,13 @@ mod tests {
                 level: Level::Project,
                 target: None,
                 exclude: Vec::new(),
-                scope: Scope::new("ns", "repo", "branch"),
             },
         )
-        .await
         .expect("analyze");
 
         assert_eq!(report.files_parsed, 2);
-        assert!(report.atoms_indexed >= 4); // 2 modules + 2 functions
+        assert!(report.atoms_indexed >= 4);
         assert_eq!(report.edges_resolved, 1);
-
-        // Mermaid output should mention both crates and the cross-crate edge.
         assert!(report.mermaid.contains("crate_a"));
         assert!(report.mermaid.contains("crate_b"));
         assert!(
@@ -341,8 +318,8 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn analyze_overview_level_renders_modules() {
+    #[test]
+    fn analyze_overview_level_renders_modules() {
         let tmp = tempdir().expect("tmp");
         let root = tmp.path();
         write(
@@ -359,7 +336,6 @@ mod tests {
                 ..AnalyzeOptions::default()
             },
         )
-        .await
         .expect("analyze");
         assert_eq!(report.files_parsed, 2);
         assert!(report.mermaid.contains("mod_a"));
@@ -367,14 +343,12 @@ mod tests {
         assert!(report.mermaid.contains(" -->|\""));
     }
 
-    #[tokio::test]
-    async fn analyze_propagates_invalid_utf8() {
+    #[test]
+    fn analyze_propagates_invalid_utf8() {
         let tmp = tempdir().expect("tmp");
         let path = tmp.path().join("bad.rs");
         fs::write(&path, [0xff, 0xfe, 0xfd]).expect("write");
-        let err = analyze(tmp.path(), &AnalyzeOptions::default())
-            .await
-            .expect_err("must reject");
+        let err = analyze(tmp.path(), &AnalyzeOptions::default()).expect_err("must reject");
         assert!(matches!(err, AstToMermaidError::InvalidInput(_)));
     }
 
@@ -386,11 +360,9 @@ mod tests {
         write(root, "vendor/junk.rs", "fn dont_parse() {}");
         write(root, "workspaces/inner.rs", "fn dont_parse() {}");
 
-        // Default: vendor/ + workspaces/ are walked (not in built-in skip set).
         let default = walk_for_languages(root).expect("walk");
         assert_eq!(default.len(), 3, "default should walk all 3");
 
-        // With exclude: skip vendor + workspaces.
         let filtered =
             walk_for_languages_with_exclude(root, &["vendor", "workspaces"]).expect("walk");
         assert_eq!(filtered.len(), 1);
@@ -404,27 +376,22 @@ mod tests {
         write(root, "src/a.rs", "fn a() {}");
         write(root, "target/junk.rs", "fn dont_parse() {}");
 
-        // target/ is always skipped, with or without explicit exclude.
         let no_exclude = walk_for_languages(root).expect("walk");
         let with_exclude = walk_for_languages_with_exclude(root, &["unrelated"]).expect("walk");
         assert_eq!(no_exclude.len(), 1);
         assert_eq!(with_exclude.len(), 1);
     }
 
-    #[tokio::test]
-    async fn analyze_with_exclude_skips_directory() {
+    #[test]
+    fn analyze_with_exclude_skips_directory() {
         let tmp = tempdir().expect("tmp");
         let root = tmp.path();
         write(root, "src/main.rs", "pub fn main() {}");
         write(root, "vendor/lib.rs", "pub fn vendored() {}");
 
-        // Without exclude: 2 files.
-        let report = analyze(root, &AnalyzeOptions::default())
-            .await
-            .expect("analyze");
+        let report = analyze(root, &AnalyzeOptions::default()).expect("analyze");
         assert_eq!(report.files_parsed, 2);
 
-        // With exclude: 1 file (vendored skipped).
         let report = analyze(
             root,
             &AnalyzeOptions {
@@ -432,7 +399,6 @@ mod tests {
                 ..AnalyzeOptions::default()
             },
         )
-        .await
         .expect("analyze");
         assert_eq!(report.files_parsed, 1);
     }
@@ -441,7 +407,6 @@ mod tests {
     fn analyze_options_default_uses_project_level() {
         let opts = AnalyzeOptions::default();
         assert_eq!(opts.level, Level::Project);
-        assert_eq!(opts.scope.namespace, "local");
     }
 
     #[test]

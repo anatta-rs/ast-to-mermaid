@@ -61,7 +61,7 @@ pub struct AnalyzeFlags {
 /// All failures are reported via `eprintln!` and surfaced as
 /// `ExitCode::Failure`. Bad CLI input (missing target for a level that
 /// requires one) yields `ExitCode::UsageError`.
-pub async fn run_analyze(level: Level, flags: AnalyzeFlags) -> ExitCode {
+pub fn run_analyze(level: Level, flags: &AnalyzeFlags) -> ExitCode {
     if level.requires_target() && flags.target.is_none() {
         eprintln!("level={level} requires --target");
         return ExitCode::UsageError;
@@ -79,10 +79,9 @@ pub async fn run_analyze(level: Level, flags: AnalyzeFlags) -> ExitCode {
         level,
         target: flags.target.clone(),
         exclude,
-        ..AnalyzeOptions::default()
     };
 
-    let report = match analyze(&flags.path, &opts).await {
+    let report = match analyze(&flags.path, &opts) {
         Ok(r) => r,
         Err(e) => {
             eprintln!("analyze: {e}");
@@ -112,27 +111,63 @@ pub async fn run_analyze(level: Level, flags: AnalyzeFlags) -> ExitCode {
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn module_level_without_target_returns_usage_error() {
+    #[test]
+    fn module_level_without_target_returns_usage_error() {
         let flags = AnalyzeFlags {
             path: PathBuf::from("/dev/null"),
             target: None,
             exclude: String::new(),
             out: None,
         };
-        let code = run_analyze(Level::Module, flags).await;
+        let code = run_analyze(Level::Module, &flags);
         assert_eq!(code, ExitCode::UsageError);
     }
 
-    #[tokio::test]
-    async fn analyze_with_missing_path_returns_failure() {
+    #[test]
+    fn analyze_with_missing_path_returns_failure() {
         let flags = AnalyzeFlags {
             path: PathBuf::from("/no/such/path/here"),
             target: None,
             exclude: String::new(),
             out: None,
         };
-        let code = run_analyze(Level::Project, flags).await;
+        let code = run_analyze(Level::Project, &flags);
         assert_eq!(code, ExitCode::Failure);
+    }
+
+    #[test]
+    fn exit_code_converts_to_process_exit_code() {
+        let _ = process::ExitCode::from(ExitCode::Success);
+        let _ = process::ExitCode::from(ExitCode::Failure);
+        let _ = process::ExitCode::from(ExitCode::UsageError);
+    }
+
+    #[test]
+    fn project_level_on_empty_dir_succeeds_and_writes_to_file() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let out_file = tmp.path().join("out.mmd");
+        // Analyze the tempdir itself (no source files → empty diagram).
+        let flags = AnalyzeFlags {
+            path: tmp.path().to_path_buf(),
+            target: None,
+            exclude: String::new(),
+            out: Some(out_file.clone()),
+        };
+        let code = run_analyze(Level::Project, &flags);
+        assert_eq!(code, ExitCode::Success);
+        assert!(out_file.exists(), "output file must be written");
+    }
+
+    #[test]
+    fn project_level_on_empty_dir_prints_to_stdout() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let flags = AnalyzeFlags {
+            path: tmp.path().to_path_buf(),
+            target: None,
+            exclude: String::new(),
+            out: None,
+        };
+        let code = run_analyze(Level::Project, &flags);
+        assert_eq!(code, ExitCode::Success);
     }
 }

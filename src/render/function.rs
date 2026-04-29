@@ -4,10 +4,10 @@
 //! callees (outgoing).
 
 use crate::error::Result;
+use crate::graph::Store;
+use crate::model::EdgeKind;
 use crate::render::lookup::resolve_function;
 use crate::render::util::{escape_label, mermaid_id};
-use ingester_core::{Atom, Relation};
-use polystore::{Direction, EntityId, GraphStore};
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
@@ -16,51 +16,30 @@ use std::fmt::Write as _;
 /// # Errors
 ///
 /// Same as [`crate::render::lookup::resolve_function`].
-pub async fn render<S>(store: &S, target: &str) -> Result<String>
-where
-    S: GraphStore<Atom, Relation>,
-{
-    let center_id = resolve_function(store, target).await?;
+pub fn render(store: &Store, target: &str) -> Result<String> {
+    let center_id = resolve_function(store, target)?;
     let center_atom = store
-        .get_node(&center_id)
-        .await?
+        .get_atom(&center_id)
         .expect("resolve_function vouched the id exists");
 
-    // Walk both directions, collect every counterpart id with a `calls`
-    // edge, then bulk-fetch their atoms in a single round-trip.
-    let in_edges = store.neighbors(&center_id, Direction::Incoming).await?;
-    let out_edges = store.neighbors(&center_id, Direction::Outgoing).await?;
+    let in_edges = store.edges_to(&center_id);
+    let out_edges = store.edges_from(&center_id);
 
-    let incoming_ids: Vec<EntityId> = in_edges
-        .iter()
-        .filter(|(_, rel)| rel.kind == "calls")
-        .map(|(id, _)| id.clone())
-        .collect();
-    let outgoing_ids: Vec<EntityId> = out_edges
-        .iter()
-        .filter(|(_, rel)| rel.kind == "calls")
-        .map(|(id, _)| id.clone())
-        .collect();
-
-    let mut all_ids = incoming_ids.clone();
-    all_ids.extend(outgoing_ids.iter().cloned());
-    let atoms = store.get_nodes_bulk(&all_ids).await?;
-    let id_to_atom: std::collections::HashMap<EntityId, Atom> = all_ids
-        .iter()
-        .zip(atoms)
-        .filter_map(|(id, opt)| opt.map(|a| (id.clone(), a)))
-        .collect();
-
-    let mut who_calls: BTreeMap<String, Atom> = BTreeMap::new();
-    for id in &incoming_ids {
-        if let Some(atom) = id_to_atom.get(id) {
-            who_calls.insert(id.as_str().to_owned(), atom.clone());
+    let mut who_calls: BTreeMap<String, String> = BTreeMap::new(); // id → name
+    for edge in &in_edges {
+        if edge.kind == EdgeKind::Calls
+            && let Some(atom) = store.get_atom(&edge.from)
+        {
+            who_calls.insert(edge.from.as_str().to_owned(), atom.name.clone());
         }
     }
-    let mut whom_called: BTreeMap<String, Atom> = BTreeMap::new();
-    for id in &outgoing_ids {
-        if let Some(atom) = id_to_atom.get(id) {
-            whom_called.insert(id.as_str().to_owned(), atom.clone());
+
+    let mut whom_called: BTreeMap<String, String> = BTreeMap::new(); // id → name
+    for edge in &out_edges {
+        if edge.kind == EdgeKind::Calls
+            && let Some(atom) = store.get_atom(&edge.to)
+        {
+            whom_called.insert(edge.to.as_str().to_owned(), atom.name.clone());
         }
     }
 
@@ -70,15 +49,15 @@ where
     let mut mermaid = String::from("graph TD\n");
     writeln!(mermaid, "    {target_node_id}((\"{target_label}\"))").expect("writing");
 
-    for (caller_id, caller_atom) in &who_calls {
+    for (caller_id, caller_name) in &who_calls {
         let id = mermaid_id(caller_id);
-        let label = escape_label(&caller_atom.name);
+        let label = escape_label(caller_name);
         writeln!(mermaid, "    {id}[\"{label}\"]").expect("writing");
         writeln!(mermaid, "    {id} --> {target_node_id}").expect("writing");
     }
-    for (callee_id, callee_atom) in &whom_called {
+    for (callee_id, callee_name) in &whom_called {
         let id = mermaid_id(callee_id);
-        let label = escape_label(&callee_atom.name);
+        let label = escape_label(callee_name);
         writeln!(mermaid, "    {id}[\"{label}\"]").expect("writing");
         writeln!(mermaid, "    {target_node_id} --> {id}").expect("writing");
     }
@@ -90,149 +69,95 @@ where
 mod tests {
     use super::*;
     use crate::error::AstToMermaidError;
-    use crate::graph::{InMemoryStore, ingest_parse_output};
-    use ingester_core::{AtomId, ParseOutput};
-    use polystore::{EntityId, Scope};
+    use crate::graph::Store;
+    use crate::model::{CodeAtom, Edge, EdgeKind, EntityId};
 
-    fn scope() -> Scope {
-        Scope::new("ns", "repo", "branch")
-    }
-
-    fn function_atom(file_path: &str, name: &str) -> Atom {
-        Atom::new(
-            AtomId::new(format!("code:{file_path}::function::{name}")),
-            "function",
-            name,
-            "h",
-        )
-        .with_metadata(serde_json::json!({"file_path": file_path}))
-    }
-
-    fn output(atoms: Vec<Atom>) -> ParseOutput {
-        ParseOutput {
-            atoms,
-            ..ParseOutput::default()
+    fn function_atom(file_path: &str, name: &str) -> CodeAtom {
+        CodeAtom {
+            id: EntityId::new(format!("code:{file_path}::function::{name}")),
+            kind: "function".to_owned(),
+            name: name.to_owned(),
+            file_path: file_path.to_owned(),
+            line_start: 1,
+            line_end: 10,
+            doc: String::new(),
+            signature: String::new(),
+            content_hash: "h".to_owned(),
+            calls: Vec::new(),
         }
     }
 
-    #[tokio::test]
-    async fn missing_target_errors() {
-        let store = InMemoryStore::new(scope());
-        let err = render(&store, "ghost").await.expect_err("must error");
+    #[test]
+    fn missing_target_errors() {
+        let store = Store::new();
+        let err = render(&store, "ghost").expect_err("must error");
         assert!(matches!(err, AstToMermaidError::InvalidInput(_)));
     }
 
-    #[tokio::test]
-    async fn empty_target_errors() {
-        let store = InMemoryStore::new(scope());
-        let err = render(&store, "").await.expect_err("must error");
+    #[test]
+    fn empty_target_errors() {
+        let store = Store::new();
+        let err = render(&store, "").expect_err("must error");
         assert!(matches!(err, AstToMermaidError::InvalidInput(_)));
     }
 
-    #[tokio::test]
-    async fn isolated_function_renders_only_target() {
-        let store = InMemoryStore::new(scope());
-        ingest_parse_output(&store, &output(vec![function_atom("src/lib.rs", "foo")]))
-            .await
-            .expect("ingest");
-        let out = render(&store, "foo").await.expect("render");
+    #[test]
+    fn isolated_function_renders_only_target() {
+        let store = Store::new();
+        store.add_atom(function_atom("src/lib.rs", "foo"));
+        let out = render(&store, "foo").expect("render");
         assert!(out.contains("fn foo (target)"));
-        // No --> arrows when target has neither callers nor callees.
         assert_eq!(out.matches("-->").count(), 0);
     }
 
-    #[tokio::test]
-    async fn callers_appear_with_arrows_in() {
-        let store = InMemoryStore::new(scope());
-        ingest_parse_output(
-            &store,
-            &output(vec![
-                function_atom("src/a.rs", "caller_one"),
-                function_atom("src/a.rs", "caller_two"),
-                function_atom("src/lib.rs", "target"),
-            ]),
-        )
-        .await
-        .expect("ingest");
+    #[test]
+    fn callers_appear_with_arrows_in() {
+        let store = Store::new();
+        store.add_atom(function_atom("src/a.rs", "caller_one"));
+        store.add_atom(function_atom("src/a.rs", "caller_two"));
+        store.add_atom(function_atom("src/lib.rs", "target"));
 
         let target_id = EntityId::new("code:src/lib.rs::function::target");
         for caller in ["caller_one", "caller_two"] {
             let cid = EntityId::new(format!("code:src/a.rs::function::{caller}"));
-            store
-                .add_edge(
-                    &cid,
-                    &target_id,
-                    Relation::new(AtomId::new("c"), AtomId::new("t"), "calls"),
-                )
-                .await
-                .expect("edge");
+            store.add_edge(Edge::new(cid, target_id.clone(), EdgeKind::Calls));
         }
 
-        let out = render(&store, "target").await.expect("render");
+        let out = render(&store, "target").expect("render");
         assert!(out.contains("caller_one"));
         assert!(out.contains("caller_two"));
-        // 2 incoming arrows
         assert_eq!(out.matches("--> ").count(), 2);
     }
 
-    #[tokio::test]
-    async fn callees_appear_with_arrows_out() {
-        let store = InMemoryStore::new(scope());
-        ingest_parse_output(
-            &store,
-            &output(vec![
-                function_atom("src/lib.rs", "target"),
-                function_atom("src/b.rs", "helper_one"),
-                function_atom("src/b.rs", "helper_two"),
-            ]),
-        )
-        .await
-        .expect("ingest");
+    #[test]
+    fn callees_appear_with_arrows_out() {
+        let store = Store::new();
+        store.add_atom(function_atom("src/lib.rs", "target"));
+        store.add_atom(function_atom("src/b.rs", "helper_one"));
+        store.add_atom(function_atom("src/b.rs", "helper_two"));
 
         let target_id = EntityId::new("code:src/lib.rs::function::target");
         for callee in ["helper_one", "helper_two"] {
             let cid = EntityId::new(format!("code:src/b.rs::function::{callee}"));
-            store
-                .add_edge(
-                    &target_id,
-                    &cid,
-                    Relation::new(AtomId::new("t"), AtomId::new("h"), "calls"),
-                )
-                .await
-                .expect("edge");
+            store.add_edge(Edge::new(target_id.clone(), cid, EdgeKind::Calls));
         }
 
-        let out = render(&store, "target").await.expect("render");
+        let out = render(&store, "target").expect("render");
         assert!(out.contains("helper_one"));
         assert!(out.contains("helper_two"));
         assert_eq!(out.matches("--> ").count(), 2);
     }
 
-    #[tokio::test]
-    async fn non_calls_relations_ignored() {
-        let store = InMemoryStore::new(scope());
-        ingest_parse_output(
-            &store,
-            &output(vec![
-                function_atom("src/lib.rs", "target"),
-                function_atom("src/b.rs", "noise"),
-            ]),
-        )
-        .await
-        .expect("ingest");
+    #[test]
+    fn non_calls_relations_ignored() {
+        let store = Store::new();
+        store.add_atom(function_atom("src/lib.rs", "target"));
+        store.add_atom(function_atom("src/b.rs", "noise"));
         let t = EntityId::new("code:src/lib.rs::function::target");
         let n = EntityId::new("code:src/b.rs::function::noise");
-        store
-            .add_edge(
-                &t,
-                &n,
-                Relation::new(AtomId::new("t"), AtomId::new("n"), "uses"),
-            )
-            .await
-            .expect("edge");
+        store.add_edge(Edge::new(t, n, EdgeKind::Uses));
 
-        let out = render(&store, "target").await.expect("render");
-        // `noise` should NOT appear because the edge is `uses`, not `calls`.
+        let out = render(&store, "target").expect("render");
         assert!(!out.contains("noise"));
     }
 }

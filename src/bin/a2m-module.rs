@@ -22,9 +22,8 @@ struct Cli {
     flags: AnalyzeFlags,
 }
 
-#[tokio::main(flavor = "current_thread")]
-async fn main() -> std::process::ExitCode {
+fn main() -> std::process::ExitCode {
     let cli = Cli::parse();
-    let code: ExitCode = run_analyze(Level::Module, cli.flags).await;
+    let code: ExitCode = run_analyze(Level::Module, &cli.flags);
     code.into()
 }
