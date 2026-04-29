@@ -201,3 +201,88 @@ impl Edge {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn entity_id_roundtrip_and_display() {
+        let id = EntityId::new("code:src/lib.rs::function::foo");
+        assert_eq!(id.as_str(), "code:src/lib.rs::function::foo");
+        assert_eq!(id.to_string(), "code:src/lib.rs::function::foo");
+    }
+
+    #[test]
+    fn atom_kind_as_str_covers_all_variants() {
+        assert_eq!(AtomKind::Function.as_str(), "function");
+        assert_eq!(AtomKind::Module.as_str(), "module");
+        assert_eq!(AtomKind::Struct.as_str(), "struct");
+        assert_eq!(AtomKind::Trait.as_str(), "trait");
+        assert_eq!(AtomKind::Impl.as_str(), "impl");
+        assert_eq!(AtomKind::Enum.as_str(), "enum");
+        assert_eq!(AtomKind::TypeAlias.as_str(), "type_alias");
+        assert_eq!(AtomKind::Const.as_str(), "const");
+        assert_eq!(AtomKind::Static.as_str(), "static");
+        assert_eq!(AtomKind::Macro.as_str(), "macro");
+        assert_eq!(AtomKind::Other("custom".to_owned()).as_str(), "custom");
+    }
+
+    #[test]
+    fn atom_kind_parse_roundtrips() {
+        for s in [
+            "function",
+            "module",
+            "struct",
+            "trait",
+            "impl",
+            "enum",
+            "type_alias",
+            "const",
+            "static",
+            "macro",
+        ] {
+            assert_eq!(AtomKind::parse(s).as_str(), s, "roundtrip failed for {s}");
+        }
+        // unknown maps to Other
+        assert_eq!(AtomKind::parse("unknown").as_str(), "unknown");
+    }
+
+    #[test]
+    fn atom_kind_display() {
+        assert_eq!(AtomKind::Function.to_string(), "function");
+        assert_eq!(AtomKind::Other("xyz".to_owned()).to_string(), "xyz");
+    }
+
+    #[test]
+    fn edge_kind_as_str_and_parse_roundtrip() {
+        for (s, v) in [
+            ("calls", EdgeKind::Calls),
+            ("uses", EdgeKind::Uses),
+            ("implements", EdgeKind::Implements),
+            ("contains", EdgeKind::Contains),
+        ] {
+            assert_eq!(v.as_str(), s);
+            assert_eq!(EdgeKind::parse(s), v);
+        }
+        // unknown maps to Uses
+        assert_eq!(EdgeKind::parse("bogus"), EdgeKind::Uses);
+    }
+
+    #[test]
+    fn edge_kind_display() {
+        assert_eq!(EdgeKind::Calls.to_string(), "calls");
+        assert_eq!(EdgeKind::Implements.to_string(), "implements");
+    }
+
+    #[test]
+    fn edge_new_sets_role_none() {
+        let a = EntityId::new("a");
+        let b = EntityId::new("b");
+        let e = Edge::new(a.clone(), b.clone(), EdgeKind::Calls);
+        assert_eq!(e.from, a);
+        assert_eq!(e.to, b);
+        assert_eq!(e.kind, EdgeKind::Calls);
+        assert!(e.role.is_none());
+    }
+}

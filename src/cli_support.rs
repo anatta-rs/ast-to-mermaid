@@ -134,4 +134,40 @@ mod tests {
         let code = run_analyze(Level::Project, &flags);
         assert_eq!(code, ExitCode::Failure);
     }
+
+    #[test]
+    fn exit_code_converts_to_process_exit_code() {
+        let _ = process::ExitCode::from(ExitCode::Success);
+        let _ = process::ExitCode::from(ExitCode::Failure);
+        let _ = process::ExitCode::from(ExitCode::UsageError);
+    }
+
+    #[test]
+    fn project_level_on_empty_dir_succeeds_and_writes_to_file() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let out_file = tmp.path().join("out.mmd");
+        // Analyze the tempdir itself (no source files → empty diagram).
+        let flags = AnalyzeFlags {
+            path: tmp.path().to_path_buf(),
+            target: None,
+            exclude: String::new(),
+            out: Some(out_file.clone()),
+        };
+        let code = run_analyze(Level::Project, &flags);
+        assert_eq!(code, ExitCode::Success);
+        assert!(out_file.exists(), "output file must be written");
+    }
+
+    #[test]
+    fn project_level_on_empty_dir_prints_to_stdout() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let flags = AnalyzeFlags {
+            path: tmp.path().to_path_buf(),
+            target: None,
+            exclude: String::new(),
+            out: None,
+        };
+        let code = run_analyze(Level::Project, &flags);
+        assert_eq!(code, ExitCode::Success);
+    }
 }

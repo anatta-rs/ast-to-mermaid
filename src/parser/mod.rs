@@ -504,4 +504,122 @@ mod tests {
         let c = hex_sha256(b"world");
         assert_ne!(a, c);
     }
+
+    #[test]
+    fn language_name_returns_correct_tag() {
+        assert_eq!(Language::Rust.name(), "rust");
+        assert_eq!(Language::Python.name(), "python");
+    }
+
+    #[test]
+    fn language_equality_via_ref() {
+        let r = Language::Rust;
+        assert!(r == Language::Rust);
+        assert!(!(r == Language::Python));
+    }
+
+    #[test]
+    fn code_parser_language_accessor() {
+        assert_eq!(CodeParser::rust().language(), Language::Rust);
+        assert_eq!(CodeParser::python().language(), Language::Python);
+    }
+
+    #[test]
+    fn rust_parser_struct_and_trait_atoms() {
+        let store = Store::new();
+        let src = b"pub struct Foo {}\npub trait Bar {}\n";
+        CodeParser::rust()
+            .parse_into(src, "src/types.rs", &store)
+            .expect("parse");
+        assert!(!store.atoms_by_kind("struct").is_empty());
+        assert!(!store.atoms_by_kind("trait").is_empty());
+    }
+
+    #[test]
+    fn rust_parser_enum_impl_const_static_macro() {
+        let store = Store::new();
+        let src = b"\
+pub enum Color { Red }\n\
+impl Color { pub fn is_red(&self) -> bool { true } }\n\
+const MAX: u32 = 42;\n\
+static NAME: &str = \"x\";\n\
+macro_rules! say_hi { () => {} }\n\
+pub type Alias = u32;\n";
+        CodeParser::rust()
+            .parse_into(src, "src/misc.rs", &store)
+            .expect("parse");
+        assert!(!store.atoms_by_kind("enum").is_empty());
+        assert!(!store.atoms_by_kind("impl").is_empty());
+        assert!(!store.atoms_by_kind("const").is_empty());
+        assert!(!store.atoms_by_kind("static").is_empty());
+        assert!(!store.atoms_by_kind("macro").is_empty());
+        assert!(!store.atoms_by_kind("type_alias").is_empty());
+    }
+
+    #[test]
+    fn rust_doc_comment_extracted() {
+        let store = Store::new();
+        let src = b"/// Does something.\npub fn documented() {}\n";
+        CodeParser::rust()
+            .parse_into(src, "src/lib.rs", &store)
+            .expect("parse");
+        let id = EntityId::new("code:src/lib.rs::function::documented");
+        let atom = store.get_atom(&id).expect("atom");
+        assert!(atom.doc.contains("Does something"), "doc={:?}", atom.doc);
+    }
+
+    #[test]
+    fn python_docstring_extracted() {
+        let store = Store::new();
+        let src = b"def greet():\n    \"\"\"Say hello.\"\"\"\n    pass\n";
+        CodeParser::python()
+            .parse_into(src, "greet.py", &store)
+            .expect("parse");
+        let id = EntityId::new("code:greet.py::function::greet");
+        let atom = store.get_atom(&id).expect("atom");
+        assert!(atom.doc.contains("Say hello"), "doc={:?}", atom.doc);
+    }
+
+    #[test]
+    fn python_method_calls_extracted() {
+        let store = Store::new();
+        // obj.method() — triggers method_call_expression in Python grammar
+        let src = b"def runner():\n    obj.run()\n    helper()\n";
+        CodeParser::python()
+            .parse_into(src, "runner.py", &store)
+            .expect("parse");
+        let id = EntityId::new("code:runner.py::function::runner");
+        let atom = store.get_atom(&id).expect("atom");
+        // calls list should contain extracted call names
+        assert!(
+            !atom.calls.is_empty(),
+            "expected some calls, got {:?}",
+            atom.calls
+        );
+    }
+
+    #[test]
+    fn rust_impl_for_trait_naming() {
+        let store = Store::new();
+        let src = b"pub trait Foo {}\npub struct Bar;\nimpl Foo for Bar {}\n";
+        CodeParser::rust()
+            .parse_into(src, "src/impl_trait.rs", &store)
+            .expect("parse");
+        // The impl atom should exist with "Foo for Bar" as name
+        let atoms = store.atoms_by_kind("impl");
+        assert!(!atoms.is_empty(), "expected impl atom");
+        assert!(
+            atoms
+                .iter()
+                .any(|a| a.name.contains("Foo") && a.name.contains("Bar")),
+            "got names: {:?}",
+            atoms.iter().map(|a| &a.name).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn module_name_no_extension() {
+        // file with no dot → returns full basename
+        assert_eq!(module_name("Makefile"), "Makefile");
+    }
 }
