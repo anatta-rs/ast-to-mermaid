@@ -1,5 +1,4 @@
-//! Mermaid renderers driven by a [`polystore::GraphStore`] populated with
-//! ingester atoms.
+//! Mermaid renderers driven by a [`Store`] populated with code atoms.
 //!
 //! v0.3 ships five levels:
 //! - [`Level::Project`] — one node per crate with `(modules, functions,
@@ -23,8 +22,7 @@ mod project;
 pub mod util;
 
 use crate::error::{AstToMermaidError, Result as AtmResult};
-use ingester_core::{Atom, Relation};
-use polystore::GraphStore;
+use crate::graph::Store;
 use std::fmt;
 use std::str::FromStr;
 
@@ -94,19 +92,13 @@ impl FromStr for Level {
 ///
 /// - [`AstToMermaidError::InvalidInput`] when a target is required but absent
 ///   or doesn't resolve.
-/// - Any storage-layer error during the read traversal.
-pub async fn render<S>(level: Level, store: &S, target: Option<&str>) -> AtmResult<String>
-where
-    S: GraphStore<Atom, Relation>,
-{
+pub fn render(level: Level, store: &Store, target: Option<&str>) -> AtmResult<String> {
     let s = match level {
-        Level::Project => project::render(store).await?,
-        Level::Overview => overview::render(store).await?,
-        Level::Module => module::render(store, require_target(level, target)?).await?,
-        Level::Function => function::render(store, require_target(level, target)?).await?,
-        Level::Impact => {
-            impact::render(store, require_target(level, target)?, DEFAULT_HOPS).await?
-        }
+        Level::Project => project::render(store),
+        Level::Overview => overview::render(store),
+        Level::Module => module::render(store, require_target(level, target)?)?,
+        Level::Function => function::render(store, require_target(level, target)?)?,
+        Level::Impact => impact::render(store, require_target(level, target)?, DEFAULT_HOPS)?,
     };
     Ok(s)
 }
@@ -120,12 +112,7 @@ fn require_target(level: Level, target: Option<&str>) -> AtmResult<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::graph::InMemoryStore;
-    use polystore::Scope;
-
-    fn scope() -> Scope {
-        Scope::new("ns", "repo", "branch")
-    }
+    use crate::graph::Store;
 
     #[test]
     fn level_as_str_and_display() {
@@ -183,24 +170,20 @@ mod tests {
         assert!(format!("{a:?}").contains("Project"));
     }
 
-    #[tokio::test]
-    async fn render_dispatches_project_and_overview_without_target() {
-        let store = InMemoryStore::new(scope());
-        let project = render(Level::Project, &store, None).await.expect("project");
-        let overview = render(Level::Overview, &store, None)
-            .await
-            .expect("overview");
+    #[test]
+    fn render_dispatches_project_and_overview_without_target() {
+        let store = Store::new();
+        let project = render(Level::Project, &store, None).expect("project");
+        let overview = render(Level::Overview, &store, None).expect("overview");
         assert_eq!(project, "graph TD\n");
         assert_eq!(overview, "graph TD\n");
     }
 
-    #[tokio::test]
-    async fn render_target_required_for_zoom_levels() {
-        let store = InMemoryStore::new(scope());
+    #[test]
+    fn render_target_required_for_zoom_levels() {
+        let store = Store::new();
         for lvl in [Level::Module, Level::Function, Level::Impact] {
-            let err = render(lvl, &store, None)
-                .await
-                .expect_err("must require target");
+            let err = render(lvl, &store, None).expect_err("must require target");
             assert!(err.to_string().contains("--target"));
         }
     }

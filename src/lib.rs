@@ -1,8 +1,10 @@
 //! ast-to-mermaid — Mermaid diagram renderer for code ASTs.
 //!
-//! Wires the [`ingester`](https://github.com/anatta-rs/ingester) parsers into
-//! a [`polystore`](https://github.com/anatta-rs/polystore)-backed graph and
-//! renders [Mermaid](https://mermaid.js.org) diagrams from it.
+//! Parses Rust and Python source trees with tree-sitter, builds an in-memory
+//! call/dependency graph, and renders [Mermaid](https://mermaid.js.org) diagrams
+//! at five levels of detail.
+//!
+//! **No external graph backend.** No polystore. No ingester. Tree-sitter only.
 //!
 //! Five rendering levels:
 //! - [`Level::Project`] — one node per crate, cross-crate calls.
@@ -14,18 +16,20 @@
 #![warn(missing_docs)]
 #![deny(unsafe_code)]
 
+pub mod artifacts;
 pub mod cli_support;
 pub mod error;
 pub mod graph;
+pub mod model;
+pub mod parser;
 pub mod pipeline;
 pub mod render;
 pub mod resolve;
 
 pub use error::{AstToMermaidError, Result};
-pub use graph::InMemoryStore;
-pub use ingester_code::CodeParser;
-pub use ingester_core::{Atom, AtomId, Origin, ParseOutput, Parser, Relation};
+pub use graph::Store;
+pub use model::{AtomKind, CodeAtom, Edge, EdgeKind, EntityId};
+pub use parser::{CodeParser, Language};
 pub use pipeline::{AnalyzeOptions, AnalyzeReport, analyze};
-pub use polystore::{Direction, EntityId, GraphStore, KvStore, Scope, VectorHit, VectorStore};
 pub use render::{Level, render};
 pub use resolve::resolve_cross_module_calls;

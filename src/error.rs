@@ -5,17 +5,17 @@ use thiserror::Error;
 /// Errors raised by the parser, renderer, resolver, or storage adapters.
 #[derive(Debug, Error)]
 pub enum AstToMermaidError {
-    /// Wraps a [`polystore::PolystoreError`] from any storage backend.
-    #[error("storage: {0}")]
-    Storage(#[from] polystore::PolystoreError),
-
     /// The requested feature is not yet implemented at this version.
     #[error("not implemented: {0}")]
     NotImplemented(&'static str),
 
-    /// Invalid CLI arguments or MCP request.
+    /// Invalid CLI arguments or user input.
     #[error("invalid input: {0}")]
     InvalidInput(String),
+
+    /// I/O error (file read, directory walk, artifact write).
+    #[error("io: {0}")]
+    Io(#[from] std::io::Error),
 }
 
 /// Convenience alias used throughout the crate.
@@ -24,13 +24,6 @@ pub type Result<T> = std::result::Result<T, AstToMermaidError>;
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn storage_wraps_polystore_error() {
-        let pe = polystore::PolystoreError::NotFound("x".to_owned());
-        let e: AstToMermaidError = pe.into();
-        assert!(e.to_string().starts_with("storage:"));
-    }
 
     #[test]
     fn not_implemented_displays() {

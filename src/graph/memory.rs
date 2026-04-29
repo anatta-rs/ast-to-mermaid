@@ -1,200 +1,258 @@
-//! In-memory [`polystore::GraphStore`] implementation for ingester atoms.
+//! In-memory [`Store`] — the only storage backend needed by `ast-to-mermaid`.
 //!
-//! Backed by `HashMap<EntityId, Atom>` for nodes and `Vec<EdgeRecord>` for
-//! edges, guarded by a single `RwLock` for interior mutability (the trait
-//! methods take `&self`).
+//! Backed by `HashMap<EntityId, CodeAtom>` for nodes and `Vec<Edge>` for
+//! edges, guarded by a single `RwLock` for interior mutability.
 //!
 //! Designed for: tests, CLI one-shot runs, and the MVP self-bootstrap path.
 //! NOT designed for: large datasets (no compaction), persistence (process-bound),
 //! or concurrent writers (single writer at a time via the rwlock).
 
-use async_trait::async_trait;
-use ingester_core::{Atom, AtomId, Relation};
-use polystore::{Direction, EntityId, GraphStore, PolystoreError, Result, Scope};
-use std::collections::{HashMap, HashSet, VecDeque};
+use crate::model::{CodeAtom, Edge, EdgeKind, EntityId};
+use std::collections::HashMap;
 use std::sync::RwLock;
 
-/// In-memory backend bound to a single tenant scope.
-pub struct InMemoryStore {
-    scope: Scope,
+// ── Store ─────────────────────────────────────────────────────────────────────
+
+/// Lightweight in-memory graph of [`CodeAtom`]s and [`Edge`]s.
+pub struct Store {
     inner: RwLock<Inner>,
 }
 
 #[derive(Default)]
 struct Inner {
-    nodes: HashMap<EntityId, Atom>,
-    edges: Vec<EdgeRecord>,
+    atoms: HashMap<EntityId, CodeAtom>,
+    edges: Vec<Edge>,
 }
 
-#[derive(Clone)]
-struct EdgeRecord {
-    from: EntityId,
-    to: EntityId,
-    relation: Relation,
+impl Default for Store {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
-impl InMemoryStore {
-    /// Construct an empty store bound to `scope`.
+impl Store {
+    /// Construct an empty store.
     #[must_use]
-    pub fn new(scope: Scope) -> Self {
+    pub fn new() -> Self {
         Self {
-            scope,
             inner: RwLock::new(Inner::default()),
         }
     }
 
-    /// Number of nodes currently stored.
+    // ── Writes ────────────────────────────────────────────────────────────────
+
+    /// Insert or replace an atom (upsert semantics).
     ///
     /// # Panics
     ///
-    /// Panics if the internal lock is poisoned (only possible if a previous
-    /// call panicked while holding the write lock).
-    #[must_use]
-    pub fn node_count(&self) -> usize {
-        self.inner.read().expect("rwlock not poisoned").nodes.len()
-    }
-
-    /// Number of edges currently stored.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal lock is poisoned.
-    #[must_use]
-    pub fn edge_count(&self) -> usize {
-        self.inner.read().expect("rwlock not poisoned").edges.len()
-    }
-}
-
-/// Bridge: ingester [`AtomId`] → polystore [`EntityId`].
-fn atom_id_to_entity(id: &AtomId) -> EntityId {
-    EntityId::new(id.as_str())
-}
-
-#[async_trait]
-impl GraphStore<Atom, Relation> for InMemoryStore {
-    fn scope(&self) -> &Scope {
-        &self.scope
-    }
-
-    async fn upsert_node(&self, id: &EntityId, node: Atom) -> Result<()> {
+    /// Panics if the internal `RwLock` is poisoned.
+    pub fn add_atom(&self, atom: CodeAtom) {
         self.inner
             .write()
             .expect("rwlock not poisoned")
-            .nodes
-            .insert(id.clone(), node);
-        Ok(())
+            .atoms
+            .insert(atom.id.clone(), atom);
     }
 
-    async fn get_node(&self, id: &EntityId) -> Result<Option<Atom>> {
-        Ok(self
-            .inner
-            .read()
-            .expect("rwlock not poisoned")
-            .nodes
-            .get(id)
-            .cloned())
-    }
-
-    async fn delete_node(&self, id: &EntityId) -> Result<()> {
-        let mut guard = self.inner.write().expect("rwlock not poisoned");
-        guard.nodes.remove(id);
-        // Cascade: drop any edge touching this node.
-        guard.edges.retain(|e| &e.from != id && &e.to != id);
-        Ok(())
-    }
-
-    async fn add_edge(&self, from: &EntityId, to: &EntityId, edge: Relation) -> Result<()> {
-        let guard_read = self.inner.read().expect("rwlock not poisoned");
-        if !guard_read.nodes.contains_key(from) {
-            return Err(PolystoreError::NotFound(format!("from node: {from}")));
-        }
-        if !guard_read.nodes.contains_key(to) {
-            return Err(PolystoreError::NotFound(format!("to node: {to}")));
-        }
-        drop(guard_read);
-
+    /// Record a directed edge.
+    ///
+    /// Unlike the old `polystore` store, both endpoints are allowed to be
+    /// absent at insertion time — dangling edges are simply ignored by the
+    /// renderers when they fetch the atoms.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal `RwLock` is poisoned.
+    pub fn add_edge(&self, edge: Edge) {
         self.inner
             .write()
             .expect("rwlock not poisoned")
             .edges
-            .push(EdgeRecord {
-                from: from.clone(),
-                to: to.clone(),
-                relation: edge,
-            });
-        Ok(())
+            .push(edge);
     }
 
-    async fn neighbors(
-        &self,
-        id: &EntityId,
-        direction: Direction,
-    ) -> Result<Vec<(EntityId, Relation)>> {
-        let guard = self.inner.read().expect("rwlock not poisoned");
-        let mut out = Vec::new();
-        for e in &guard.edges {
-            match direction {
-                Direction::Outgoing if e.from == *id => {
-                    out.push((e.to.clone(), e.relation.clone()));
-                }
-                Direction::Incoming if e.to == *id => {
-                    out.push((e.from.clone(), e.relation.clone()));
-                }
-                Direction::Both => {
-                    if e.from == *id {
-                        out.push((e.to.clone(), e.relation.clone()));
-                    } else if e.to == *id {
-                        out.push((e.from.clone(), e.relation.clone()));
-                    }
-                }
-                _ => {}
-            }
-        }
-        Ok(out)
+    // ── Reads ─────────────────────────────────────────────────────────────────
+
+    /// Look up a single atom by id.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal `RwLock` is poisoned.
+    #[must_use]
+    pub fn get_atom(&self, id: &EntityId) -> Option<CodeAtom> {
+        self.inner
+            .read()
+            .expect("rwlock not poisoned")
+            .atoms
+            .get(id)
+            .cloned()
     }
 
-    async fn list_by_kind(&self, kind: &str) -> Result<Vec<EntityId>> {
+    /// Return all atoms whose `file_path` matches `path`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal `RwLock` is poisoned.
+    #[must_use]
+    pub fn atoms_in_file(&self, path: &str) -> Vec<CodeAtom> {
         let guard = self.inner.read().expect("rwlock not poisoned");
-        let mut out: Vec<EntityId> = guard
-            .nodes
-            .iter()
-            .filter(|(_, atom)| atom.kind == kind)
-            .map(|(id, _)| id.clone())
+        let mut out: Vec<CodeAtom> = guard
+            .atoms
+            .values()
+            .filter(|a| a.file_path == path)
+            .cloned()
             .collect();
-        // Deterministic iteration order for snapshot-friendly callers.
-        out.sort_by(|a, b| a.as_str().cmp(b.as_str()));
-        Ok(out)
+        // Deterministic order.
+        out.sort_by_key(|a| a.id.clone());
+        out
     }
 
-    async fn search_by_name(&self, query: &str, top_k: usize) -> Result<Vec<(EntityId, Atom)>> {
-        if top_k == 0 {
-            return Ok(Vec::new());
-        }
-        let needle = query.to_lowercase();
+    /// All atoms of a given kind string (e.g. `"function"`, `"module"`).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal `RwLock` is poisoned.
+    #[must_use]
+    pub fn atoms_by_kind(&self, kind: &str) -> Vec<CodeAtom> {
         let guard = self.inner.read().expect("rwlock not poisoned");
-        let mut hits: Vec<(EntityId, Atom)> = guard
-            .nodes
-            .iter()
-            .filter(|(_, atom)| atom.name.to_lowercase().contains(&needle))
-            .map(|(id, atom)| (id.clone(), atom.clone()))
+        let mut out: Vec<CodeAtom> = guard
+            .atoms
+            .values()
+            .filter(|a| a.kind == kind)
+            .cloned()
             .collect();
-        // Stable order: shorter names first (closer match), then alphabetical.
-        hits.sort_by(|a, b| {
-            a.1.name
-                .len()
-                .cmp(&b.1.name.len())
-                .then_with(|| a.1.name.cmp(&b.1.name))
-        });
-        hits.truncate(top_k);
-        Ok(hits)
+        out.sort_by_key(|a| a.id.clone());
+        out
     }
 
-    async fn reverse_path(&self, from: &EntityId, hops: u8) -> Result<Vec<Vec<EntityId>>> {
+    /// All atoms for several kinds at once. Returns a `Vec<CodeAtom>` in a
+    /// stable (id-sorted) order.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal `RwLock` is poisoned.
+    #[must_use]
+    pub fn atoms_by_kinds(&self, kinds: &[&str]) -> Vec<CodeAtom> {
+        let guard = self.inner.read().expect("rwlock not poisoned");
+        let mut out: Vec<CodeAtom> = guard
+            .atoms
+            .values()
+            .filter(|a| kinds.contains(&a.kind.as_str()))
+            .cloned()
+            .collect();
+        out.sort_by_key(|a| a.id.clone());
+        out
+    }
+
+    /// All atoms (id-sorted).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal `RwLock` is poisoned.
+    #[must_use]
+    pub fn all_atoms(&self) -> Vec<CodeAtom> {
+        let guard = self.inner.read().expect("rwlock not poisoned");
+        let mut out: Vec<CodeAtom> = guard.atoms.values().cloned().collect();
+        out.sort_by_key(|a| a.id.clone());
+        out
+    }
+
+    /// Outgoing edges from `from`, optionally filtered by kind.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal `RwLock` is poisoned.
+    #[must_use]
+    pub fn edges_from(&self, from: &EntityId) -> Vec<Edge> {
+        let guard = self.inner.read().expect("rwlock not poisoned");
+        guard
+            .edges
+            .iter()
+            .filter(|e| &e.from == from)
+            .cloned()
+            .collect()
+    }
+
+    /// Incoming edges to `to`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal `RwLock` is poisoned.
+    #[must_use]
+    pub fn edges_to(&self, to: &EntityId) -> Vec<Edge> {
+        let guard = self.inner.read().expect("rwlock not poisoned");
+        guard
+            .edges
+            .iter()
+            .filter(|e| &e.to == to)
+            .cloned()
+            .collect()
+    }
+
+    /// All edges whose kind is `Calls`, outgoing from `from`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal `RwLock` is poisoned.
+    #[must_use]
+    pub fn call_edges_from(&self, from: &EntityId) -> Vec<EntityId> {
+        let guard = self.inner.read().expect("rwlock not poisoned");
+        guard
+            .edges
+            .iter()
+            .filter(|e| e.kind == EdgeKind::Calls && &e.from == from)
+            .map(|e| e.to.clone())
+            .collect()
+    }
+
+    /// All edges whose kind is `Calls`, incoming to `to`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal `RwLock` is poisoned.
+    #[must_use]
+    pub fn call_edges_to(&self, to: &EntityId) -> Vec<EntityId> {
+        let guard = self.inner.read().expect("rwlock not poisoned");
+        guard
+            .edges
+            .iter()
+            .filter(|e| e.kind == EdgeKind::Calls && &e.to == to)
+            .map(|e| e.from.clone())
+            .collect()
+    }
+
+    /// Items contained in `parent` (via `Contains` edges).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal `RwLock` is poisoned.
+    #[must_use]
+    pub fn children_of(&self, parent: &EntityId) -> Vec<EntityId> {
+        let guard = self.inner.read().expect("rwlock not poisoned");
+        guard
+            .edges
+            .iter()
+            .filter(|e| e.kind == EdgeKind::Contains && &e.from == parent)
+            .map(|e| e.to.clone())
+            .collect()
+    }
+
+    /// Reverse-path BFS from `from` walking `Calls` edges backwards, up to
+    /// `hops` steps.
+    ///
+    /// Returns all paths found (each path = `[from, predecessor, …]`).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal `RwLock` is poisoned.
+    #[must_use]
+    pub fn reverse_call_paths(&self, from: &EntityId, hops: u8) -> Vec<Vec<EntityId>> {
+        use std::collections::{HashSet, VecDeque};
+
         if hops == 0 {
-            return Ok(vec![vec![from.clone()]]);
+            return vec![vec![from.clone()]];
         }
 
-        // BFS on incoming edges. Each path is a Vec<EntityId> [from, predecessor, ...].
         let guard = self.inner.read().expect("rwlock not poisoned");
         let mut out = Vec::new();
         let mut queue: VecDeque<Vec<EntityId>> = VecDeque::new();
@@ -208,16 +266,14 @@ impl GraphStore<Atom, Relation> for InMemoryStore {
             }
 
             let tip = path.last().expect("path non-empty");
+            let mut visited: HashSet<EntityId> = path.iter().cloned().collect();
             let mut extended = false;
-            let mut visited = HashSet::new();
-            for node in &path {
-                visited.insert(node.clone());
-            }
             for e in &guard.edges {
-                if e.to == *tip && !visited.contains(&e.from) {
+                if e.kind == EdgeKind::Calls && &e.to == tip && !visited.contains(&e.from) {
                     let mut new_path = path.clone();
                     new_path.push(e.from.clone());
                     queue.push_back(new_path);
+                    visited.insert(e.from.clone());
                     extended = true;
                 }
             }
@@ -226,411 +282,206 @@ impl GraphStore<Atom, Relation> for InMemoryStore {
             }
         }
 
-        Ok(out)
+        out
+    }
+
+    /// Whether a `Calls` edge already exists from `from` to `to`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal `RwLock` is poisoned.
+    #[must_use]
+    pub fn has_call_edge(&self, from: &EntityId, to: &EntityId) -> bool {
+        let guard = self.inner.read().expect("rwlock not poisoned");
+        guard
+            .edges
+            .iter()
+            .any(|e| e.kind == EdgeKind::Calls && &e.from == from && &e.to == to)
+    }
+
+    /// Number of atoms stored (for tests / diagnostics).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal `RwLock` is poisoned.
+    #[must_use]
+    pub fn atom_count(&self) -> usize {
+        self.inner.read().expect("rwlock not poisoned").atoms.len()
+    }
+
+    /// Number of edges stored (for tests / diagnostics).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal `RwLock` is poisoned.
+    #[must_use]
+    pub fn edge_count(&self) -> usize {
+        self.inner.read().expect("rwlock not poisoned").edges.len()
     }
 }
 
-/// Convenience helper: ingest a parser [`ParseOutput`] into an [`InMemoryStore`].
-///
-/// Walks `output.atoms` (upserts each), then `output.relations` (adds each
-/// edge). Atom contents (the `output.contents` map) are NOT stored — they
-/// belong to a `KvStore`, which is out of scope for v0.2.
-///
-/// # Errors
-///
-/// Returns the first error from any underlying store operation. Edges that
-/// reference unknown atoms produce [`PolystoreError::NotFound`].
-pub async fn ingest_parse_output(
-    store: &InMemoryStore,
-    output: &ingester_core::ParseOutput,
-) -> Result<()> {
-    for atom in &output.atoms {
-        let id = atom_id_to_entity(&atom.id);
-        store.upsert_node(&id, atom.clone()).await?;
-    }
-    for rel in &output.relations {
-        let from = atom_id_to_entity(&rel.from);
-        let to = atom_id_to_entity(&rel.to);
-        store.add_edge(&from, &to, rel.clone()).await?;
-    }
-    Ok(())
-}
+// ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::{Edge, EdgeKind, EntityId};
     use pretty_assertions::assert_eq;
 
-    fn scope() -> Scope {
-        Scope::new("ns", "repo", "branch")
+    fn atom(id: &str, kind: &str, name: &str, file: &str) -> CodeAtom {
+        CodeAtom {
+            id: EntityId::new(id),
+            kind: kind.to_owned(),
+            name: name.to_owned(),
+            file_path: file.to_owned(),
+            line_start: 1,
+            line_end: 10,
+            doc: String::new(),
+            signature: String::new(),
+            content_hash: "deadbeef".to_owned(),
+            calls: Vec::new(),
+        }
     }
 
-    fn make_atom(id: &str, kind: &str, name: &str) -> Atom {
-        Atom::new(AtomId::new(id), kind, name, "deadbeef")
+    fn edge(from: &str, to: &str, kind: EdgeKind) -> Edge {
+        Edge::new(EntityId::new(from), EntityId::new(to), kind)
     }
 
     #[test]
-    fn new_store_is_empty_and_carries_scope() {
-        let store = InMemoryStore::new(scope());
-        assert_eq!(store.node_count(), 0);
+    fn new_store_is_empty() {
+        let store = Store::new();
+        assert_eq!(store.atom_count(), 0);
         assert_eq!(store.edge_count(), 0);
-        assert_eq!(store.scope().to_string(), "ns/repo/branch");
     }
 
     #[test]
-    fn atom_id_to_entity_bridges_string_repr() {
-        let aid = AtomId::new("code:foo.rs");
-        let eid = atom_id_to_entity(&aid);
-        assert_eq!(eid.as_str(), "code:foo.rs");
-    }
-
-    #[tokio::test]
-    async fn upsert_then_get_returns_stored_atom() {
-        let store = InMemoryStore::new(scope());
-        let id = EntityId::new("code:x");
-        let atom = make_atom("code:x", "function", "foo");
-        store.upsert_node(&id, atom.clone()).await.expect("upsert");
-        let got = store.get_node(&id).await.expect("get").expect("present");
+    fn add_then_get_atom_roundtrips() {
+        let store = Store::new();
+        let a = atom(
+            "code:src/lib.rs::function::foo",
+            "function",
+            "foo",
+            "src/lib.rs",
+        );
+        store.add_atom(a.clone());
+        let got = store
+            .get_atom(&EntityId::new("code:src/lib.rs::function::foo"))
+            .expect("present");
         assert_eq!(got.name, "foo");
     }
 
-    #[tokio::test]
-    async fn get_missing_returns_none() {
-        let store = InMemoryStore::new(scope());
-        let id = EntityId::new("code:missing");
-        assert!(store.get_node(&id).await.expect("get").is_none());
-    }
-
-    #[tokio::test]
-    async fn upsert_replaces_existing_node() {
-        let store = InMemoryStore::new(scope());
-        let id = EntityId::new("code:x");
-        store
-            .upsert_node(&id, make_atom("code:x", "function", "first"))
-            .await
-            .expect("upsert");
-        store
-            .upsert_node(&id, make_atom("code:x", "function", "second"))
-            .await
-            .expect("upsert");
-        assert_eq!(store.node_count(), 1);
-        let got = store.get_node(&id).await.expect("get").expect("present");
-        assert_eq!(got.name, "second");
-    }
-
-    #[tokio::test]
-    async fn delete_node_cascades_to_edges() {
-        let store = InMemoryStore::new(scope());
-        let a = EntityId::new("a");
-        let b = EntityId::new("b");
-        store
-            .upsert_node(&a, make_atom("a", "function", "a"))
-            .await
-            .expect("upsert");
-        store
-            .upsert_node(&b, make_atom("b", "function", "b"))
-            .await
-            .expect("upsert");
-        store
-            .add_edge(
-                &a,
-                &b,
-                Relation::new(AtomId::new("a"), AtomId::new("b"), "calls"),
-            )
-            .await
-            .expect("edge");
-        assert_eq!(store.edge_count(), 1);
-        store.delete_node(&a).await.expect("delete");
-        assert_eq!(store.node_count(), 1);
-        assert_eq!(store.edge_count(), 0);
-    }
-
-    #[tokio::test]
-    async fn delete_missing_node_is_idempotent() {
-        let store = InMemoryStore::new(scope());
-        store.delete_node(&EntityId::new("nope")).await.expect("ok");
-    }
-
-    #[tokio::test]
-    async fn add_edge_rejects_unknown_endpoints() {
-        let store = InMemoryStore::new(scope());
-        let a = EntityId::new("a");
-        let b = EntityId::new("b");
-        store
-            .upsert_node(&a, make_atom("a", "function", "a"))
-            .await
-            .expect("upsert");
-
-        // 'b' missing
-        let err = store
-            .add_edge(
-                &a,
-                &b,
-                Relation::new(AtomId::new("a"), AtomId::new("b"), "calls"),
-            )
-            .await
-            .expect_err("must fail on missing to");
-        assert!(matches!(err, PolystoreError::NotFound(_)));
-
-        // 'a' missing (after deleting it)
-        store.delete_node(&a).await.expect("ok");
-        let err = store
-            .add_edge(
-                &a,
-                &b,
-                Relation::new(AtomId::new("a"), AtomId::new("b"), "calls"),
-            )
-            .await
-            .expect_err("must fail on missing from");
-        assert!(matches!(err, PolystoreError::NotFound(_)));
-    }
-
-    #[tokio::test]
-    async fn neighbors_outgoing_incoming_both() {
-        let store = InMemoryStore::new(scope());
-        let a = EntityId::new("a");
-        let b = EntityId::new("b");
-        let c = EntityId::new("c");
-        for (id, name) in [(&a, "a"), (&b, "b"), (&c, "c")] {
+    #[test]
+    fn add_atom_upserts() {
+        let store = Store::new();
+        store.add_atom(atom("code:x", "function", "first", "src/a.rs"));
+        store.add_atom(atom("code:x", "function", "second", "src/a.rs"));
+        assert_eq!(store.atom_count(), 1);
+        assert_eq!(
             store
-                .upsert_node(id, make_atom(name, "function", name))
-                .await
-                .expect("upsert");
-        }
-        // a → b, a → c, b → c
-        for (from, to) in [(&a, &b), (&a, &c), (&b, &c)] {
-            store
-                .add_edge(
-                    from,
-                    to,
-                    Relation::new(
-                        AtomId::new(from.as_str()),
-                        AtomId::new(to.as_str()),
-                        "calls",
-                    ),
-                )
-                .await
-                .expect("edge");
-        }
-
-        let outs = store
-            .neighbors(&a, Direction::Outgoing)
-            .await
-            .expect("neighbors");
-        let out_ids: Vec<&str> = outs.iter().map(|(n, _)| n.as_str()).collect();
-        assert!(out_ids.contains(&"b"));
-        assert!(out_ids.contains(&"c"));
-        assert_eq!(out_ids.len(), 2);
-
-        let ins = store
-            .neighbors(&c, Direction::Incoming)
-            .await
-            .expect("neighbors");
-        let in_ids: Vec<&str> = ins.iter().map(|(n, _)| n.as_str()).collect();
-        assert!(in_ids.contains(&"a"));
-        assert!(in_ids.contains(&"b"));
-        assert_eq!(in_ids.len(), 2);
-
-        let both = store
-            .neighbors(&b, Direction::Both)
-            .await
-            .expect("neighbors");
-        let both_ids: Vec<&str> = both.iter().map(|(n, _)| n.as_str()).collect();
-        assert!(both_ids.contains(&"a")); // incoming a → b
-        assert!(both_ids.contains(&"c")); // outgoing b → c
-        assert_eq!(both_ids.len(), 2);
+                .get_atom(&EntityId::new("code:x"))
+                .expect("present")
+                .name,
+            "second"
+        );
     }
 
-    #[tokio::test]
-    async fn list_by_kind_filters_and_sorts() {
-        let store = InMemoryStore::new(scope());
-        for (id, kind) in [
-            ("code:fn:a", "function"),
-            ("code:struct:s", "struct"),
-            ("code:fn:b", "function"),
-        ] {
-            let eid = EntityId::new(id);
-            store
-                .upsert_node(&eid, make_atom(id, kind, id))
-                .await
-                .expect("upsert");
-        }
-        let fns = store.list_by_kind("function").await.expect("list");
-        let ids: Vec<&str> = fns.iter().map(EntityId::as_str).collect();
-        assert_eq!(ids, vec!["code:fn:a", "code:fn:b"]);
-
-        let structs = store.list_by_kind("struct").await.expect("list");
-        assert_eq!(structs.len(), 1);
-
-        let none = store.list_by_kind("trait").await.expect("list");
-        assert!(none.is_empty());
+    #[test]
+    fn atoms_by_kind_filters_correctly() {
+        let store = Store::new();
+        store.add_atom(atom("code:a", "function", "a", "src/a.rs"));
+        store.add_atom(atom("code:b", "module", "b", "src/b.rs"));
+        store.add_atom(atom("code:c", "function", "c", "src/c.rs"));
+        let fns = store.atoms_by_kind("function");
+        assert_eq!(fns.len(), 2);
+        let mods = store.atoms_by_kind("module");
+        assert_eq!(mods.len(), 1);
     }
 
-    #[tokio::test]
-    async fn search_by_name_substring_top_k() {
-        let store = InMemoryStore::new(scope());
-        for name in ["hello", "hello_world", "world", "Helmut"] {
-            let id = EntityId::new(format!("code:{name}"));
-            store
-                .upsert_node(&id, make_atom(id.as_str(), "function", name))
-                .await
-                .expect("upsert");
-        }
-        // Case-insensitive substring `hel`
-        let hits = store.search_by_name("hel", 10).await.expect("search");
-        let names: Vec<&str> = hits.iter().map(|(_, a)| a.name.as_str()).collect();
-        assert!(names.contains(&"hello"));
-        assert!(names.contains(&"hello_world"));
-        assert!(names.contains(&"Helmut"));
-
-        // Top-k limits
-        let limited = store.search_by_name("hel", 2).await.expect("search");
-        assert_eq!(limited.len(), 2);
-        // Shortest first ordering
-        assert_eq!(limited[0].1.name, "hello");
-
-        // top_k = 0 short-circuits
-        let zero = store.search_by_name("hel", 0).await.expect("search");
-        assert!(zero.is_empty());
-
-        // No match returns empty
-        let empty = store.search_by_name("zzz", 10).await.expect("search");
-        assert!(empty.is_empty());
+    #[test]
+    fn atoms_in_file_filters_by_path() {
+        let store = Store::new();
+        store.add_atom(atom("code:1", "function", "f", "src/a.rs"));
+        store.add_atom(atom("code:2", "function", "g", "src/b.rs"));
+        let in_a = store.atoms_in_file("src/a.rs");
+        assert_eq!(in_a.len(), 1);
+        assert_eq!(in_a[0].name, "f");
     }
 
-    #[tokio::test]
-    async fn reverse_path_walks_incoming_edges() {
-        let store = InMemoryStore::new(scope());
-        // a → b → c. From c, reverse path of length 2 should reach a.
-        for n in ["a", "b", "c"] {
-            let eid = EntityId::new(n);
-            store
-                .upsert_node(&eid, make_atom(n, "function", n))
-                .await
-                .expect("upsert");
-        }
-        for (from, to) in [("a", "b"), ("b", "c")] {
-            let f = EntityId::new(from);
-            let t = EntityId::new(to);
-            store
-                .add_edge(
-                    &f,
-                    &t,
-                    Relation::new(AtomId::new(from), AtomId::new(to), "calls"),
-                )
-                .await
-                .expect("edge");
-        }
+    #[test]
+    fn edges_from_and_to_work() {
+        let store = Store::new();
+        store.add_edge(edge("a", "b", EdgeKind::Calls));
+        store.add_edge(edge("a", "c", EdgeKind::Contains));
+        let from_a = store.edges_from(&EntityId::new("a"));
+        assert_eq!(from_a.len(), 2);
+        let to_b = store.edges_to(&EntityId::new("b"));
+        assert_eq!(to_b.len(), 1);
+    }
 
-        let paths_0 = store
-            .reverse_path(&EntityId::new("c"), 0)
-            .await
-            .expect("paths");
-        assert_eq!(paths_0, vec![vec![EntityId::new("c")]]);
+    #[test]
+    fn call_edges_from_and_to_filter_by_kind() {
+        let store = Store::new();
+        store.add_edge(edge("a", "b", EdgeKind::Calls));
+        store.add_edge(edge("a", "c", EdgeKind::Contains));
+        store.add_edge(edge("d", "b", EdgeKind::Calls));
+        let calls_from_a = store.call_edges_from(&EntityId::new("a"));
+        assert_eq!(calls_from_a.len(), 1);
+        assert_eq!(calls_from_a[0].as_str(), "b");
+        let calls_to_b = store.call_edges_to(&EntityId::new("b"));
+        assert_eq!(calls_to_b.len(), 2);
+    }
 
-        let paths_2 = store
-            .reverse_path(&EntityId::new("c"), 2)
-            .await
-            .expect("paths");
-        // Expect at least one path c → b → a
-        let has_full = paths_2.iter().any(|p| {
+    #[test]
+    fn children_of_returns_contains_targets() {
+        let store = Store::new();
+        store.add_edge(edge("mod", "fn1", EdgeKind::Contains));
+        store.add_edge(edge("mod", "fn2", EdgeKind::Contains));
+        store.add_edge(edge("mod", "ext", EdgeKind::Calls));
+        let children = store.children_of(&EntityId::new("mod"));
+        assert_eq!(children.len(), 2);
+    }
+
+    #[test]
+    fn reverse_call_paths_zero_hops_returns_self() {
+        let store = Store::new();
+        let paths = store.reverse_call_paths(&EntityId::new("c"), 0);
+        assert_eq!(paths, vec![vec![EntityId::new("c")]]);
+    }
+
+    #[test]
+    fn reverse_call_paths_walks_back() {
+        let store = Store::new();
+        // a → b → c
+        store.add_edge(edge("a", "b", EdgeKind::Calls));
+        store.add_edge(edge("b", "c", EdgeKind::Calls));
+        let paths = store.reverse_call_paths(&EntityId::new("c"), 2);
+        let has_full = paths.iter().any(|p| {
             p.len() == 3 && p[0].as_str() == "c" && p[1].as_str() == "b" && p[2].as_str() == "a"
         });
-        assert!(has_full, "expected reverse path c → b → a, got {paths_2:?}");
-
-        // hops=1 should reach b but not a
-        let paths_1 = store
-            .reverse_path(&EntityId::new("c"), 1)
-            .await
-            .expect("paths");
-        assert!(paths_1.iter().any(|p| p.len() == 2 && p[1].as_str() == "b"));
-        assert!(paths_1.iter().all(|p| p.iter().all(|n| n.as_str() != "a")));
+        assert!(has_full, "expected c→b→a path, got {paths:?}");
     }
 
-    #[tokio::test]
-    async fn reverse_path_visits_each_node_once_per_path() {
-        // a → b, b → a (cycle). reverse_path from a, hops=3 must terminate
-        // and not loop forever.
-        let store = InMemoryStore::new(scope());
-        for n in ["a", "b"] {
-            let eid = EntityId::new(n);
-            store
-                .upsert_node(&eid, make_atom(n, "function", n))
-                .await
-                .expect("upsert");
-        }
-        for (from, to) in [("a", "b"), ("b", "a")] {
-            let f = EntityId::new(from);
-            let t = EntityId::new(to);
-            store
-                .add_edge(
-                    &f,
-                    &t,
-                    Relation::new(AtomId::new(from), AtomId::new(to), "calls"),
-                )
-                .await
-                .expect("edge");
-        }
-        let paths = store
-            .reverse_path(&EntityId::new("a"), 3)
-            .await
-            .expect("paths");
-        // Must terminate. Every path must be acyclic (no node repeated within it).
+    #[test]
+    fn reverse_call_paths_cycle_terminates() {
+        let store = Store::new();
+        store.add_edge(edge("a", "b", EdgeKind::Calls));
+        store.add_edge(edge("b", "a", EdgeKind::Calls));
+        // Must terminate, not loop forever.
+        let paths = store.reverse_call_paths(&EntityId::new("a"), 3);
         for p in &paths {
-            let mut seen = HashSet::new();
-            for n in p {
-                assert!(seen.insert(n.clone()), "cycle in path: {p:?}");
-            }
+            let ids: std::collections::HashSet<&EntityId> = p.iter().collect();
+            assert_eq!(ids.len(), p.len(), "cycle in path: {p:?}");
         }
     }
 
-    #[tokio::test]
-    async fn ingest_parse_output_round_trip() {
-        let store = InMemoryStore::new(scope());
-        let mut output = ingester_core::ParseOutput::default();
-        let a = AtomId::new("code:m");
-        let b = AtomId::new("code:m::function::foo");
-        output.atoms.push(Atom::new(a.clone(), "module", "m", "h0"));
-        output
-            .atoms
-            .push(Atom::new(b.clone(), "function", "foo", "h1"));
-        output
-            .relations
-            .push(Relation::new(a.clone(), b.clone(), "contains"));
-
-        ingest_parse_output(&store, &output)
-            .await
-            .expect("ingest ok");
-
-        assert_eq!(store.node_count(), 2);
-        assert_eq!(store.edge_count(), 1);
-
-        let fns = store.list_by_kind("function").await.expect("list");
-        assert_eq!(fns.len(), 1);
-        assert_eq!(fns[0].as_str(), "code:m::function::foo");
-
-        let neighbors = store
-            .neighbors(&EntityId::new("code:m"), Direction::Outgoing)
-            .await
-            .expect("neighbors");
-        assert_eq!(neighbors.len(), 1);
-        assert_eq!(neighbors[0].0.as_str(), "code:m::function::foo");
-        assert_eq!(neighbors[0].1.kind, "contains");
-    }
-
-    #[tokio::test]
-    async fn ingest_parse_output_propagates_missing_endpoint_error() {
-        let store = InMemoryStore::new(scope());
-        let mut output = ingester_core::ParseOutput::default();
-        // Relation references atoms that aren't in `atoms` — should NotFound.
-        output.relations.push(Relation::new(
-            AtomId::new("ghost-a"),
-            AtomId::new("ghost-b"),
-            "calls",
-        ));
-        let err = ingest_parse_output(&store, &output)
-            .await
-            .expect_err("must fail");
-        assert!(matches!(err, PolystoreError::NotFound(_)));
+    #[test]
+    fn has_call_edge_checks_existence() {
+        let store = Store::new();
+        let a = EntityId::new("a");
+        let b = EntityId::new("b");
+        assert!(!store.has_call_edge(&a, &b));
+        store.add_edge(edge("a", "b", EdgeKind::Calls));
+        assert!(store.has_call_edge(&a, &b));
+        assert!(!store.has_call_edge(&b, &a));
     }
 }

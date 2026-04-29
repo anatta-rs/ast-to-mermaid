@@ -4,9 +4,9 @@
 //! Best-effort layout aware of the `crates/<X>/` workspace convention. For
 //! flat repos (no `crates/` prefix), the leading path segment is used.
 
+use crate::graph::Store;
+use crate::model::EdgeKind;
 use crate::render::util::{crate_name, escape_label, mermaid_id};
-use ingester_core::{Atom, Relation};
-use polystore::{Direction, EntityId, GraphStore, Result};
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write as _;
 
@@ -17,9 +17,6 @@ struct CrateCounts {
     modules: usize,
     functions: usize,
     structs: usize,
-    traits: usize,
-    impls: usize,
-    enums: usize,
 }
 
 impl CrateCounts {
@@ -28,9 +25,6 @@ impl CrateCounts {
             "module" => self.modules += 1,
             "function" => self.functions += 1,
             "struct" => self.structs += 1,
-            "trait" => self.traits += 1,
-            "impl" => self.impls += 1,
-            "enum" => self.enums += 1,
             _ => {}
         }
     }
@@ -43,101 +37,56 @@ impl CrateCounts {
     }
 }
 
-fn crate_of_atom(atom: &Atom) -> Option<String> {
-    atom.metadata
-        .get("file_path")
-        .and_then(|v| v.as_str())
-        .map(|p| crate_name(p).to_owned())
-}
-
 /// Render the project-level Mermaid view of `store`.
 ///
 /// One node per crate with `(modules, functions, structs)` counts; one edge
 /// per cross-crate `calls` aggregation labelled with the call count.
-///
-/// # Errors
-///
-/// Propagates any error from the underlying store.
-pub async fn render<S>(store: &S) -> Result<String>
-where
-    S: GraphStore<Atom, Relation>,
-{
-    // 1. Bulk-list ids per kind (1 query for backends that override
-    //    list_by_kinds; falls back to N for default impls).
-    let kind_groups = store.list_by_kinds(KINDS).await?;
+#[must_use]
+pub fn render(store: &Store) -> String {
+    let atoms = store.atoms_by_kinds(KINDS);
 
-    // Flatten + remember which ids are functions for the edge pass.
-    let mut all_ids = Vec::new();
-    let mut id_to_kind: HashMap<EntityId, &'static str> = HashMap::new();
-    let mut function_ids = Vec::new();
-    for (kind, ids) in &kind_groups {
-        let kind_lit = match kind.as_str() {
-            "module" => "module",
-            "function" => "function",
-            "struct" => "struct",
-            "trait" => "trait",
-            "impl" => "impl",
-            "enum" => "enum",
-            _ => continue,
-        };
-        for id in ids {
-            id_to_kind.insert(id.clone(), kind_lit);
-            if kind_lit == "function" {
-                function_ids.push(id.clone());
-            }
-            all_ids.push(id.clone());
-        }
-    }
-
-    // 2. Bulk-fetch every node we need (1 query for backends that override).
-    let nodes = store.get_nodes_bulk(&all_ids).await?;
-    let id_to_atom: HashMap<EntityId, Atom> = all_ids
-        .iter()
-        .zip(nodes)
-        .filter_map(|(id, opt)| opt.map(|a| (id.clone(), a)))
-        .collect();
-
-    // 3. Counts per crate (purely from the in-memory map — zero queries).
+    // Build crate-count map.
     let mut counts: BTreeMap<String, CrateCounts> = BTreeMap::new();
-    for (id, kind) in &id_to_kind {
-        if let Some(atom) = id_to_atom.get(id)
-            && let Some(c) = crate_of_atom(atom)
-        {
-            counts.entry(c).or_default().bump(kind);
+    for atom in &atoms {
+        let c = crate_name(&atom.file_path).to_owned();
+        if !c.is_empty() {
+            counts.entry(c).or_default().bump(&atom.kind);
         }
     }
 
-    // 4. Cross-crate edges (1 bulk neighbors query for the function set).
+    // Build a file_path → crate_name map for the edge pass.
+    let mut file_to_crate: HashMap<String, String> = HashMap::new();
+    for atom in &atoms {
+        let c = crate_name(&atom.file_path).to_owned();
+        if !c.is_empty() {
+            file_to_crate.insert(atom.file_path.clone(), c);
+        }
+    }
+
+    // Cross-crate call edges.
     let mut edges: BTreeMap<(String, String), usize> = BTreeMap::new();
-    let neighbor_groups = store
-        .neighbors_bulk(&function_ids, Direction::Outgoing)
-        .await?;
-    for (caller_id, outs) in neighbor_groups {
-        let Some(caller_atom) = id_to_atom.get(&caller_id) else {
+    let functions = store.atoms_by_kind("function");
+    for caller in &functions {
+        let Some(caller_crate) = file_to_crate.get(&caller.file_path) else {
             continue;
         };
-        let Some(caller_crate) = crate_of_atom(caller_atom) else {
-            continue;
-        };
-        for (target_id, rel) in outs {
-            if rel.kind != "calls" {
+        let calls_out = store.edges_from(&caller.id);
+        for edge in calls_out {
+            if edge.kind != EdgeKind::Calls {
                 continue;
             }
-            let Some(target_atom) = id_to_atom.get(&target_id) else {
-                continue;
-            };
-            let Some(target_crate) = crate_of_atom(target_atom) else {
-                continue;
-            };
-            if target_crate != caller_crate {
+            if let Some(callee) = store.get_atom(&edge.to)
+                && let Some(callee_crate) = file_to_crate.get(&callee.file_path)
+                && callee_crate != caller_crate
+            {
                 *edges
-                    .entry((caller_crate.clone(), target_crate))
+                    .entry((caller_crate.clone(), callee_crate.clone()))
                     .or_default() += 1;
             }
         }
     }
 
-    // 3. Render Mermaid.
+    // Render Mermaid.
     let mut mermaid = String::from("graph TD\n");
     for (name, c) in &counts {
         let id = mermaid_id(name);
@@ -152,112 +101,92 @@ where
                 .expect("writing to String");
         }
     }
-    Ok(mermaid)
+    mermaid
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::graph::{InMemoryStore, ingest_parse_output};
-    use ingester_core::{AtomId, ParseOutput};
-    use polystore::Scope;
+    use crate::graph::Store;
+    use crate::model::{CodeAtom, Edge, EdgeKind, EntityId};
 
-    fn scope() -> Scope {
-        Scope::new("ns", "repo", "branch")
-    }
-
-    fn module_atom(file_path: &str, name: &str) -> Atom {
-        Atom::new(
-            AtomId::new(format!("code:{file_path}")),
-            "module",
-            name,
-            "h",
-        )
-        .with_metadata(serde_json::json!({"file_path": file_path}))
-    }
-
-    fn item_atom(file_path: &str, kind: &str, name: &str, calls: &[&str]) -> Atom {
-        let id = AtomId::new(format!("code:{file_path}::{kind}::{name}"));
-        let mut meta = serde_json::json!({"file_path": file_path});
-        if !calls.is_empty() {
-            meta["calls"] = serde_json::json!(calls);
+    fn module_atom(file_path: &str, name: &str) -> CodeAtom {
+        CodeAtom {
+            id: EntityId::new(format!("code:{file_path}")),
+            kind: "module".to_owned(),
+            name: name.to_owned(),
+            file_path: file_path.to_owned(),
+            line_start: 1,
+            line_end: 1,
+            doc: String::new(),
+            signature: String::new(),
+            content_hash: "h".to_owned(),
+            calls: Vec::new(),
         }
-        Atom::new(id, kind, name, "h").with_metadata(meta)
     }
 
-    fn build(file_path: &str, items: &[(&str, &str, &[&str])]) -> ParseOutput {
-        let mut o = ParseOutput::default();
-        let m = module_atom(
-            file_path,
-            file_path
-                .rsplit('/')
-                .next()
-                .unwrap_or(file_path)
-                .strip_suffix(".rs")
-                .unwrap_or(file_path),
-        );
-        let mid = m.id.clone();
-        o.atoms.push(m);
-        for (kind, name, calls) in items {
-            let a = item_atom(file_path, kind, name, calls);
-            o.relations
-                .push(Relation::new(mid.clone(), a.id.clone(), "contains"));
-            o.atoms.push(a);
+    fn fn_atom(file_path: &str, name: &str) -> CodeAtom {
+        CodeAtom {
+            id: EntityId::new(format!("code:{file_path}::function::{name}")),
+            kind: "function".to_owned(),
+            name: name.to_owned(),
+            file_path: file_path.to_owned(),
+            line_start: 1,
+            line_end: 10,
+            doc: String::new(),
+            signature: String::new(),
+            content_hash: "h".to_owned(),
+            calls: Vec::new(),
         }
-        o
     }
 
-    #[tokio::test]
-    async fn empty_store_renders_minimal_graph() {
-        let store = InMemoryStore::new(scope());
-        let out = render(&store).await.expect("ok");
+    fn struct_atom(file_path: &str, name: &str) -> CodeAtom {
+        CodeAtom {
+            id: EntityId::new(format!("code:{file_path}::struct::{name}")),
+            kind: "struct".to_owned(),
+            name: name.to_owned(),
+            file_path: file_path.to_owned(),
+            line_start: 1,
+            line_end: 5,
+            doc: String::new(),
+            signature: String::new(),
+            content_hash: "h".to_owned(),
+            calls: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn empty_store_renders_minimal_graph() {
+        let store = Store::new();
+        let out = render(&store);
         assert_eq!(out, "graph TD\n");
     }
 
-    #[tokio::test]
-    async fn single_crate_counts_modules_functions_structs() {
-        let store = InMemoryStore::new(scope());
-        let a = build(
-            "crates/foo/src/lib.rs",
-            &[
-                ("function", "f1", &[]),
-                ("function", "f2", &[]),
-                ("struct", "S", &[]),
-            ],
-        );
-        ingest_parse_output(&store, &a).await.expect("ingest");
-        let out = render(&store).await.expect("render");
+    #[test]
+    fn single_crate_counts_modules_functions_structs() {
+        let store = Store::new();
+        store.add_atom(module_atom("crates/foo/src/lib.rs", "lib"));
+        store.add_atom(fn_atom("crates/foo/src/lib.rs", "f1"));
+        store.add_atom(fn_atom("crates/foo/src/lib.rs", "f2"));
+        store.add_atom(struct_atom("crates/foo/src/lib.rs", "S"));
+        let out = render(&store);
         assert!(out.contains("foo — 1 mod, 2 fn, 1 struct"));
     }
 
-    #[tokio::test]
-    async fn cross_crate_calls_emit_edges_with_counts() {
-        let store = InMemoryStore::new(scope());
-        // crate_a fn caller calls helper (in crate_b)
-        let a = build("crates/crate_a/src/lib.rs", &[("function", "caller", &[])]);
-        let b = build("crates/crate_b/src/lib.rs", &[("function", "helper", &[])]);
-        ingest_parse_output(&store, &a).await.expect("a");
-        ingest_parse_output(&store, &b).await.expect("b");
+    #[test]
+    fn cross_crate_calls_emit_edges_with_counts() {
+        let store = Store::new();
+        store.add_atom(module_atom("crates/crate_a/src/lib.rs", "lib"));
+        store.add_atom(module_atom("crates/crate_b/src/lib.rs", "lib"));
+        let caller = fn_atom("crates/crate_a/src/lib.rs", "caller");
+        let helper = fn_atom("crates/crate_b/src/lib.rs", "helper");
+        let caller_id = caller.id.clone();
+        let helper_id = helper.id.clone();
+        store.add_atom(caller);
+        store.add_atom(helper);
+        store.add_edge(Edge::new(caller_id, helper_id, EdgeKind::Calls));
 
-        // Manually add a cross-crate calls edge.
-        let caller_id =
-            polystore::EntityId::new("code:crates/crate_a/src/lib.rs::function::caller");
-        let helper_id =
-            polystore::EntityId::new("code:crates/crate_b/src/lib.rs::function::helper");
-        store
-            .add_edge(
-                &caller_id,
-                &helper_id,
-                Relation::new(
-                    AtomId::new(caller_id.as_str()),
-                    AtomId::new(helper_id.as_str()),
-                    "calls",
-                ),
-            )
-            .await
-            .expect("edge");
-
-        let out = render(&store).await.expect("render");
+        let out = render(&store);
         assert!(out.contains("crate_a"));
         assert!(out.contains("crate_b"));
         assert!(
@@ -266,105 +195,78 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn intra_crate_calls_do_not_emit_edges() {
-        let store = InMemoryStore::new(scope());
-        let a = build(
-            "crates/foo/src/lib.rs",
-            &[("function", "a", &[]), ("function", "b", &[])],
-        );
-        ingest_parse_output(&store, &a).await.expect("a");
-        let aid = polystore::EntityId::new("code:crates/foo/src/lib.rs::function::a");
-        let bid = polystore::EntityId::new("code:crates/foo/src/lib.rs::function::b");
-        store
-            .add_edge(
-                &aid,
-                &bid,
-                Relation::new(
-                    AtomId::new(aid.as_str()),
-                    AtomId::new(bid.as_str()),
-                    "calls",
-                ),
-            )
-            .await
-            .expect("edge");
+    #[test]
+    fn intra_crate_calls_do_not_emit_edges() {
+        let store = Store::new();
+        store.add_atom(module_atom("crates/foo/src/lib.rs", "lib"));
+        let a = fn_atom("crates/foo/src/lib.rs", "a");
+        let b = fn_atom("crates/foo/src/lib.rs", "b");
+        let aid = a.id.clone();
+        let bid = b.id.clone();
+        store.add_atom(a);
+        store.add_atom(b);
+        store.add_edge(Edge::new(aid, bid, EdgeKind::Calls));
 
-        let out = render(&store).await.expect("render");
-        // No `--> ` cross-crate edge should appear (intra-crate filtered out).
+        let out = render(&store);
         assert!(!out.contains("-->"));
     }
 
-    #[tokio::test]
-    async fn multiple_calls_aggregate_to_single_edge_with_count() {
-        let store = InMemoryStore::new(scope());
-        let a = build(
-            "crates/crate_a/src/lib.rs",
-            &[
-                ("function", "caller_one", &[]),
-                ("function", "caller_two", &[]),
-            ],
-        );
-        let b = build("crates/crate_b/src/lib.rs", &[("function", "helper", &[])]);
-        ingest_parse_output(&store, &a).await.expect("a");
-        ingest_parse_output(&store, &b).await.expect("b");
+    #[test]
+    fn multiple_calls_aggregate_to_single_edge_with_count() {
+        let store = Store::new();
+        store.add_atom(module_atom("crates/crate_a/src/lib.rs", "lib"));
+        store.add_atom(module_atom("crates/crate_b/src/lib.rs", "lib"));
+        let c1 = fn_atom("crates/crate_a/src/lib.rs", "caller_one");
+        let c2 = fn_atom("crates/crate_a/src/lib.rs", "caller_two");
+        let helper = fn_atom("crates/crate_b/src/lib.rs", "helper");
+        let c1_id = c1.id.clone();
+        let c2_id = c2.id.clone();
+        let helper_id = helper.id.clone();
+        store.add_atom(c1);
+        store.add_atom(c2);
+        store.add_atom(helper);
+        store.add_edge(Edge::new(c1_id, helper_id.clone(), EdgeKind::Calls));
+        store.add_edge(Edge::new(c2_id, helper_id, EdgeKind::Calls));
 
-        let helper_id =
-            polystore::EntityId::new("code:crates/crate_b/src/lib.rs::function::helper");
-        for caller in ["caller_one", "caller_two"] {
-            let cid = polystore::EntityId::new(format!(
-                "code:crates/crate_a/src/lib.rs::function::{caller}"
-            ));
-            store
-                .add_edge(
-                    &cid,
-                    &helper_id,
-                    Relation::new(
-                        AtomId::new(cid.as_str()),
-                        AtomId::new(helper_id.as_str()),
-                        "calls",
-                    ),
-                )
-                .await
-                .expect("edge");
-        }
-
-        let out = render(&store).await.expect("render");
+        let out = render(&store);
         assert!(out.contains("crate_a -->|\"2 calls\"| crate_b"));
     }
 
-    #[tokio::test]
-    async fn non_calls_relations_ignored_in_edges() {
-        let store = InMemoryStore::new(scope());
-        let a = build("crates/crate_a/src/lib.rs", &[("function", "f", &[])]);
-        let b = build("crates/crate_b/src/lib.rs", &[("function", "g", &[])]);
-        ingest_parse_output(&store, &a).await.expect("a");
-        ingest_parse_output(&store, &b).await.expect("b");
+    #[test]
+    fn non_calls_relations_ignored_in_edges() {
+        let store = Store::new();
+        store.add_atom(module_atom("crates/crate_a/src/lib.rs", "lib"));
+        store.add_atom(module_atom("crates/crate_b/src/lib.rs", "lib"));
+        let f = fn_atom("crates/crate_a/src/lib.rs", "f");
+        let g = fn_atom("crates/crate_b/src/lib.rs", "g");
+        let fid = f.id.clone();
+        let gid = g.id.clone();
+        store.add_atom(f);
+        store.add_atom(g);
+        store.add_edge(Edge::new(fid, gid, EdgeKind::Uses));
 
-        // RELATES_TO with role uses — must NOT count as a call edge.
-        let fid = polystore::EntityId::new("code:crates/crate_a/src/lib.rs::function::f");
-        let gid = polystore::EntityId::new("code:crates/crate_b/src/lib.rs::function::g");
-        store
-            .add_edge(
-                &fid,
-                &gid,
-                Relation::new(AtomId::new(fid.as_str()), AtomId::new(gid.as_str()), "uses"),
-            )
-            .await
-            .expect("edge");
-
-        let out = render(&store).await.expect("render");
+        let out = render(&store);
         assert!(!out.contains("-->"));
     }
 
-    #[tokio::test]
-    async fn atom_without_file_path_skipped() {
-        let store = InMemoryStore::new(scope());
-        let mut o = ParseOutput::default();
-        let mut m = module_atom("crates/foo/src/lib.rs", "lib");
-        m.metadata = serde_json::json!({});
-        o.atoms.push(m);
-        ingest_parse_output(&store, &o).await.expect("ingest");
-        let out = render(&store).await.expect("render");
+    #[test]
+    fn atom_without_file_path_skipped() {
+        let store = Store::new();
+        // Atom with empty file_path — should produce empty crate name → skipped.
+        let a = CodeAtom {
+            id: EntityId::new("code:ghost"),
+            kind: "module".to_owned(),
+            name: "ghost".to_owned(),
+            file_path: String::new(),
+            line_start: 1,
+            line_end: 1,
+            doc: String::new(),
+            signature: String::new(),
+            content_hash: "h".to_owned(),
+            calls: Vec::new(),
+        };
+        store.add_atom(a);
+        let out = render(&store);
         assert_eq!(out, "graph TD\n");
     }
 
@@ -381,19 +283,5 @@ mod tests {
         assert_eq!(c.functions, 2);
         assert_eq!(c.structs, 1);
         assert_eq!(c.label("foo"), "foo — 1 mod, 2 fn, 1 struct");
-    }
-
-    #[test]
-    fn crate_counts_bumps_all_kinds() {
-        let mut c = CrateCounts::default();
-        for k in ["module", "function", "struct", "trait", "impl", "enum"] {
-            c.bump(k);
-        }
-        assert_eq!(c.modules, 1);
-        assert_eq!(c.functions, 1);
-        assert_eq!(c.structs, 1);
-        assert_eq!(c.traits, 1);
-        assert_eq!(c.impls, 1);
-        assert_eq!(c.enums, 1);
     }
 }

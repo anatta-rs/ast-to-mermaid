@@ -8,21 +8,18 @@ license = "Apache-2.0"
 repository = "https://github.com/anatta-rs/ast-to-mermaid"
 
 [dependencies]
-polystore = { git = "https://github.com/anatta-rs/polystore", branch = "main" }
-ingester-core = { git = "https://github.com/anatta-rs/ingester", branch = "main" }
-ingester-code = { git = "https://github.com/anatta-rs/ingester", branch = "main" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 thiserror = "2"
 tracing = "0.1"
-async-trait = "0.1"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std", "io-util"] }
+tree-sitter = "0.24"
+tree-sitter-rust = "0.23"
+tree-sitter-python = "0.23"
 clap = { version = "4", features = ["derive"] }
 
 [dev-dependencies]
 pretty_assertions = "1"
 tempfile = "3"
-tokio = { version = "1", features = ["macros", "rt"] }
 
 [[bin]]
 name = "a2m-project"
