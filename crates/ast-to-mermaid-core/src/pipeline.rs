@@ -3,13 +3,15 @@
 //! Used by both the CLI and (later) the MCP server. Pure async; backed by an
 //! [`InMemoryStore`] for the v0.2 MVP.
 
+use crate::artifacts::{ArtifactDir, EntityArtifact, build_index, sanitize_id};
 use crate::error::{AstToMermaidError, Result};
 use crate::render::{Level, render};
 use crate::resolve::resolve_cross_module_calls;
 use crate::store::{InMemoryStore, ingest_parse_output};
 use ingester_code::{CodeParser, Language};
-use ingester_core::{Origin, Parser};
-use polystore::Scope;
+use ingester_core::{Atom, Origin, Parser, Relation};
+use polystore::{Direction, EntityId, GraphStore, Scope};
+use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 
 /// Options controlling [`analyze`].
@@ -105,6 +107,295 @@ pub async fn analyze(root: &Path, opts: &AnalyzeOptions) -> Result<AnalyzeReport
         atoms_indexed,
         edges_resolved,
     })
+}
+
+/// Build the full 4-layer artifact bundle for `root`.
+///
+/// Walks the project, ingests every supported source file, resolves
+/// cross-module call edges, then renders :
+/// - `overview.mmd` (module-level view)
+/// - `project.mmd` (crate-level view)
+/// - one `.mmd` + `.meta.json` per indexed entity (module, function,
+///   struct, trait, impl, enum)
+/// - `index.json` with the registry + per-entity edge summary
+///
+/// The per-entity `.mmd` shipped here is a minimal 1-hop renderer
+/// (central node + neighbours) — kind-specialised renderers
+/// (struct / trait / enum subgraphs) land in PR 2 of the bundle
+/// rollout.
+///
+/// # Errors
+///
+/// Returns the first error from filesystem walk, parsing, store
+/// ingestion, resolver, or renderer.
+pub async fn bundle(root: &Path, opts: &AnalyzeOptions) -> Result<(ArtifactDir, AnalyzeReport)> {
+    if !root.exists() {
+        return Err(AstToMermaidError::InvalidInput(format!(
+            "path does not exist: {}",
+            root.display()
+        )));
+    }
+
+    let files = walk_for_languages_with_exclude(root, &opts.exclude)?;
+    let store = InMemoryStore::new(opts.scope.clone());
+
+    let mut atoms_indexed = 0;
+    let mut files_parsed = 0;
+    for (path, lang) in &files {
+        let bytes = std::fs::read(path).map_err(|e| {
+            AstToMermaidError::InvalidInput(format!("read {}: {e}", path.display()))
+        })?;
+        let parser = match lang {
+            Language::Rust => CodeParser::rust(),
+            Language::Python => CodeParser::python(),
+        };
+        let display_path = display_path(root, path);
+        let origin = Origin::file(display_path, Some(lang.name()));
+        let output = parser
+            .parse(&bytes, &origin)
+            .map_err(|e| AstToMermaidError::InvalidInput(format!("parse {origin}: {e}")))?;
+        atoms_indexed += output.atoms.len();
+        ingest_parse_output(&store, &output).await?;
+        files_parsed += 1;
+    }
+
+    let edges_resolved = resolve_cross_module_calls(&store).await?;
+
+    let overview_mmd = render(Level::Overview, &store, None).await?;
+    let project_mmd = render(Level::Project, &store, None).await?;
+
+    let (entities, index_entries) = collect_entities(&store).await?;
+
+    let report = AnalyzeReport {
+        mermaid: overview_mmd.clone(),
+        files_parsed,
+        atoms_indexed,
+        edges_resolved,
+    };
+
+    let source_root = root.to_string_lossy();
+    let index_json = build_index(
+        &index_entries,
+        source_root.as_ref(),
+        files_parsed,
+        atoms_indexed,
+        edges_resolved,
+    );
+
+    let dir = ArtifactDir {
+        overview_mmd,
+        project_mmd,
+        index_json,
+        entities,
+    };
+    Ok((dir, report))
+}
+
+/// Kinds we materialise into per-entity bundle artifacts. Matches the
+/// list the renderers already understand — keeps the bundle in lockstep
+/// with the in-memory schema.
+const ENTITY_KINDS: &[&str] = &["module", "function", "struct", "trait", "impl", "enum"];
+
+/// Walk the indexed store and produce one [`EntityArtifact`] +
+/// matching `index.json` row per entity in [`ENTITY_KINDS`].
+///
+/// Edges are computed via `neighbors_bulk` once for each direction —
+/// no N+1 per-entity round trips on backends that override.
+#[allow(clippy::too_many_lines, clippy::similar_names)]
+async fn collect_entities<S>(store: &S) -> Result<(Vec<EntityArtifact>, Vec<Value>)>
+where
+    S: GraphStore<Atom, Relation>,
+{
+    // 1. Bulk-list every indexed kind.
+    let kind_groups = store.list_by_kinds(ENTITY_KINDS).await?;
+    let mut all_ids: Vec<EntityId> = Vec::new();
+    for (_, ids) in &kind_groups {
+        all_ids.extend(ids.iter().cloned());
+    }
+    all_ids.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+    all_ids.dedup_by(|a, b| a.as_str() == b.as_str());
+
+    // 2. Bulk-fetch every node + its outgoing/incoming neighbours.
+    let nodes = store.get_nodes_bulk(&all_ids).await?;
+    let outgoing = store.neighbors_bulk(&all_ids, Direction::Outgoing).await?;
+    let incoming = store.neighbors_bulk(&all_ids, Direction::Incoming).await?;
+
+    let mut entities = Vec::new();
+    let mut index_entries = Vec::new();
+
+    for (id, atom_opt) in all_ids.iter().zip(nodes) {
+        let Some(atom) = atom_opt else { continue };
+
+        let kind = atom.kind.clone();
+        let name = atom.name.clone();
+        let id_str = id.as_str().to_owned();
+
+        let file = atom
+            .metadata
+            .get("file_path")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_owned();
+        let line_start = atom
+            .metadata
+            .get("line_start")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        let line_end = atom
+            .metadata
+            .get("line_end")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        let signature = atom
+            .metadata
+            .get("signature")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_owned();
+        let doc = atom
+            .metadata
+            .get("doc")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_owned();
+
+        let outs = outgoing
+            .iter()
+            .find(|(eid, _)| eid.as_str() == id.as_str())
+            .map(|(_, v)| v.clone())
+            .unwrap_or_default();
+        let ins = incoming
+            .iter()
+            .find(|(eid, _)| eid.as_str() == id.as_str())
+            .map(|(_, v)| v.clone())
+            .unwrap_or_default();
+
+        // Index-level edge summary (compact — one row per neighbour).
+        let edges_out: Vec<Value> = outs
+            .iter()
+            .map(|(target, rel)| json!({"to": target.as_str(), "kind": rel.kind}))
+            .collect();
+        let edges_in: Vec<Value> = ins
+            .iter()
+            .map(|(source, rel)| json!({"from": source.as_str(), "kind": rel.kind}))
+            .collect();
+
+        // meta.json — detailed view with neighbour names.
+        let callers: Vec<Value> = ins
+            .iter()
+            .filter(|(_, rel)| rel.kind == "calls")
+            .map(|(source, _)| neighbor_meta(source.as_str()))
+            .collect();
+        let callees: Vec<Value> = outs
+            .iter()
+            .filter(|(_, rel)| rel.kind == "calls")
+            .map(|(target, _)| neighbor_meta(target.as_str()))
+            .collect();
+        let children: Vec<Value> = outs
+            .iter()
+            .filter(|(_, rel)| rel.kind == "contains")
+            .map(|(target, _)| neighbor_meta(target.as_str()))
+            .collect();
+
+        let meta = json!({
+            "id": id_str,
+            "kind": kind,
+            "name": name,
+            "file": file,
+            "line_start": line_start,
+            "line_end": line_end,
+            "signature": signature,
+            "doc": doc,
+            "content_hash": atom.content_hash,
+            "callers": callers,
+            "callees": callees,
+            "children": children,
+            "imports": Vec::<Value>::new(),
+            "imported_by": Vec::<Value>::new(),
+        });
+
+        let mmd = render_entity_mmd(
+            &id_str, &kind, &name, &file, line_start, line_end, &outs, &ins,
+        );
+
+        let stem = sanitize_id(&id_str);
+        index_entries.push(json!({
+            "id": id_str,
+            "kind": kind,
+            "name": name,
+            "file": file,
+            "mmd_path": format!("entities/{stem}.mmd"),
+            "meta_path": format!("entities/{stem}.meta.json"),
+            "edges": {"out": edges_out, "in": edges_in},
+        }));
+        entities.push(EntityArtifact {
+            id: id_str,
+            mmd,
+            meta,
+        });
+    }
+
+    entities.sort_by(|a, b| a.id.cmp(&b.id));
+    Ok((entities, index_entries))
+}
+
+/// Bare-bones neighbour record for `meta.json`. PR 2 enriches with
+/// signature / line numbers ; for now we just keep `id`.
+fn neighbor_meta(neighbour_id: &str) -> Value {
+    // The store's bulk API returns Relation only — for richer
+    // neighbour metadata we'd need a second lookup pass. Keep PR1
+    // cheap : emit just the id ; PR2 attaches names/lines via a
+    // second `get_nodes_bulk` round-trip on the union of caller +
+    // callee + children sets.
+    json!({"id": neighbour_id})
+}
+
+/// Generic per-entity Mermaid renderer.
+///
+/// PR 1 ships the same 1-hop layout for every entity kind : the
+/// central node + 1-hop callers above + 1-hop callees below. The
+/// `%% id`, `%% kind`, `%% file` headers make the file
+/// self-describing so `mermaid-graph` can correlate it with its
+/// `meta.json` without reparsing the path.
+///
+/// PR 2 swaps this for kind-specific renderers (struct subgraphs
+/// with fields, trait subgraphs with methods, …).
+#[allow(clippy::too_many_arguments)]
+fn render_entity_mmd(
+    id: &str,
+    kind: &str,
+    name: &str,
+    file: &str,
+    line_start: u64,
+    line_end: u64,
+    outs: &[(EntityId, Relation)],
+    ins: &[(EntityId, Relation)],
+) -> String {
+    use std::fmt::Write as _;
+
+    let mut s = String::new();
+    writeln!(s, "%% id: {id}").ok();
+    writeln!(s, "%% kind: {kind}").ok();
+    if !file.is_empty() {
+        writeln!(s, "%% file: {file}:{line_start}-{line_end}").ok();
+    }
+    writeln!(s, "graph TD").ok();
+    let self_id = crate::render::util::mermaid_id(name);
+    let label = crate::render::util::escape_label(name);
+    writeln!(s, "    {self_id}[\"{label}\"]").ok();
+
+    for (source, rel) in ins {
+        let neigh = crate::render::util::mermaid_id(source.as_str());
+        let lbl = crate::render::util::escape_label(source.as_str());
+        writeln!(s, "    {neigh}[\"{lbl}\"] -->|\"{}\"| {self_id}", rel.kind).ok();
+    }
+    for (target, rel) in outs {
+        let neigh = crate::render::util::mermaid_id(target.as_str());
+        let lbl = crate::render::util::escape_label(target.as_str());
+        writeln!(s, "    {self_id} -->|\"{}\"| {neigh}[\"{lbl}\"]", rel.kind).ok();
+    }
+
+    s
 }
 
 /// Walk `root` recursively and return `(path, language)` pairs for every
@@ -301,6 +592,88 @@ mod tests {
         assert_eq!(report.atoms_indexed, 0);
         assert_eq!(report.edges_resolved, 0);
         assert_eq!(report.mermaid, "graph TD\n");
+    }
+
+    #[tokio::test]
+    async fn bundle_produces_overview_project_and_per_entity_files() {
+        let tmp = tempdir().expect("tmp");
+        let root = tmp.path();
+        write(root, "src/lib.rs", "pub fn hello() {}\n");
+
+        let (artifacts, report) = bundle(
+            root,
+            &AnalyzeOptions {
+                level: Level::Project,
+                target: None,
+                exclude: Vec::new(),
+                scope: Scope::new("ns", "repo", "branch"),
+            },
+        )
+        .await
+        .expect("bundle");
+
+        // Stats land in the report and in index.json.
+        assert_eq!(report.files_parsed, 1);
+        assert!(report.atoms_indexed >= 2);
+
+        assert!(artifacts.overview_mmd.starts_with("graph TD"));
+        assert!(artifacts.project_mmd.starts_with("graph TD"));
+        assert_eq!(artifacts.index_json["schema_version"], json!(1));
+        assert_eq!(artifacts.index_json["stats"]["files_parsed"], json!(1));
+
+        // At least the module + the function should be there.
+        let kinds: Vec<&str> = artifacts
+            .entities
+            .iter()
+            .filter_map(|e| e.meta["kind"].as_str())
+            .collect();
+        assert!(
+            kinds.contains(&"module"),
+            "missing module entity: {kinds:?}"
+        );
+        assert!(
+            kinds.contains(&"function"),
+            "missing function entity: {kinds:?}",
+        );
+
+        // Each entity's .mmd is self-describing.
+        for e in &artifacts.entities {
+            assert!(
+                e.mmd.contains(&format!("%% id: {}", e.id)),
+                "entity {} missing id header",
+                e.id,
+            );
+            assert!(
+                e.mmd.contains(&format!(
+                    "%% kind: {}",
+                    e.meta["kind"].as_str().unwrap_or("")
+                )),
+                "entity {} missing kind header",
+                e.id,
+            );
+            assert!(e.mmd.starts_with("%% id:"));
+        }
+    }
+
+    #[tokio::test]
+    async fn bundle_round_trips_through_write_and_load() {
+        use crate::artifacts::{load_artifact_dir, write_artifacts};
+
+        let tmp = tempdir().expect("tmp");
+        let root = tmp.path();
+        write(root, "src/lib.rs", "pub fn foo() {}\n");
+
+        let (artifacts, _) = bundle(root, &AnalyzeOptions::default())
+            .await
+            .expect("bundle");
+
+        let out_tmp = tempdir().expect("out tmp");
+        write_artifacts(&artifacts, out_tmp.path()).expect("write");
+        let loaded = load_artifact_dir(out_tmp.path()).expect("load");
+
+        assert_eq!(loaded.overview_mmd, artifacts.overview_mmd);
+        assert_eq!(loaded.project_mmd, artifacts.project_mmd);
+        assert_eq!(loaded.entities.len(), artifacts.entities.len());
     }
 
     #[tokio::test]
