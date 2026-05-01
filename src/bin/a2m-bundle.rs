@@ -37,7 +37,7 @@ struct Cli {
     out: PathBuf,
 
     /// Comma-separated dir basenames to skip on top of the built-in
-    /// skip set (target, node_modules, .git, dotfile dirs).
+    /// skip set (`target`, `node_modules`, `.git`, dotfile dirs).
     #[arg(short = 'x', long, value_delimiter = ',', default_value = "")]
     exclude: Vec<String>,
 }
