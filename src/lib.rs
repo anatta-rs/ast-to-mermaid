@@ -17,6 +17,7 @@
 #![deny(unsafe_code)]
 
 pub mod artifacts;
+pub mod cache;
 pub mod cli_support;
 pub mod error;
 pub mod graph;
