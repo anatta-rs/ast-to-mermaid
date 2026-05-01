@@ -46,18 +46,34 @@ graph TD
 
 (Note the `graph_` node id: the `graph/` module's name collides with Mermaid's `graph TD` keyword, so `mermaid_id` suffixes it with `_`. Without that escape, the diagram fails to parse — the same kind of reserved-keyword guard that pretty much every codegen tool that emits a target language has to deal with.)
 
-### Convergence: `a2m impact ./src --target analyze`
+### Convergence: `a2m impact ./src --target parse_phase`
 
-How does a change to `pipeline::analyze` ripple outward? Three hops from `a2m::main`, through `cli_support::run_analyze`, into the core function — that's the whole blast radius:
+How does a change to `pipeline::parse_phase` ripple outward? It's an internal helper called by both `analyze` and `bundle`, which means **every** subcommand that hits the parse loop reaches it — through five different cli_support handlers, with `run_diff` taking a two-hop detour via `ensure_indexed`:
 
 ```mermaid
 graph BT
-    analyze(("fn analyze (impacted)"))
-    a2m_main["a2m::main"]
-    run_analyze["cli_support::run_analyze"]
-    a2m_main --> run_analyze
+    parse_phase(("fn parse_phase (impacted)"))
+    main["main"]
+    run_analyze["run_analyze"]
+    run_bundle["run_bundle"]
+    run_index["run_index"]
+    run_diff["run_diff"]
+    ensure_indexed["ensure_indexed"]
+    analyze["analyze"]
+    bundle["bundle"]
+    main --> run_analyze
+    main --> run_bundle
+    main --> run_index
     run_analyze --> analyze
+    run_bundle --> bundle
+    run_index --> bundle
+    run_diff --> ensure_indexed
+    ensure_indexed --> bundle
+    analyze --> parse_phase
+    bundle --> parse_phase
 ```
+
+Five entry points, two private helpers, all converging on one impacted function. The kind of blast radius that turns "is it safe to refactor this?" into a 10-second answer.
 
 ### Dispatcher: `a2m module ./src --target render/mod.rs`
 
