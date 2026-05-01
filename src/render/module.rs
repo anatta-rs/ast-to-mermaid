@@ -28,22 +28,49 @@ pub fn render(store: &Store, target: &str) -> Result<String> {
     let module_label = module_atom.name.clone();
     let module_path = module_atom.file_path.clone();
 
-    // 1. Items inside the module via `Contains` edges.
+    // 1. Items inside the module via `Contains` edges. Two tiers:
+    //    - top-level items directly contained by the module.
+    //    - methods nested inside `impl` blocks (which we draw as their own
+    //      sub-subgraph).
     let child_ids = store.children_of(&module_id);
-    let mut item_ids: BTreeMap<EntityId, String> = BTreeMap::new(); // id → kind
+    let mut top_items: BTreeMap<EntityId, String> = BTreeMap::new(); // id → kind
+    let mut impl_methods: BTreeMap<EntityId, BTreeMap<EntityId, String>> = BTreeMap::new(); // impl_id → (method_id → kind)
+    let mut inside_set: HashSet<EntityId> = HashSet::new();
     for id in &child_ids {
-        if let Some(atom) = store.get_atom(id) {
-            item_ids.insert(id.clone(), atom.kind.clone());
+        let Some(atom) = store.get_atom(id) else {
+            continue;
+        };
+        top_items.insert(id.clone(), atom.kind.clone());
+        inside_set.insert(id.clone());
+        if atom.kind == "impl" {
+            let methods = store.children_of(id);
+            let mut method_map: BTreeMap<EntityId, String> = BTreeMap::new();
+            for m in &methods {
+                if let Some(matom) = store.get_atom(m) {
+                    method_map.insert(m.clone(), matom.kind.clone());
+                    inside_set.insert(m.clone());
+                }
+            }
+            if !method_map.is_empty() {
+                impl_methods.insert(id.clone(), method_map);
+            }
         }
     }
-    let inside_set: HashSet<EntityId> = item_ids.keys().cloned().collect();
 
-    // 2. Walk outgoing + incoming neighbors of function items.
-    let function_items: Vec<EntityId> = item_ids
+    // 2. Walk outgoing + incoming neighbors of every function item — both
+    //    top-level functions and impl methods.
+    let mut function_items: Vec<EntityId> = top_items
         .iter()
         .filter(|(_, kind)| kind.as_str() == "function")
         .map(|(id, _)| id.clone())
         .collect();
+    for methods in impl_methods.values() {
+        for (mid, kind) in methods {
+            if kind == "function" {
+                function_items.push(mid.clone());
+            }
+        }
+    }
 
     let mut outgoing: BTreeMap<(EntityId, EntityId), String> = BTreeMap::new(); // (inside, outside) → outside name
     let mut incoming: BTreeMap<(EntityId, EntityId), String> = BTreeMap::new(); // (outside, inside) → outside name
@@ -79,16 +106,41 @@ pub fn render(store: &Store, target: &str) -> Result<String> {
     mermaid.push_str("\"]\n");
 
     // Sorted item list for deterministic output.
-    let mut sorted_items: Vec<(&EntityId, &String)> = item_ids.iter().collect();
+    let mut sorted_items: Vec<(&EntityId, &String)> = top_items.iter().collect();
     sorted_items.sort_by_key(|(id, _)| id.as_str());
 
     for (item_id, kind) in &sorted_items {
-        if let Some(atom) = store.get_atom(item_id) {
-            let id = mermaid_id(item_id.as_str());
-            let label = escape_label(&format!("{} {}", short_kind(kind), atom.name));
-            let shape = node_shape(kind, &id, &label);
-            writeln!(mermaid, "        {shape}").expect("writing");
+        let Some(atom) = store.get_atom(item_id) else {
+            continue;
+        };
+        // For impl atoms with method children, emit a nested subgraph.
+        if kind.as_str() == "impl"
+            && let Some(methods) = impl_methods.get(item_id)
+        {
+            let impl_subgraph_id = mermaid_id(&format!("impl_{}", item_id.as_str()));
+            let impl_label = escape_label(&format!("impl {}", atom.name));
+            writeln!(
+                mermaid,
+                "        subgraph {impl_subgraph_id}[\"{impl_label}\"]"
+            )
+            .expect("writing");
+            let mut sorted_methods: Vec<(&EntityId, &String)> = methods.iter().collect();
+            sorted_methods.sort_by_key(|(id, _)| id.as_str());
+            for (mid, mkind) in sorted_methods {
+                if let Some(matom) = store.get_atom(mid) {
+                    let id = mermaid_id(mid.as_str());
+                    let label = escape_label(&format!("{} {}", short_kind(mkind), matom.name));
+                    let shape = node_shape(mkind, &id, &label);
+                    writeln!(mermaid, "            {shape}").expect("writing");
+                }
+            }
+            writeln!(mermaid, "        end").expect("writing");
+            continue;
         }
+        let id = mermaid_id(item_id.as_str());
+        let label = escape_label(&format!("{} {}", short_kind(kind), atom.name));
+        let shape = node_shape(kind, &id, &label);
+        writeln!(mermaid, "        {shape}").expect("writing");
     }
     mermaid.push_str("    end\n");
 
@@ -293,6 +345,115 @@ mod tests {
             assert!(!short_kind(k).is_empty());
         }
         assert_eq!(short_kind("unknown"), "?");
+    }
+
+    #[test]
+    fn impl_methods_render_as_nested_subgraph() {
+        // An impl with two methods becomes a nested subgraph inside the
+        // module subgraph; each method shows as its own `fn` node.
+        let store = Store::new();
+        let m = module_atom("src/foo.rs", "foo");
+        store.add_atom(m.clone());
+        let impl_a = item_atom("src/foo.rs", "impl", "Foo");
+        let m1 = CodeAtom {
+            id: EntityId::new("code:src/foo.rs::function::Foo::build"),
+            kind: "function".to_owned(),
+            name: "build".to_owned(),
+            file_path: "src/foo.rs".to_owned(),
+            line_start: 1,
+            line_end: 5,
+            doc: String::new(),
+            signature: String::new(),
+            content_hash: "h".to_owned(),
+            calls: Vec::new(),
+        };
+        let m2 = CodeAtom {
+            id: EntityId::new("code:src/foo.rs::function::Foo::update"),
+            kind: "function".to_owned(),
+            name: "update".to_owned(),
+            file_path: "src/foo.rs".to_owned(),
+            line_start: 6,
+            line_end: 10,
+            doc: String::new(),
+            signature: String::new(),
+            content_hash: "h".to_owned(),
+            calls: Vec::new(),
+        };
+        store.add_edge(Edge::new(
+            m.id.clone(),
+            impl_a.id.clone(),
+            EdgeKind::Contains,
+        ));
+        store.add_edge(Edge::new(
+            impl_a.id.clone(),
+            m1.id.clone(),
+            EdgeKind::Contains,
+        ));
+        store.add_edge(Edge::new(
+            impl_a.id.clone(),
+            m2.id.clone(),
+            EdgeKind::Contains,
+        ));
+        store.add_atom(impl_a);
+        store.add_atom(m1);
+        store.add_atom(m2);
+
+        let out = render(&store, "src/foo.rs").expect("render");
+        // Outer module subgraph + nested impl subgraph = two `subgraph` lines.
+        let nesting = out.matches("subgraph").count();
+        assert!(
+            nesting >= 2,
+            "expected nested subgraph for impl, got {nesting}\n{out}"
+        );
+        assert!(out.contains("[\"impl Foo\"]"), "impl label missing: {out}");
+        assert!(out.contains("fn build"), "method label missing: {out}");
+        assert!(out.contains("fn update"), "method label missing: {out}");
+    }
+
+    #[test]
+    fn impl_method_calls_to_outside_render_as_external_arrows() {
+        // A method inside an impl that calls a function in another module
+        // produces an outgoing arrow from the method node.
+        let store = Store::new();
+        // Outer module with an impl and a method.
+        let m = module_atom("src/foo.rs", "foo");
+        store.add_atom(m.clone());
+        let impl_a = item_atom("src/foo.rs", "impl", "Foo");
+        let method = CodeAtom {
+            id: EntityId::new("code:src/foo.rs::function::Foo::build"),
+            kind: "function".to_owned(),
+            name: "build".to_owned(),
+            file_path: "src/foo.rs".to_owned(),
+            line_start: 1,
+            line_end: 5,
+            doc: String::new(),
+            signature: String::new(),
+            content_hash: "h".to_owned(),
+            calls: Vec::new(),
+        };
+        store.add_edge(Edge::new(
+            m.id.clone(),
+            impl_a.id.clone(),
+            EdgeKind::Contains,
+        ));
+        store.add_edge(Edge::new(
+            impl_a.id.clone(),
+            method.id.clone(),
+            EdgeKind::Contains,
+        ));
+        store.add_atom(impl_a);
+        store.add_atom(method.clone());
+        // Outside module + function being called.
+        build_module(&store, "src/bar.rs", &[("function", "helper")]);
+        let helper_id = EntityId::new("code:src/bar.rs::function::helper");
+        store.add_edge(Edge::new(method.id, helper_id, EdgeKind::Calls));
+
+        let out = render(&store, "src/foo.rs").expect("render");
+        assert!(
+            out.contains("([\"helper\"])"),
+            "external `helper` node missing: {out}"
+        );
+        assert!(out.contains(" --> "), "expected an arrow: {out}");
     }
 
     #[test]
