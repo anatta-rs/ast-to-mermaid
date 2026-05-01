@@ -47,7 +47,7 @@ graph BT
 
 ### Dispatcher: `a2m module ./src --target render/mod.rs`
 
-`render::render` is one function name shared by **six** modules. The resolver disambiguates via `use` imports + qualified call paths, so the dispatch fan-out and the two real callers land on the right node:
+`render::render` is one function name shared by **six** modules. The resolver disambiguates via `use` imports + qualified call paths, so the dispatch fan-out and the two real callers land on the right node. Methods inside `impl` blocks are first-class too — addressable via `--target Type::method` (e.g. `--target HnswBuilder::build`) without spelling out generic params:
 
 ```mermaid
 graph TD
@@ -99,6 +99,9 @@ a2m module ./my-repo --target src/server/handlers.rs
 # Reverse call chain into a function (who calls it?)
 a2m function ./my-repo --target parse_config
 
+# Methods on a type — `Type::method` shorthand handles generics for you
+a2m function ./my-repo --target HnswBuilder::build
+
 # Forward + backward impact (3 hops by default)
 a2m impact ./my-repo --target execute
 
@@ -140,14 +143,16 @@ a2m bundle ./src --out ./.artifacts
     └── code_src_pipeline.rs__function__analyze.meta.json #   ↳ callers, callees, line range, signature, doc
 ```
 
-Each `.meta.json` carries the entity's id, kind, file/line range, signature, doc, content hash, and full caller/callee lists. The bundle is plain JSON + Mermaid — load it into any graph store (Neo4j, DuckDB, in-memory) without re-parsing.
+Each `.meta.json` carries the entity's id, kind, file/line range, signature, doc, SHA-256 content hash, and the full edge surface — `callers`, `callees`, plus `implements` / `implemented_by` for impl/trait pairs. Calls into crates outside the analysed tree (e.g. `serde_json::to_string`, `divan::main`) become synthetic `extern:` atoms in the bundle so external dependencies are visible at the boundary instead of disappearing silently.
+
+The bundle is plain JSON + Mermaid — load it into any graph store (Neo4j, DuckDB, in-memory) without re-parsing.
 
 ## Languages
 
 - **Rust** — `tree-sitter-rust`
 - **Python** — `tree-sitter-python`
 
-Anything else is silently skipped during the walk. Adding a language is a matter of wiring up one tree-sitter grammar in `src/parser/mod.rs`.
+Anything else is silently skipped during the walk. The parser is **query-driven**: each supported language gets a small set of `.scm` tree-sitter query files in `src/parser/queries/<lang>/` (items, calls, uses, impl-methods). Adding a language is roughly: add the `tree-sitter-<lang>` dep, drop the queries, add a `Language` enum variant. No new walker code per language.
 
 ## Use as a library
 
@@ -178,22 +183,36 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-Lower-level pieces are public for embedders that want to drive the pipeline by hand: `parser::CodeParser`, `graph::Store`, `resolve::resolve_cross_module_calls`, `render::render`.
+Lower-level pieces are public for embedders that want to drive the pipeline by hand: `parser::{CodeParser, Language}`, `graph::Store`, `resolve::{resolve_cross_module_calls, resolve_implements_edges, EXTERN_KIND}`, `render::{render, Level}`, `pipeline::{bundle, DEFAULT_EXCLUDED_DIRS}`.
 
 ## How it works
 
 ```
-walk source tree
-    └─ src/parser    tree-sitter → CodeAtom + intra-file Calls edges
-    └─ src/graph     in-memory Store<atoms, edges>
-    └─ src/resolve   cross-module Calls edges (uses file-scope `use`
-                     imports + qualified call paths to disambiguate
-                     same-named functions across modules)
-    └─ src/render    Mermaid string per zoom level
-    └─ src/artifacts emit_artifacts → ArtifactSet → write_artifacts
+walk source tree                    [src/pipeline,  src/parser]
+    │  (skips target/, node_modules/, __pycache__/, dist/, …
+    │   plus dotfile dirs; symlink-loop safe)
+    │
+    └─ tree-sitter parse  →  CodeAtom per item
+    │                         + intra-file Calls edges
+    │                         + impl-method atoms (id = Type::method)
+    │
+    └─ Store<atoms, edges>          [src/graph]
+    │
+    └─ cross-module Calls           [src/resolve]
+    │   from `use` imports + qualified paths;
+    │   unresolved external calls → synthetic `extern:` atoms
+    │
+    └─ Implements edges             [src/resolve]
+    │   `impl Trait for Type` linked to local trait atoms
+    │
+    └─ Mermaid render               [src/render]
+    │   one renderer per zoom level
+    │
+    └─ Artifact bundle              [src/artifacts]
+        overview.mmd + index.json + per-entity {.mmd, .meta.json}
 ```
 
-No async, no persistence layer, no graph backend. The store is a `RwLock<HashMap + Vec>` and lives for the duration of one CLI invocation. Each binary is a thin clap parser plus a call into the library.
+No async, no persistence layer, no graph backend. The store is a `RwLock<HashMap + Vec>` and lives for the duration of one CLI invocation. The CLI is a single binary `a2m` with seven subcommands, each a thin clap parser plus a call into the library.
 
 ## Quality gates
 
@@ -208,7 +227,7 @@ CI runs `make ci` on every PR. The coverage gate ignores `bin/*.rs` (thin wrappe
 
 ## Status
 
-`v0.1` — seven binaries, library API, artifact bundle. Stable shape; future work is mostly more languages and richer per-entity metadata.
+`v0.1` — single `a2m` binary with seven subcommands, library API, artifact bundle, query-driven parser for Rust + Python. Stable shape; future work is mostly more languages (cheap to add via `.scm` queries) and richer per-entity metadata.
 
 ## License
 

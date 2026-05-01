@@ -1,22 +1,60 @@
 graph TD
-    crates_ast_to_mermaid_cli_src_main_rs["main — 1 fn"]
-    crates_ast_to_mermaid_core_src_cli_rs["cli — 4 fn, 1 struct, 0 trait"]
-    crates_ast_to_mermaid_core_src_error_rs["error — 0 fn"]
-    crates_ast_to_mermaid_core_src_lib_rs["lib — 0 fn"]
-    crates_ast_to_mermaid_core_src_mcp_rs["mcp — 1 fn"]
-    crates_ast_to_mermaid_core_src_pipeline_rs["pipeline — 5 fn, 2 struct, 0 trait"]
-    crates_ast_to_mermaid_core_src_render_mod_rs["mod — 1 fn"]
-    crates_ast_to_mermaid_core_src_render_overview_rs["overview — 2 fn, 1 struct, 0 trait"]
-    crates_ast_to_mermaid_core_src_render_project_rs["project — 2 fn, 1 struct, 0 trait"]
-    crates_ast_to_mermaid_core_src_render_util_rs["util — 3 fn"]
-    crates_ast_to_mermaid_core_src_resolve_rs["resolve — 3 fn"]
-    crates_ast_to_mermaid_core_src_store_memory_rs["memory — 2 fn, 3 struct, 0 trait"]
-    crates_ast_to_mermaid_core_src_store_mod_rs["mod — 0 fn"]
-    crates_ast_to_mermaid_mcp_src_main_rs["main — 1 fn"]
-    crates_ast_to_mermaid_cli_src_main_rs -->|"1"| crates_ast_to_mermaid_core_src_cli_rs
-    crates_ast_to_mermaid_core_src_cli_rs -->|"1"| crates_ast_to_mermaid_core_src_pipeline_rs
-    crates_ast_to_mermaid_core_src_pipeline_rs -->|"1"| crates_ast_to_mermaid_core_src_resolve_rs
-    crates_ast_to_mermaid_core_src_pipeline_rs -->|"1"| crates_ast_to_mermaid_core_src_store_memory_rs
-    crates_ast_to_mermaid_core_src_render_overview_rs -->|"2"| crates_ast_to_mermaid_core_src_render_util_rs
-    crates_ast_to_mermaid_core_src_render_project_rs -->|"3"| crates_ast_to_mermaid_core_src_render_util_rs
-    crates_ast_to_mermaid_mcp_src_main_rs -->|"1"| crates_ast_to_mermaid_core_src_mcp_rs
+    artifacts_mod_rs["mod — 9 fn, 2 struct, 0 trait"]
+    bin_a2m_rs["a2m — 1 fn, 1 struct, 0 trait"]
+    cli_support_rs["cli_support — 3 fn, 3 struct, 0 trait"]
+    error_rs["error — 0 fn"]
+    graph_memory_rs["memory — 0 fn, 2 struct, 0 trait"]
+    graph_mod_rs["mod — 0 fn"]
+    lib_rs["lib — 0 fn"]
+    model_rs["model — 0 fn, 3 struct, 0 trait"]
+    parser_mod_rs["mod — 16 fn, 3 struct, 0 trait"]
+    parser_queries_rs["queries — 0 fn, 2 struct, 0 trait"]
+    pipeline_rs["pipeline — 8 fn, 2 struct, 0 trait"]
+    render_function_rs["function — 1 fn"]
+    render_impact_rs["impact — 1 fn"]
+    render_lookup_rs["lookup — 2 fn"]
+    render_mod_rs["mod — 2 fn"]
+    render_module_rs["module — 3 fn"]
+    render_overview_rs["overview — 1 fn, 1 struct, 0 trait"]
+    render_project_rs["project — 1 fn, 1 struct, 0 trait"]
+    render_util_rs["util — 3 fn"]
+    resolve_rs["resolve — 8 fn"]
+    artifacts_mod_rs -->|"6"| graph_memory_rs
+    artifacts_mod_rs -->|"1"| parser_mod_rs
+    artifacts_mod_rs -->|"1"| render_mod_rs
+    artifacts_mod_rs -->|"1"| render_util_rs
+    bin_a2m_rs -->|"3"| cli_support_rs
+    cli_support_rs -->|"1"| artifacts_mod_rs
+    cli_support_rs -->|"3"| pipeline_rs
+    cli_support_rs -->|"1"| render_mod_rs
+    parser_mod_rs -->|"4"| graph_memory_rs
+    pipeline_rs -->|"1"| artifacts_mod_rs
+    pipeline_rs -->|"2"| parser_mod_rs
+    pipeline_rs -->|"1"| render_mod_rs
+    pipeline_rs -->|"4"| resolve_rs
+    render_function_rs -->|"3"| graph_memory_rs
+    render_function_rs -->|"1"| parser_mod_rs
+    render_function_rs -->|"1"| render_lookup_rs
+    render_function_rs -->|"2"| render_util_rs
+    render_impact_rs -->|"2"| graph_memory_rs
+    render_impact_rs -->|"1"| parser_mod_rs
+    render_impact_rs -->|"1"| render_lookup_rs
+    render_impact_rs -->|"2"| render_util_rs
+    render_lookup_rs -->|"2"| graph_memory_rs
+    render_lookup_rs -->|"2"| parser_mod_rs
+    render_mod_rs -->|"1"| render_function_rs
+    render_mod_rs -->|"1"| render_impact_rs
+    render_mod_rs -->|"1"| render_module_rs
+    render_mod_rs -->|"1"| render_overview_rs
+    render_mod_rs -->|"1"| render_project_rs
+    render_module_rs -->|"4"| graph_memory_rs
+    render_module_rs -->|"1"| parser_mod_rs
+    render_module_rs -->|"1"| render_lookup_rs
+    render_module_rs -->|"2"| render_util_rs
+    render_overview_rs -->|"4"| graph_memory_rs
+    render_overview_rs -->|"1"| parser_mod_rs
+    render_overview_rs -->|"2"| render_util_rs
+    render_project_rs -->|"4"| graph_memory_rs
+    render_project_rs -->|"3"| render_util_rs
+    resolve_rs -->|"7"| graph_memory_rs
+    resolve_rs -->|"2"| parser_mod_rs
