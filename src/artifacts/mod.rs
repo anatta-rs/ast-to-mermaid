@@ -254,6 +254,20 @@ fn entity_meta(
         .filter(|e| e.kind == EdgeKind::Uses)
         .map(|e| e.from.as_str().to_owned())
         .collect();
+    // For impl atoms: which trait this impl block satisfies.
+    // For trait atoms: which impl atoms satisfy this trait.
+    let implements: Vec<String> = store
+        .edges_from(&atom.id)
+        .iter()
+        .filter(|e| e.kind == EdgeKind::Implements)
+        .map(|e| e.to.as_str().to_owned())
+        .collect();
+    let implemented_by: Vec<String> = store
+        .edges_to(&atom.id)
+        .iter()
+        .filter(|e| e.kind == EdgeKind::Implements)
+        .map(|e| e.from.as_str().to_owned())
+        .collect();
 
     json!({
         "id": atom.id.as_str(),
@@ -270,6 +284,8 @@ fn entity_meta(
         "children": children.iter().map(EntityId::as_str).collect::<Vec<_>>(),
         "imports": imports,
         "imported_by": imported_by,
+        "implements": implements,
+        "implemented_by": implemented_by,
     })
 }
 
