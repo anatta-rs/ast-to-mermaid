@@ -15,7 +15,9 @@ use crate::error::{AstToMermaidError, Result};
 use crate::graph::Store;
 use crate::model::{CodeAtom, Edge, EdgeKind, EntityId};
 use std::collections::{HashMap, HashSet};
-use tree_sitter::{Node, Parser as TsParser};
+use tree_sitter::{Node, Parser as TsParser, QueryCursor, StreamingIterator};
+
+mod queries;
 
 // ── Language ──────────────────────────────────────────────────────────────────
 
@@ -131,6 +133,7 @@ impl CodeParser {
     ///
     /// - `InvalidInput` for non-UTF-8 content.
     /// - `InvalidInput` when tree-sitter fails to parse.
+    #[allow(clippy::too_many_lines)]
     pub fn parse_into(&self, content: &[u8], file_path: &str, store: &Store) -> Result<usize> {
         let text = std::str::from_utf8(content).map_err(|e| {
             AstToMermaidError::InvalidInput(format!("invalid utf-8 in {file_path}: {e}"))
@@ -179,51 +182,58 @@ impl CodeParser {
         let imports: HashMap<String, String> = use_decls_to_imports(&use_decls);
 
         // ── Item atoms ────────────────────────────────────────────────────────
-        let mut cursor = root.walk();
+        // Top-level items are matched via a tree-sitter query (see
+        // `queries/{lang}/items.scm`). The query restricts matches to
+        // direct children of the file root, so we don't recurse manually.
+        let items_query = match self.language {
+            Language::Rust => &queries::RUST.items,
+            Language::Python => &queries::PYTHON.items,
+        };
         let mut name_to_id: HashMap<String, EntityId> = HashMap::new();
         let mut items: Vec<(EntityId, Vec<String>)> = Vec::new(); // (id, calls)
 
-        for child in root.children(&mut cursor) {
-            let Some((atom, call_names)) =
-                extract_item(&child, text, file_path, self.language, &imports)
-            else {
-                continue;
-            };
-            let item_id = atom.id.clone();
-            let item_name = atom.name.clone();
-            let item_kind = atom.kind.clone();
-            name_to_id.insert(item_name.clone(), item_id.clone());
+        let mut cursor = QueryCursor::new();
+        let mut matches = cursor.matches(items_query, root, text.as_bytes());
+        while let Some(m) = matches.next() {
+            for capture in m.captures {
+                let item_node = capture.node;
+                let Some((atom, call_names)) =
+                    extract_item(&item_node, text, file_path, self.language, &imports)
+                else {
+                    continue;
+                };
+                let item_id = atom.id.clone();
+                let item_name = atom.name.clone();
+                let item_kind = atom.kind.clone();
+                name_to_id.insert(item_name.clone(), item_id.clone());
 
-            store.add_edge(Edge::new(
-                module_id.clone(),
-                item_id.clone(),
-                EdgeKind::Contains,
-            ));
-            items.push((item_id.clone(), call_names));
-            store.add_atom(atom);
-            atom_count += 1;
+                store.add_edge(Edge::new(
+                    module_id.clone(),
+                    item_id.clone(),
+                    EdgeKind::Contains,
+                ));
+                items.push((item_id.clone(), call_names));
+                store.add_atom(atom);
+                atom_count += 1;
 
-            // For Rust `impl` blocks, also extract every method inside the
-            // body as a first-class function atom. Each method gets a
-            // `Contains` edge from the impl, plus intra-impl call edges
-            // (one method calling another in the same impl resolve directly).
-            // These methods participate in the global resolver like free
-            // functions.
-            if item_kind == "impl" {
-                let methods = extract_impl_methods(
-                    &child,
-                    &ImplCtx {
-                        impl_atom_id: &item_id,
-                        impl_owner_name: &item_name,
-                        source: text,
-                        file_path,
-                        language: self.language,
-                        imports: &imports,
-                    },
-                    store,
-                );
-                atom_count += methods.len();
-                items.extend(methods);
+                // For Rust `impl` blocks, descend into the body and lift
+                // every method to a first-class function atom.
+                if item_kind == "impl" {
+                    let methods = extract_impl_methods(
+                        &item_node,
+                        &ImplCtx {
+                            impl_atom_id: &item_id,
+                            impl_owner_name: &item_name,
+                            source: text,
+                            file_path,
+                            language: self.language,
+                            imports: &imports,
+                        },
+                        store,
+                    );
+                    atom_count += methods.len();
+                    items.extend(methods);
+                }
             }
         }
 
@@ -301,7 +311,7 @@ fn extract_item(
 
     // Call names for functions.
     let call_names = if ts_kind == "function_item" || ts_kind == "function_definition" {
-        extract_calls(node, source, imports)
+        extract_calls(node, source, language, imports)
     } else {
         Vec::new()
     };
@@ -361,9 +371,6 @@ fn extract_impl_methods(
     ctx: &ImplCtx,
     store: &Store,
 ) -> Vec<(EntityId, Vec<String>)> {
-    let Some(body) = impl_node.child_by_field_name("body") else {
-        return Vec::new();
-    };
     let ImplCtx {
         impl_atom_id,
         impl_owner_name,
@@ -374,56 +381,59 @@ fn extract_impl_methods(
     } = *ctx;
 
     // Pass 1: extract every method, build the impl-local name lookup.
+    // The `impl_methods` query matches method `function_item` children of
+    // the impl's `declaration_list` body.
     let mut method_id_by_name: HashMap<String, EntityId> = HashMap::new();
     let mut pending: Vec<(EntityId, CodeAtom, Vec<String>)> = Vec::new();
-    let mut body_cursor = body.walk();
-    for inner in body.children(&mut body_cursor) {
-        if inner.kind() != "function_item" {
-            continue;
+    let mut cursor = QueryCursor::new();
+    let mut matches = cursor.matches(&queries::RUST.impl_methods, *impl_node, source.as_bytes());
+    while let Some(m) = matches.next() {
+        for capture in m.captures {
+            let inner = capture.node;
+            let Some(method_name) = inner
+                .child_by_field_name("name")
+                .and_then(|n| n.utf8_text(source.as_bytes()).ok())
+                .map(str::to_owned)
+            else {
+                continue;
+            };
+
+            let item_text = inner.utf8_text(source.as_bytes()).unwrap_or_default();
+            let content_hash = format!("sha256:{}", hex_sha256(item_text.as_bytes()));
+            let line_start = u32::try_from(inner.start_position().row).unwrap_or(u32::MAX) + 1;
+            let line_end = u32::try_from(inner.end_position().row).unwrap_or(u32::MAX) + 1;
+            let signature = item_text
+                .lines()
+                .next()
+                .unwrap_or_default()
+                .trim_end_matches('{')
+                .trim()
+                .to_owned();
+            let doc = if language == Language::Python {
+                python_docstring(&inner, source)
+            } else {
+                rust_doc_comment(source, inner.start_position().row)
+            };
+            let call_names = extract_calls(&inner, source, language, imports);
+
+            let id = EntityId::new(format!(
+                "code:{file_path}::function::{impl_owner_name}::{method_name}"
+            ));
+            let atom = CodeAtom {
+                id: id.clone(),
+                kind: "function".to_owned(),
+                name: method_name.clone(),
+                file_path: file_path.to_owned(),
+                line_start,
+                line_end,
+                doc,
+                signature,
+                content_hash,
+                calls: call_names.clone(),
+            };
+            method_id_by_name.insert(method_name, id.clone());
+            pending.push((id, atom, call_names));
         }
-        let Some(method_name) = inner
-            .child_by_field_name("name")
-            .and_then(|n| n.utf8_text(source.as_bytes()).ok())
-            .map(str::to_owned)
-        else {
-            continue;
-        };
-
-        let item_text = inner.utf8_text(source.as_bytes()).unwrap_or_default();
-        let content_hash = format!("sha256:{}", hex_sha256(item_text.as_bytes()));
-        let line_start = u32::try_from(inner.start_position().row).unwrap_or(u32::MAX) + 1;
-        let line_end = u32::try_from(inner.end_position().row).unwrap_or(u32::MAX) + 1;
-        let signature = item_text
-            .lines()
-            .next()
-            .unwrap_or_default()
-            .trim_end_matches('{')
-            .trim()
-            .to_owned();
-        let doc = if language == Language::Python {
-            python_docstring(&inner, source)
-        } else {
-            rust_doc_comment(source, inner.start_position().row)
-        };
-        let call_names = extract_calls(&inner, source, imports);
-
-        let id = EntityId::new(format!(
-            "code:{file_path}::function::{impl_owner_name}::{method_name}"
-        ));
-        let atom = CodeAtom {
-            id: id.clone(),
-            kind: "function".to_owned(),
-            name: method_name.clone(),
-            file_path: file_path.to_owned(),
-            line_start,
-            line_end,
-            doc,
-            signature,
-            content_hash,
-            calls: call_names.clone(),
-        };
-        method_id_by_name.insert(method_name, id.clone());
-        pending.push((id, atom, call_names));
     }
 
     // Pass 2: emit atoms + Contains edges + intra-impl Calls edges.
@@ -485,75 +495,96 @@ fn extract_name(node: &Node, source: &str, ts_kind: &str) -> Option<String> {
 
 // ── Call extraction ───────────────────────────────────────────────────────────
 
-fn extract_calls(node: &Node, source: &str, imports: &HashMap<String, String>) -> Vec<String> {
+/// Extract every call site within `node`'s subtree. Bare-name Rust calls
+/// (e.g. `foo()` after `use crate::other::foo`) are normalised to their
+/// fully-qualified path via `imports`; qualified inline calls
+/// (`module::foo`, `crate::path::foo`) are kept verbatim.
+///
+/// Driven by `queries/{lang}/calls.scm` — see the .scm files for the exact
+/// patterns and a note on why method calls match `field_expression`
+/// instead of the non-existent `method_call_expression`.
+fn extract_calls(
+    node: &Node,
+    source: &str,
+    language: Language,
+    imports: &HashMap<String, String>,
+) -> Vec<String> {
     let mut calls: Vec<String> = Vec::new();
-    let mut stack: Vec<Node> = vec![*node];
+    let mut cursor = QueryCursor::new();
+    let bytes = source.as_bytes();
 
-    while let Some(current) = stack.pop() {
-        match current.kind() {
-            "call_expression" => {
-                if let Some(func) = current.child_by_field_name("function") {
-                    match func.kind() {
-                        "identifier" => {
-                            if let Ok(name) = func.utf8_text(source.as_bytes())
-                                && !name.is_empty()
-                            {
+    match language {
+        Language::Rust => {
+            let query = &queries::RUST.calls;
+            // Capture index → name lookup so we can route each match by
+            // capture role (`@call.fn`, `@call.field`).
+            let cn_call_fn = capture_index(query, "call.fn");
+            let cn_call_field = capture_index(query, "call.field");
+            let mut matches = cursor.matches(query, *node, bytes);
+            while let Some(m) = matches.next() {
+                for cap in m.captures {
+                    let Ok(text) = cap.node.utf8_text(bytes) else {
+                        continue;
+                    };
+                    if text.is_empty() {
+                        continue;
+                    }
+                    if Some(cap.index) == cn_call_fn {
+                        match cap.node.kind() {
+                            "identifier" => {
                                 // Bare call: expand via use imports if available.
-                                let normalized = imports
-                                    .get(name)
-                                    .cloned()
-                                    .unwrap_or_else(|| name.to_owned());
-                                calls.push(normalized);
+                                calls.push(
+                                    imports
+                                        .get(text)
+                                        .cloned()
+                                        .unwrap_or_else(|| text.to_owned()),
+                                );
                             }
-                        }
-                        "scoped_identifier" => {
-                            // Already qualified — keep the full path so the
-                            // resolver can disambiguate by module.
-                            if let Ok(name) = func.utf8_text(source.as_bytes())
-                                && !name.is_empty()
-                            {
-                                calls.push(name.to_owned());
+                            "scoped_identifier" => {
+                                // Qualified — keep verbatim so the resolver
+                                // can disambiguate by module.
+                                calls.push(text.to_owned());
                             }
+                            _ => {}
                         }
-                        // Other shapes (field_expression for chained calls,
-                        // generic_function, etc.) are handled by the inner
-                        // call/method-call branches as we recurse.
-                        _ => {}
+                    } else if Some(cap.index) == cn_call_field {
+                        // `obj.method` → `method`. Many of these (`unwrap`,
+                        // `iter`, …) are filtered later by SKIP_CALLS.
+                        calls.push(text.to_owned());
                     }
                 }
             }
-            "method_call_expression" | "field_expression" => {
-                let name_node = current
-                    .child_by_field_name("name")
-                    .or_else(|| current.child_by_field_name("field"));
-                if let Some(n) = name_node
-                    && let Ok(name) = n.utf8_text(source.as_bytes())
-                    && !name.is_empty()
-                {
-                    calls.push(name.to_owned());
-                }
-            }
-            "call" => {
-                if let Some(func) = current.child_by_field_name("function")
-                    && let Ok(name) = func.utf8_text(source.as_bytes())
-                    && let Some(short) = name.rsplit('.').next()
-                    && !short.is_empty()
-                {
-                    calls.push(short.to_owned());
-                }
-            }
-            _ => {}
         }
-
-        let mut cursor = current.walk();
-        for child in current.children(&mut cursor) {
-            stack.push(child);
+        Language::Python => {
+            let query = &queries::PYTHON.calls;
+            let mut matches = cursor.matches(query, *node, bytes);
+            while let Some(m) = matches.next() {
+                for cap in m.captures {
+                    let Ok(text) = cap.node.utf8_text(bytes) else {
+                        continue;
+                    };
+                    // `foo()` and `obj.method()` both come through here.
+                    // Strip any receiver — keep only the trailing name.
+                    if let Some(short) = text.rsplit('.').next()
+                        && !short.is_empty()
+                    {
+                        calls.push(short.to_owned());
+                    }
+                }
+            }
         }
     }
 
     let mut seen: HashSet<String> = HashSet::new();
     calls.retain(|c| seen.insert(c.clone()));
     calls
+}
+
+/// Look up a capture's index in a compiled query by its `@name`.
+/// Returns `None` if the query doesn't declare that capture (a programmer
+/// error caught at first run).
+fn capture_index(query: &tree_sitter::Query, name: &str) -> Option<u32> {
+    query.capture_index_for_name(name)
 }
 
 // ── Use-import extraction (Rust) ──────────────────────────────────────────────
@@ -570,31 +601,26 @@ pub(crate) struct UseDecl {
     pub glob: bool,
 }
 
-/// Walk the whole AST collecting every `use_declaration` reachable from
-/// `root` — including `use` items nested inside `mod { … }` blocks. Skips
-/// `pub use` re-exports (they don't introduce a name in *this* file's
-/// scope).
+/// Collect every `use_declaration` reachable from `root` — including `use`
+/// items nested inside `mod { … }` blocks. Skips `pub use` re-exports
+/// (they don't introduce a name in *this* file's scope).
 ///
 /// Group forms (`use foo::{a, b}`), aliases (`use foo as bar`), wildcards
 /// (`use foo::*`), and nested paths are all unfolded into one [`UseDecl`]
-/// per leaf.
+/// per leaf by [`flatten_use`].
 fn extract_use_decls(root: Node, source: &str) -> Vec<UseDecl> {
     let mut out: Vec<UseDecl> = Vec::new();
-    let mut stack: Vec<Node> = vec![root];
-    while let Some(n) = stack.pop() {
-        if n.kind() == "use_declaration" {
+    let mut cursor = QueryCursor::new();
+    let mut matches = cursor.matches(&queries::RUST.uses, root, source.as_bytes());
+    while let Some(m) = matches.next() {
+        for cap in m.captures {
+            let n = cap.node;
             if has_visibility_modifier(n) {
-                // `pub use` re-exports don't bind a name locally.
                 continue;
             }
             if let Some(arg) = use_argument(&n) {
                 flatten_use(arg, "", source, &mut out);
             }
-            continue;
-        }
-        let mut cursor = n.walk();
-        for child in n.children(&mut cursor) {
-            stack.push(child);
         }
     }
     out
