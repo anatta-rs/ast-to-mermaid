@@ -1,8 +1,10 @@
 # ast-to-mermaid
 
-Tree-sitter-based code-graph builder that emits [Mermaid](https://mermaid.js.org/) diagrams at five zoom levels, plus a JSON artifact bundle suitable for downstream graph stores.
+Tree-sitter-based code-graph builder that emits [Mermaid](https://mermaid.js.org/) diagrams at five zoom levels, plus a JSON artifact bundle suitable for downstream graph stores. **Git-aware**: render the graph at any ref, materialize per-commit bundles, diff structural changes between branches.
 
 Self-contained Rust crate. **No database, no graph backend, no async runtime, no in-house framework coupling** — just tree-sitter, serde, clap, plus the usual error/log helpers. Drop a path in, get a Mermaid string (or a directory of `.mmd` + `.meta.json` artifacts) out.
+
+A content-addressed cache keyed on git blob SHA-1 makes branch switches cheap: 95%+ of files unchanged → parse skipped, **38× warm-path speedup** on rust-analyzer (1500 files).
 
 ## See it on real code
 
@@ -15,20 +17,27 @@ The whole crate at a glance — every top-level module + cross-module call count
 ```mermaid
 graph TD
     artifacts["artifacts — 1 mod, 9 fn, 2 struct"]
-    bin["bin — 7 mod, 7 fn, 7 struct"]
-    cli_support["cli_support — 1 fn, 1 struct"]
+    bin["bin — 1 mod, 2 fn, 1 struct"]
+    cache_rs["cache.rs — 1 mod, 5 fn, 5 struct"]
+    cli_support_rs["cli_support.rs — 1 mod, 12 fn, 7 struct"]
+    diff_rs["diff.rs — 1 mod, 3 fn, 5 struct"]
+    git_source_rs["git_source.rs — 1 mod, 5 fn, 1 struct"]
     graph_mod["graph — 2 mod, 2 struct"]
-    parser["parser — 1 mod, 9 fn, 1 struct"]
-    pipeline["pipeline — 8 fn, 2 struct"]
+    parser["parser — 1 mod, 9 fn, 2 struct"]
+    pipeline_rs["pipeline.rs — 1 mod, 14 fn, 3 struct"]
     render["render — 8 mod, 14 fn, 2 struct"]
-    resolve["resolve — 4 fn"]
-    bin -->|"5 calls"| cli_support
-    bin -->|"2 calls"| pipeline
-    bin -->|"1 call"| artifacts
-    cli_support -->|"1 call"| pipeline
-    pipeline -->|"2 calls"| resolve
-    pipeline -->|"1 call"| render
-    pipeline -->|"1 call"| artifacts
+    resolve_rs["resolve.rs — 1 mod, 4 fn"]
+    bin -->|"6 calls"| cli_support_rs
+    cli_support_rs -->|"7 calls"| pipeline_rs
+    cli_support_rs -->|"3 calls"| git_source_rs
+    cli_support_rs -->|"2 calls"| artifacts
+    cli_support_rs -->|"2 calls"| diff_rs
+    cli_support_rs -->|"1 call"| cache_rs
+    pipeline_rs -->|"4 calls"| git_source_rs
+    pipeline_rs -->|"2 calls"| parser
+    pipeline_rs -->|"1 call"| render
+    pipeline_rs -->|"1 call"| resolve_rs
+    pipeline_rs -->|"1 call"| artifacts
     artifacts -->|"1 call"| render
 ```
 
@@ -74,13 +83,33 @@ graph TD
 
 Five zoom levels, one tool — `a2m overview` and `a2m function` aren't shown above but follow the same shape.
 
+### Diff: `a2m diff <ref-a>..<ref-b>`
+
+Set-diff between two cached bundles, with each entity coloured by change kind. Auto-runs `a2m index` for any ref that isn't already cached:
+
+```mermaid
+graph TD
+    %% diff: main → feature
+    classDef added fill:#9f9,stroke:#0a0,color:#000
+    classDef removed fill:#f99,stroke:#a00,color:#000
+    classDef modified fill:#fb8,stroke:#d60,color:#000
+    classDef renamed fill:#9ff,stroke:#0aa,color:#000
+    n0["cache.rs::struct::Cache"]:::added
+    n1["cli_support.rs::function::run_index"]:::added
+    n2["pipeline.rs::function::analyze"]:::modified
+    n3["parser/mod.rs::function::hex_sha256"]:::removed
+    n4["parser/util.rs::function::camel_case ↪ to_camel"]:::renamed
+```
+
+`--format json` returns a structured `BundleDiff` with `added` / `removed` / `modified` / `renamed` arrays for downstream tooling. The rename heuristic pairs (removed, added) entries with identical `content_hash`.
+
 ## Install
 
 ```bash
 cargo install ast-to-mermaid
 ```
 
-That ships one binary, `a2m`, with seven subcommands. Building from source works the same way:
+That ships one binary, `a2m`, with ten subcommands. Building from source works the same way:
 
 ```bash
 cargo build --release
@@ -90,8 +119,14 @@ cargo build --release
 ## Quick start
 
 ```bash
-# Birds-eye: every crate/module + cross-module call edges
+# Birds-eye: every crate/module + cross-module call edges (working tree)
 a2m project ./my-repo
+
+# Same diagram at a specific git ref — reads via `git ls-tree` / `cat-file`,
+# no checkout required.
+a2m project ./my-repo --ref main
+a2m project ./my-repo --ref v0.1.0
+a2m project ./my-repo --ref HEAD~3
 
 # One module's items + intra/cross-module calls
 a2m module ./my-repo --target src/server/handlers.rs
@@ -105,11 +140,21 @@ a2m impact ./my-repo --target execute
 # Write to a file instead of stdout
 a2m project ./my-repo --out graph.mmd
 
+# Materialize a full bundle for a ref into the cache (idempotent, re-runs
+# print the cached path and exit instantly)
+a2m index ./my-repo --ref main
+
+# Structural diff between two refs — colour-coded Mermaid output
+a2m diff main..feature
+
 # Skip directories on top of the built-in (target, node_modules, .git, dotfiles)
 a2m project ./my-repo --exclude vendor,generated
+
+# See parse / resolve phase timings + cache hit ratio
+a2m project ./my-repo --trace=info
 ```
 
-## The seven subcommands
+## The ten subcommands
 
 | Subcommand | Output | Needs `--target` |
 |---|---|---|
@@ -120,6 +165,11 @@ a2m project ./my-repo --exclude vendor,generated
 | `a2m impact` | Forward + backward call chain from a function (default 3 hops) | yes — function name |
 | `a2m walk` | List source files under a path (no parsing) — handy for shell pipelines | no |
 | `a2m bundle` | Full 4-layer artifact bundle (see below) | no — needs `--out` |
+| `a2m index` | Materialize a bundle for a git ref into the cache (`./.a2m/cache/refs/<sha>/`) | no — defaults to working tree |
+| `a2m diff` | Set-diff between two cached bundles, colour-coded Mermaid or JSON | yes — `<ref-a>..<ref-b>` |
+| `a2m gc` | Evict old / oversized cache entries by mtime + soft size cap | no |
+
+The first seven accept `--ref <git-ref>` to read from any ref instead of the working tree. The last three accept `--cache-dir <path>` to relocate the cache and `--no-cache` to bypass it (ephemeral tempdir).
 
 ## The artifact bundle
 
@@ -132,7 +182,7 @@ a2m bundle ./src --out ./.artifacts
 ```
 .artifacts/
 ├── overview.mmd                  # project-level diagram
-├── index.json                    # every entity, edges, file pointers
+├── index.json                    # schema=2, every entity (id, kind, content_hash, edges)
 └── entities/
     ├── code_src_pipeline.rs.mmd                          # the module
     ├── code_src_pipeline.rs.meta.json                    #   ↳ children, hash, ...
@@ -141,6 +191,58 @@ a2m bundle ./src --out ./.artifacts
 ```
 
 Each `.meta.json` carries the entity's id, kind, file/line range, signature, doc, content hash, and full caller/callee lists. The bundle is plain JSON + Mermaid — load it into any graph store (Neo4j, DuckDB, in-memory) without re-parsing.
+
+`content_hash` is the **git blob SHA-1** of the entity's source slice — the same value `git hash-object` produces. Cache keys, dedup across branches, and the `a2m diff` rename heuristic all rely on this identity.
+
+## Git-aware mode + cache
+
+`a2m` keeps a content-addressed cache at `<git-toplevel>/.a2m/cache/`. The directory is created on first run, gitignored automatically (single-line `.a2m/.gitignore` written if absent), and structured as:
+
+```
+.a2m/cache/
+├── version                          # schema + grammar + a2m versions; mismatch wipes
+├── blobs/
+│   └── <git_blob_sha>.cbor          # parse output for one file blob
+└── refs/
+    └── <commit_sha or wt-digest>/   # one materialized bundle per ref
+        ├── overview.mmd
+        ├── index.json
+        └── entities/...
+```
+
+Two layers, two payoffs:
+
+- **`blobs/<sha>.cbor`** — per-file atom dedup. Switch branches → only the changed blobs need re-parsing. Measured 38× parse-phase speedup on rust-analyzer warm path.
+- **`refs/<sha>/`** — whole-bundle reuse on identical refs. Re-running `a2m index` on a cached commit prints the path and exits in ~50 ms.
+
+### Workflow examples
+
+```bash
+# CI: materialize once per commit, downstream jobs read the bundle directly
+a2m index ./repo --ref "$GITHUB_SHA"
+cp -r .a2m/cache/refs/"$GITHUB_SHA"/ ./pr-graph/
+
+# Dev loop: see what changed structurally between two PR refs
+a2m diff main..feature/cache-rewrite
+
+# Trim the cache (default 1 GB soft cap)
+a2m gc --max-size 500M --dry-run    # plan
+a2m gc --max-size 500M              # execute
+
+# Cold-path benchmark (no persistent cache)
+a2m project ./repo --no-cache --trace=info
+```
+
+### Tracing
+
+`--trace=info` emits structured per-phase timings:
+
+```
+INFO parse_phase{files=1464}: parse_phase done parsed=1464 atoms=15867 hits=1464 misses=0 elapsed_ms=42
+INFO resolve_phase{atoms=15867}: resolve_phase done edges=5924 elapsed_ms=98
+```
+
+The `hits` / `misses` counters tell you exactly how much work the atom cache saved.
 
 ## Languages
 
@@ -155,7 +257,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-ast-to-mermaid = "0.1"
+ast-to-mermaid = "0.2"
 ```
 
 ```rust
@@ -183,17 +285,24 @@ Lower-level pieces are public for embedders that want to drive the pipeline by h
 ## How it works
 
 ```
-walk source tree
-    └─ src/parser    tree-sitter → CodeAtom + intra-file Calls edges
-    └─ src/graph     in-memory Store<atoms, edges>
-    └─ src/resolve   cross-module Calls edges (uses file-scope `use`
-                     imports + qualified call paths to disambiguate
-                     same-named functions across modules)
-    └─ src/render    Mermaid string per zoom level
-    └─ src/artifacts emit_artifacts → ArtifactSet → write_artifacts
+collect inputs (FS walk OR `git ls-tree --full-tree <ref>`)
+    └─ src/git_source  shell-out to git rev-parse / ls-tree / cat-file
+    └─ src/cache       per-blob: blobs/<git_blob_sha>.cbor (cbor)
+                       per-ref:  refs/<commit_sha>/ (full bundle)
+    └─ src/parser      tree-sitter → ParseUnit { atoms, edges }
+                       (intra-file Calls + Contains edges)
+    └─ src/graph       in-memory Store<atoms, edges>
+    └─ src/resolve     cross-module Calls edges (file-scope `use`
+                       imports + qualified call paths to disambiguate
+                       same-named functions across modules)
+    └─ src/render      Mermaid string per zoom level
+    └─ src/artifacts   emit_artifacts → ArtifactSet → write_artifacts
+    └─ src/diff        compute_diff(BundleA, BundleB) →
+                       BundleDiff (added/removed/modified/renamed)
+                       + render_mermaid (colour-coded)
 ```
 
-No async, no persistence layer, no graph backend. The store is a `RwLock<HashMap + Vec>` and lives for the duration of one CLI invocation. Each binary is a thin clap parser plus a call into the library.
+No async, no persistence layer, no graph backend. The cache is plain CBOR + JSON files on disk. The in-memory `Store` is a `RwLock<HashMap + Vec>` and lives for the duration of one CLI invocation.
 
 ## Quality gates
 
@@ -208,7 +317,96 @@ CI runs `make ci` on every PR. The coverage gate ignores `bin/*.rs` (thin wrappe
 
 ## Status
 
-`v0.1` — seven binaries, library API, artifact bundle. Stable shape; future work is mostly more languages and richer per-entity metadata.
+`v0.2` — git-aware. Ten subcommands (seven render levels + `index` / `diff` / `gc`), library API, artifact bundle, two-tier content-addressed cache keyed by git blob SHA-1. Breaking on `index.json` (`schema: 2`, new `content_hash` field, value format change from `sha256:<fnv-1a>` to raw git blob SHA-1). Tested on Rust crates from 6 to 1 463 files (rust-analyzer); see [`docs/perf/2026-05-01-resolve-cost-baseline.md`](./docs/perf/2026-05-01-resolve-cost-baseline.md) for benchmarks.
+
+Future work: parallel parse loop (`rayon`) for the cold path on large monorepos, optional V2 edge-level cache if `--trace=info` shows resolve-phase exceeding 30% of wall on real workloads (currently ≤ 7% even at rust-analyzer scale).
+
+## Examples (real output from this repo)
+
+### Atom cache: cold → warm → one-file edit
+
+`a2m project ./src --trace=info` on this crate, three runs back-to-back. Cache state is visible in `hits` / `misses`:
+
+```text
+# Run 1 — cold cache, every file is a miss
+INFO parse_phase{files=22}: parse_phase done parsed=22 atoms=173 hits=0 misses=22 elapsed_ms=23
+INFO resolve_phase{atoms=173}: resolve_phase done edges=50 elapsed_ms=0
+
+# Run 2 — warm cache, every file replays from disk, parser skipped entirely
+INFO parse_phase{files=22}: parse_phase done parsed=22 atoms=173 hits=22 misses=0 elapsed_ms=0
+INFO resolve_phase{atoms=173}: resolve_phase done edges=50 elapsed_ms=0
+
+# Run 3 — touched one file; only that blob is re-parsed, the other 21 are reused
+INFO parse_phase{files=22}: parse_phase done parsed=22 atoms=173 hits=21 misses=1 elapsed_ms=1
+INFO resolve_phase{atoms=173}: resolve_phase done edges=50 elapsed_ms=0
+```
+
+The pattern scales: on rust-analyzer (1 464 files / 570 k LOC) the warm parse-phase drops from 1 432 ms to 42 ms — **38× speedup** — see [`docs/perf/2026-05-01-resolve-cost-baseline.md`](./docs/perf/2026-05-01-resolve-cost-baseline.md).
+
+### `a2m diff 0ee4cae..0ddc266` — the atomic-write commit
+
+Real diff between two commits on the branch that built this README. The atomic-write commit added the `atomic_write` / `atomic_rename` helpers, the `BlobEnvelope` magic + version, and the `write_bundle_atomic` CLI helper, then modified the `Cache::put_atoms` impl and the index plumbing to use them:
+
+```mermaid
+graph TD
+    %% diff: 0ee4cae → 0ddc266
+    classDef added fill:#9f9,stroke:#0a0,color:#000
+    classDef removed fill:#f99,stroke:#a00,color:#000
+    classDef modified fill:#fb8,stroke:#d60,color:#000
+    classDef renamed fill:#9ff,stroke:#0aa,color:#000
+    n0["cache.rs::const::BLOB_ENVELOPE_VERSION"]:::added
+    n1["cache.rs::const::BLOB_MAGIC"]:::added
+    n2["cache.rs::function::atomic_rename"]:::added
+    n3["cache.rs::function::atomic_write"]:::added
+    n4["cache.rs::struct::BlobEnvelope"]:::added
+    n5["cli_support.rs::function::write_bundle_atomic"]:::added
+    n6["cache.rs"]:::modified
+    n7["cache.rs::impl::Cache"]:::modified
+    n8["cli_support.rs"]:::modified
+    n9["cli_support.rs::function::ensure_indexed"]:::modified
+    n10["cli_support.rs::function::run_index"]:::modified
+```
+
+`+6 -0 ~5 ↪0` — six added, five modified, no removals or renames. Exactly what you'd expect from a non-breaking feature commit.
+
+### `a2m diff v0.1.0..HEAD` — the entire git-aware journey
+
+Stats for the cumulative diff between the last release and the head of this branch:
+
+```
+diff v0.1.0 → HEAD: +63 -24 ~45 ↪0
+```
+
+63 added entities (the new `cache`, `diff`, `git_source` modules + their public APIs + the new subcommand handlers), 24 removed (the FNV-1a `hex_sha256`, the seven separate binary entry points that got collapsed), 45 modified (every existing module gained `--ref` plumbing, the parser was refactored to expose `ParseUnit`, the artifact emitter now writes `content_hash`).
+
+Drop the full Mermaid output into [mermaid.live](https://mermaid.live) to scroll the colour-coded entity list visually.
+
+### `a2m index --ref` and re-runs
+
+```text
+$ a2m index ./repo --ref main
+indexed 8209bc8315459f3534c501b0d1607d2b84470fcd → /repo/.a2m/cache/refs/8209bc8.../bundle (22 files, 153 atoms, 47 edges)
+
+$ a2m index ./repo --ref main
+cached 8209bc8315459f3534c501b0d1607d2b84470fcd → /repo/.a2m/cache/refs/8209bc8.../bundle
+
+$ a2m index ./repo --ref main --force
+indexed 8209bc8315459f3534c501b0d1607d2b84470fcd → /repo/.a2m/cache/refs/8209bc8.../bundle (22 files, 153 atoms, 47 edges)
+```
+
+Idempotent by default: re-runs on the same commit print the cached path and exit in milliseconds. `--force` re-materializes (e.g. after a parser version bump).
+
+### `a2m gc` — pruning the cache
+
+```text
+$ a2m gc --max-size 100K --dry-run
+would remove 1 entries (235830 bytes) from /repo/.a2m/cache (had 1 entries, 235830 bytes)
+
+$ a2m gc --max-size 100K
+removed 1 entries (235830 bytes) from /repo/.a2m/cache (had 1 entries, 235830 bytes)
+```
+
+Eviction is by mtime ascending until total size is under the cap. `--older-than 30d` adds an age filter on top.
 
 ## License
 
