@@ -78,13 +78,7 @@ pub fn mermaid_to_dot(mermaid: &str) -> String {
             let label = label_part.trim().trim_matches('"');
             let to = to_part.trim();
             push_indent(&mut out, depth + 1);
-            let _ = writeln!(
-                out,
-                "{} -> {} [label=\"{}\"];",
-                from.trim(),
-                to,
-                esc(label)
-            );
+            let _ = writeln!(out, "{} -> {} [label=\"{}\"];", from.trim(), to, esc(label));
             continue;
         }
 
@@ -168,7 +162,10 @@ fn parse_node(line: &str) -> Option<(String, String)> {
         ("(", ")"),       // rounded (struct/enum/type_alias)
     ];
     for (open, close) in shapes {
-        if let Some(inner) = rest.strip_prefix(*open).and_then(|s| s.strip_suffix(*close)) {
+        if let Some(inner) = rest
+            .strip_prefix(*open)
+            .and_then(|s| s.strip_suffix(*close))
+        {
             return Some((id, inner.to_string()));
         }
     }
@@ -200,10 +197,7 @@ mod tests {
     fn rectangle_node_with_quoted_label() {
         let m = "graph TD\n    foo[\"foo bar — 1 fn\"]\n";
         let d = mermaid_to_dot(m);
-        assert!(
-            d.contains("foo [label=\"foo bar — 1 fn\"];"),
-            "got: {d}"
-        );
+        assert!(d.contains("foo [label=\"foo bar — 1 fn\"];"), "got: {d}");
     }
 
     #[test]
