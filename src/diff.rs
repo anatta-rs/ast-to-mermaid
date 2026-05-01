@@ -245,9 +245,12 @@ pub fn render_mermaid(diff: &BundleDiff) -> String {
     let mut out = String::with_capacity(1024);
     writeln!(out, "graph TD").ok();
     writeln!(out, "    %% diff: {} → {}", diff.from, diff.to).ok();
+    // Color convention: added=green, removed=red, modified=orange, renamed=cyan.
+    // Light fill + darker stroke + black text for legibility on both light
+    // and dark Mermaid themes.
     writeln!(out, "    classDef added fill:#9f9,stroke:#0a0,color:#000").ok();
     writeln!(out, "    classDef removed fill:#f99,stroke:#a00,color:#000").ok();
-    writeln!(out, "    classDef modified fill:#ff9,stroke:#aa0,color:#000").ok();
+    writeln!(out, "    classDef modified fill:#fb8,stroke:#d60,color:#000").ok();
     writeln!(out, "    classDef renamed fill:#9ff,stroke:#0aa,color:#000").ok();
 
     // Keep a counter so node ids are short and Mermaid-safe.
