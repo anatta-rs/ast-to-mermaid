@@ -5,6 +5,7 @@
 
 use crate::artifacts::{ArtifactSet, emit_artifacts};
 use crate::error::{AstToMermaidError, Result};
+use crate::git_source;
 use crate::graph::Store;
 use crate::parser::{CodeParser, Language};
 use crate::render::{Level, render};
@@ -23,6 +24,11 @@ pub struct AnalyzeOptions {
     /// walk. Always combined with the built-in skip set
     /// (`target`, `node_modules`, `.git`, any dotfile dir).
     pub exclude: Vec<String>,
+    /// Optional git ref to read source from (e.g. `main`, `v0.1.0`,
+    /// `HEAD~3`). When set, the pipeline reads file contents via
+    /// `git cat-file` rather than walking the working tree, and ignores
+    /// `exclude` (git ls-tree already excludes ignored files).
+    pub git_ref: Option<String>,
 }
 
 impl Default for AnalyzeOptions {
@@ -31,8 +37,76 @@ impl Default for AnalyzeOptions {
             level: Level::Project,
             target: None,
             exclude: Vec::new(),
+            git_ref: None,
         }
     }
+}
+
+/// One unit of work for the parse loop: a logical path label, the bytes to
+/// parse, and the language. Produced by either the FS walk or the git tree.
+struct ParseInput {
+    /// Display path used for entity ids (relative-to-root, slash-separated).
+    display_path: String,
+    /// File contents as bytes.
+    content: Vec<u8>,
+    /// Language detected from the file extension.
+    language: Language,
+}
+
+/// Collect parse inputs from either the working tree (FS walk) or a git ref
+/// (`git ls-tree` + `git cat-file`).
+fn collect_inputs(root: &Path, opts: &AnalyzeOptions) -> Result<Vec<ParseInput>> {
+    if let Some(git_ref) = opts.git_ref.as_deref() {
+        collect_from_git_ref(root, git_ref)
+    } else {
+        collect_from_worktree(root, &opts.exclude)
+    }
+}
+
+fn collect_from_worktree(root: &Path, exclude: &[String]) -> Result<Vec<ParseInput>> {
+    let files = walk_for_languages_with_exclude(root, exclude)?;
+    let mut out = Vec::with_capacity(files.len());
+    for (path, language) in files {
+        let content = std::fs::read(&path)?;
+        let display_path = display_path(root, &path);
+        out.push(ParseInput {
+            display_path,
+            content,
+            language,
+        });
+    }
+    Ok(out)
+}
+
+fn collect_from_git_ref(root: &Path, git_ref: &str) -> Result<Vec<ParseInput>> {
+    let toplevel = git_source::show_toplevel(root)?;
+    // If the user pointed at a subdirectory, only keep entries under it.
+    let prefix = root
+        .canonicalize()
+        .ok()
+        .and_then(|abs| abs.strip_prefix(&toplevel).ok().map(Path::to_path_buf))
+        .map(|p| p.to_string_lossy().into_owned())
+        .filter(|s| !s.is_empty());
+
+    let entries = git_source::ls_tree(&toplevel, git_ref)?;
+    let mut out = Vec::new();
+    for entry in entries {
+        if let Some(p) = prefix.as_deref()
+            && !entry.path.starts_with(p)
+        {
+            continue;
+        }
+        let Some(language) = language_for(Path::new(&entry.path)) else {
+            continue;
+        };
+        let content = git_source::cat_file(&toplevel, &entry.blob_sha)?;
+        out.push(ParseInput {
+            display_path: entry.path,
+            content,
+            language,
+        });
+    }
+    Ok(out)
 }
 
 /// What [`analyze`] returns.
@@ -60,28 +134,31 @@ pub struct AnalyzeReport {
 /// Returns the first error from filesystem walk, parsing, or renderer.
 /// Individual files that fail to parse are propagated.
 pub fn analyze(root: &Path, opts: &AnalyzeOptions) -> Result<AnalyzeReport> {
-    if !root.exists() {
+    // FS-mode requires the path to exist. In git-ref mode the path can be a
+    // subdir hint that was deleted on HEAD but present in the ref; defer the
+    // check to `git_source::show_toplevel`.
+    if opts.git_ref.is_none() && !root.exists() {
         return Err(AstToMermaidError::InvalidInput(format!(
             "path does not exist: {}",
             root.display()
         )));
     }
 
-    let files = walk_for_languages_with_exclude(root, &opts.exclude)?;
+    let inputs = collect_inputs(root, opts)?;
     let store = Store::new();
 
     let mut atoms_indexed = 0;
     let mut files_parsed = 0;
-    for (path, lang) in &files {
-        let bytes = std::fs::read(path)?;
-        let parser = match lang {
+    for input in &inputs {
+        let parser = match input.language {
             Language::Rust => CodeParser::rust(),
             Language::Python => CodeParser::python(),
         };
-        let display_path = display_path(root, path);
         let count = parser
-            .parse_into(&bytes, &display_path, &store)
-            .map_err(|e| AstToMermaidError::InvalidInput(format!("parse {display_path}: {e}")))?;
+            .parse_into(&input.content, &input.display_path, &store)
+            .map_err(|e| {
+                AstToMermaidError::InvalidInput(format!("parse {}: {e}", input.display_path))
+            })?;
         atoms_indexed += count;
         files_parsed += 1;
     }
@@ -114,36 +191,39 @@ pub fn analyze(root: &Path, opts: &AnalyzeOptions) -> Result<AnalyzeReport> {
 /// Returns the first error from filesystem walk, parsing, or
 /// resolver. Individual files that fail to parse are propagated.
 pub fn bundle(root: &Path, opts: &AnalyzeOptions) -> Result<(ArtifactSet, AnalyzeReport)> {
-    if !root.exists() {
+    if opts.git_ref.is_none() && !root.exists() {
         return Err(AstToMermaidError::InvalidInput(format!(
             "path does not exist: {}",
             root.display()
         )));
     }
 
-    let files = walk_for_languages_with_exclude(root, &opts.exclude)?;
+    let inputs = collect_inputs(root, opts)?;
     let store = Store::new();
 
     let mut atoms_indexed = 0;
     let mut files_parsed = 0;
-    for (path, lang) in &files {
-        let bytes = std::fs::read(path)?;
-        let parser = match lang {
+    for input in &inputs {
+        let parser = match input.language {
             Language::Rust => CodeParser::rust(),
             Language::Python => CodeParser::python(),
         };
-        let display_path = display_path(root, path);
         let count = parser
-            .parse_into(&bytes, &display_path, &store)
-            .map_err(|e| AstToMermaidError::InvalidInput(format!("parse {display_path}: {e}")))?;
+            .parse_into(&input.content, &input.display_path, &store)
+            .map_err(|e| {
+                AstToMermaidError::InvalidInput(format!("parse {}: {e}", input.display_path))
+            })?;
         atoms_indexed += count;
         files_parsed += 1;
     }
 
     let edges_resolved = resolve_cross_module_calls(&store);
 
-    let source_root = root.to_string_lossy();
-    let artifacts = emit_artifacts(&store, source_root.as_ref());
+    let source_root = match opts.git_ref.as_deref() {
+        Some(ref_name) => format!("{}@{ref_name}", root.display()),
+        None => root.to_string_lossy().into_owned(),
+    };
+    let artifacts = emit_artifacts(&store, &source_root);
 
     let report = AnalyzeReport {
         // The "rendered" mermaid for a bundle is the project view —
@@ -362,6 +442,7 @@ mod tests {
                 level: Level::Project,
                 target: None,
                 exclude: Vec::new(),
+                git_ref: None,
             },
         )
         .expect("analyze");

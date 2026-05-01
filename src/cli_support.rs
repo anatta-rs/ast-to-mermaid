@@ -52,6 +52,12 @@ pub struct AnalyzeFlags {
     /// Write Mermaid output to this file instead of stdout.
     #[arg(short, long)]
     pub out: Option<PathBuf>,
+
+    /// Read source from a git ref (e.g. `main`, `v0.1.0`, `HEAD~3`)
+    /// instead of the working tree. The path argument becomes a
+    /// subdirectory hint within that ref's tree.
+    #[arg(long, value_name = "GIT-REF")]
+    pub r#ref: Option<String>,
 }
 
 /// Run the analyze pipeline for `level`, writing the resulting Mermaid to
@@ -80,6 +86,7 @@ pub fn run_analyze(level: Level, flags: &AnalyzeFlags) -> ExitCode {
         level,
         target: flags.target.clone(),
         exclude,
+        git_ref: flags.r#ref.clone(),
     };
 
     let report = match analyze(&flags.path, &opts) {
@@ -119,11 +126,19 @@ pub struct WalkFlags {
     /// hidden dirs).
     #[arg(short = 'x', long, default_value = "")]
     pub exclude: String,
+
+    /// Read source from a git ref instead of the working tree. With `--ref`,
+    /// `walk` lists `git ls-tree` paths (filtered to supported languages).
+    #[arg(long, value_name = "GIT-REF")]
+    pub r#ref: Option<String>,
 }
 
 /// Run the file-walker subcommand: print one line per source file, format
 /// `<lang>\t<path>`, to stdout.
 pub fn run_walk(flags: &WalkFlags) -> ExitCode {
+    if let Some(git_ref) = flags.r#ref.as_deref() {
+        return run_walk_ref(&flags.path, git_ref);
+    }
     let exclude: Vec<String> = flags
         .exclude
         .split(',')
@@ -146,6 +161,38 @@ pub fn run_walk(flags: &WalkFlags) -> ExitCode {
     }
 }
 
+fn run_walk_ref(start: &std::path::Path, git_ref: &str) -> ExitCode {
+    use crate::git_source;
+    use crate::parser::Language;
+
+    let toplevel = match git_source::show_toplevel(start) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("walk: {e}");
+            return ExitCode::Failure;
+        }
+    };
+    let entries = match git_source::ls_tree(&toplevel, git_ref) {
+        Ok(es) => es,
+        Err(e) => {
+            eprintln!("walk: {e}");
+            return ExitCode::Failure;
+        }
+    };
+    for entry in entries {
+        let lang = match std::path::Path::new(&entry.path)
+            .extension()
+            .and_then(|e| e.to_str())
+        {
+            Some("rs") => Language::Rust,
+            Some("py") => Language::Python,
+            _ => continue,
+        };
+        println!("{}\t{}", lang.name(), entry.path);
+    }
+    ExitCode::Success
+}
+
 /// CLI args for the `bundle` subcommand.
 #[derive(Debug, Clone, clap::Args)]
 pub struct BundleFlags {
@@ -161,6 +208,11 @@ pub struct BundleFlags {
     /// with the built-in skip set.
     #[arg(short = 'x', long, default_value = "")]
     pub exclude: String,
+
+    /// Read source from a git ref (e.g. `main`, `v0.1.0`, `HEAD~3`)
+    /// instead of the working tree.
+    #[arg(long, value_name = "GIT-REF")]
+    pub r#ref: Option<String>,
 }
 
 /// Run the artifact-bundle subcommand: parse → resolve → emit a directory
@@ -176,6 +228,7 @@ pub fn run_bundle(flags: &BundleFlags) -> ExitCode {
 
     let opts = AnalyzeOptions {
         exclude,
+        git_ref: flags.r#ref.clone(),
         ..AnalyzeOptions::default()
     };
 
@@ -215,6 +268,7 @@ mod tests {
             target: None,
             exclude: String::new(),
             out: None,
+            r#ref: None,
         };
         let code = run_analyze(Level::Module, &flags);
         assert_eq!(code, ExitCode::UsageError);
@@ -227,6 +281,7 @@ mod tests {
             target: None,
             exclude: String::new(),
             out: None,
+            r#ref: None,
         };
         let code = run_analyze(Level::Project, &flags);
         assert_eq!(code, ExitCode::Failure);
@@ -249,6 +304,7 @@ mod tests {
             target: None,
             exclude: String::new(),
             out: Some(out_file.clone()),
+            r#ref: None,
         };
         let code = run_analyze(Level::Project, &flags);
         assert_eq!(code, ExitCode::Success);
@@ -263,6 +319,7 @@ mod tests {
             target: None,
             exclude: String::new(),
             out: None,
+            r#ref: None,
         };
         let code = run_analyze(Level::Project, &flags);
         assert_eq!(code, ExitCode::Success);
@@ -274,6 +331,7 @@ mod tests {
         let flags = WalkFlags {
             path: tmp.path().to_path_buf(),
             exclude: String::new(),
+            r#ref: None,
         };
         assert_eq!(run_walk(&flags), ExitCode::Success);
     }
@@ -285,6 +343,7 @@ mod tests {
         let flags = WalkFlags {
             path: PathBuf::from("/no/such/path/here-cli-test"),
             exclude: String::new(),
+            r#ref: None,
         };
         assert_eq!(run_walk(&flags), ExitCode::Success);
     }
@@ -297,6 +356,7 @@ mod tests {
             path: tmp.path().to_path_buf(),
             out: out.clone(),
             exclude: String::new(),
+            r#ref: None,
         };
         assert_eq!(run_bundle(&flags), ExitCode::Success);
         assert!(out.join("index.json").exists());
@@ -310,6 +370,7 @@ mod tests {
             path: PathBuf::from("/no/such/path/here-cli-test"),
             out: tmp.path().join("bundle-out"),
             exclude: String::new(),
+            r#ref: None,
         };
         assert_eq!(run_bundle(&flags), ExitCode::Failure);
     }
