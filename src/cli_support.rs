@@ -5,12 +5,13 @@
 //! a thin clap parser.
 
 use crate::artifacts::write_artifacts;
-use crate::cache::Cache;
+use crate::cache::{Cache, GcOptions};
 use crate::diff::{compute_diff, load_bundle_entities, render_mermaid};
 use crate::pipeline::{AnalyzeOptions, analyze, bundle, snapshot_id, walk_for_languages_with_exclude};
 use crate::render::Level;
 use std::path::{Path, PathBuf};
 use std::process;
+use std::time::Duration;
 
 /// Exit code returned by CLI functions, convertible into [`process::ExitCode`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -441,6 +442,126 @@ fn ensure_indexed(
     let (artifacts, _report) = bundle(path, &opts)?;
     write_artifacts(&artifacts, &cache.bundle_dir(&sha))?;
     Ok(sha)
+}
+
+/// CLI args for the `gc` subcommand.
+#[derive(Debug, Clone, clap::Args)]
+pub struct GcFlags {
+    /// Path inside the repo. Used only to locate the cache root via
+    /// `git rev-parse --show-toplevel`.
+    #[arg(long, default_value = ".")]
+    pub path: PathBuf,
+
+    /// Soft cap in bytes (suffixes: `K`, `M`, `G`). Default 1G.
+    #[arg(long, value_name = "SIZE", default_value = "1G")]
+    pub max_size: String,
+
+    /// Evict entries older than this duration (e.g. `30d`, `2w`, `12h`).
+    /// No default — when unset, eviction is purely size-based.
+    #[arg(long, value_name = "DURATION")]
+    pub older_than: Option<String>,
+
+    /// Compute what would be removed, but don't touch the filesystem.
+    #[arg(long)]
+    pub dry_run: bool,
+
+    /// Shared cache flags (`--cache-dir`, `--no-cache`).
+    #[command(flatten)]
+    pub cache: CacheArgs,
+}
+
+/// Run the `gc` subcommand: evict old / oversized cache entries.
+pub fn run_gc(flags: &GcFlags) -> ExitCode {
+    let max_size = match parse_size(&flags.max_size) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("gc: --max-size: {e}");
+            return ExitCode::UsageError;
+        }
+    };
+    let older_than = match flags.older_than.as_deref() {
+        Some(s) => match parse_duration(s) {
+            Ok(d) => Some(d),
+            Err(e) => {
+                eprintln!("gc: --older-than: {e}");
+                return ExitCode::UsageError;
+            }
+        },
+        None => None,
+    };
+
+    let (cache_root, _ephemeral) = match flags.cache.resolve(&flags.path) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("gc: resolve cache root: {e}");
+            return ExitCode::Failure;
+        }
+    };
+    let cache = match Cache::open(&cache_root) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("gc: open cache {}: {e}", cache_root.display());
+            return ExitCode::Failure;
+        }
+    };
+
+    let opts = GcOptions {
+        max_size_bytes: Some(max_size),
+        older_than,
+        dry_run: flags.dry_run,
+    };
+    let report = match cache.gc(&opts) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("gc: {e}");
+            return ExitCode::Failure;
+        }
+    };
+
+    let verb = if flags.dry_run { "would remove" } else { "removed" };
+    eprintln!(
+        "{verb} {} entries ({} bytes) from {} (had {} entries, {} bytes)",
+        report.removed_count,
+        report.removed_size,
+        cache_root.display(),
+        report.count_before,
+        report.total_before,
+    );
+    ExitCode::Success
+}
+
+fn parse_size(s: &str) -> std::result::Result<u64, String> {
+    let s = s.trim();
+    if s.is_empty() {
+        return Err("empty value".into());
+    }
+    let (num, mult) = match s.chars().last() {
+        Some('K' | 'k') => (&s[..s.len() - 1], 1024_u64),
+        Some('M' | 'm') => (&s[..s.len() - 1], 1024_u64 * 1024),
+        Some('G' | 'g') => (&s[..s.len() - 1], 1024_u64 * 1024 * 1024),
+        _ => (s, 1_u64),
+    };
+    num.parse::<u64>()
+        .map_err(|e| format!("expected `<num>[K|M|G]`, got `{s}`: {e}"))
+        .map(|n| n * mult)
+}
+
+fn parse_duration(s: &str) -> std::result::Result<Duration, String> {
+    let s = s.trim();
+    if s.is_empty() {
+        return Err("empty value".into());
+    }
+    let (num, secs) = match s.chars().last() {
+        Some('s') => (&s[..s.len() - 1], 1_u64),
+        Some('m') => (&s[..s.len() - 1], 60),
+        Some('h') => (&s[..s.len() - 1], 60 * 60),
+        Some('d') => (&s[..s.len() - 1], 24 * 60 * 60),
+        Some('w') => (&s[..s.len() - 1], 7 * 24 * 60 * 60),
+        _ => (s, 1),
+    };
+    num.parse::<u64>()
+        .map_err(|e| format!("expected `<num>[s|m|h|d|w]`, got `{s}`: {e}"))
+        .map(|n| Duration::from_secs(n * secs))
 }
 
 /// CLI args for the `bundle` subcommand.

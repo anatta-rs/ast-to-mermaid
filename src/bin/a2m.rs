@@ -16,8 +16,8 @@
 #![deny(unsafe_code)]
 
 use ast_to_mermaid::cli_support::{
-    AnalyzeFlags, BundleFlags, DiffFlags, ExitCode, IndexFlags, WalkFlags, run_analyze, run_bundle,
-    run_diff, run_index, run_walk,
+    AnalyzeFlags, BundleFlags, DiffFlags, ExitCode, GcFlags, IndexFlags, WalkFlags, run_analyze,
+    run_bundle, run_diff, run_gc, run_index, run_walk,
 };
 use ast_to_mermaid::render::Level;
 use clap::{Parser, Subcommand};
@@ -62,6 +62,8 @@ enum Command {
     /// Set-diff between two cached bundles (`<ref-a>..<ref-b>`).
     /// Auto-runs `index` for missing refs.
     Diff(DiffFlags),
+    /// Garbage-collect the cache: evict old / oversized entries.
+    Gc(GcFlags),
 }
 
 fn main() -> std::process::ExitCode {
@@ -77,6 +79,7 @@ fn main() -> std::process::ExitCode {
         Command::Bundle(f) => run_bundle(&f),
         Command::Index(f) => run_index(&f),
         Command::Diff(f) => run_diff(&f),
+        Command::Gc(f) => run_gc(&f),
     };
     code.into()
 }
