@@ -303,7 +303,10 @@ enum GcKind {
 /// disk for diagnosis (caller can retry or `gc`).
 pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     let parent = path.parent().ok_or_else(|| {
-        AstToMermaidError::InvalidInput(format!("atomic_write: path has no parent: {}", path.display()))
+        AstToMermaidError::InvalidInput(format!(
+            "atomic_write: path has no parent: {}",
+            path.display()
+        ))
     })?;
     fs::create_dir_all(parent)?;
     let pid = std::process::id();
@@ -338,9 +341,8 @@ fn collect_gc_entries(dir: &Path, kind: GcKind, out: &mut Vec<GcEntry>) -> Resul
         let meta = entry.metadata()?;
         let mtime = meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
         let size = match kind {
-            GcKind::Blob => meta.len(),
             GcKind::Bundle if meta.is_dir() => dir_size_recursive(&path)?,
-            _ => meta.len(),
+            GcKind::Blob | GcKind::Bundle => meta.len(),
         };
         out.push(GcEntry { path, mtime, size });
     }

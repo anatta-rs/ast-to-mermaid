@@ -7,7 +7,9 @@
 use crate::artifacts::write_artifacts;
 use crate::cache::{Cache, GcOptions, atomic_rename};
 use crate::diff::{compute_diff, load_bundle_entities, render_mermaid};
-use crate::pipeline::{AnalyzeOptions, analyze, bundle, snapshot_id, walk_for_languages_with_exclude};
+use crate::pipeline::{
+    AnalyzeOptions, analyze, bundle, snapshot_id, walk_for_languages_with_exclude,
+};
 use crate::render::Level;
 use std::path::{Path, PathBuf};
 use std::process;
@@ -233,11 +235,15 @@ impl CacheArgs {
     /// Resolve the effective cache root for `path`, honoring overrides.
     /// Returns `(root, ephemeral_handle)` — keep `ephemeral_handle` alive
     /// for the duration of the command; dropping it deletes the tempdir.
-    pub fn resolve(&self, path: &Path) -> Result<(PathBuf, Option<tempfile::TempDir>), crate::error::AstToMermaidError> {
+    ///
+    /// # Errors
+    /// Propagates I/O errors from tempdir creation when `no_cache` is set.
+    pub fn resolve(
+        &self,
+        path: &Path,
+    ) -> Result<(PathBuf, Option<tempfile::TempDir>), crate::error::AstToMermaidError> {
         if self.no_cache {
-            let dir = tempfile::Builder::new()
-                .prefix("a2m-no-cache-")
-                .tempdir()?;
+            let dir = tempfile::Builder::new().prefix("a2m-no-cache-").tempdir()?;
             return Ok((dir.path().to_path_buf(), Some(dir)));
         }
         let root = self.cache_dir.clone().unwrap_or_else(|| {
@@ -368,6 +374,7 @@ pub enum DiffFormat {
 
 /// Run the `diff` subcommand: compute the structural diff between two
 /// cached bundles. Auto-runs `index` for any ref that isn't already cached.
+#[must_use]
 pub fn run_diff(flags: &DiffFlags) -> ExitCode {
     let Some((ref_a, ref_b)) = flags.range.split_once("..") else {
         eprintln!("diff: expected `<ref-a>..<ref-b>`, got `{}`", flags.range);
@@ -485,7 +492,10 @@ fn write_bundle_atomic(
     })?;
     std::fs::create_dir_all(parent)?;
     let pid = std::process::id();
-    let stem = final_dir.file_name().and_then(|s| s.to_str()).unwrap_or("bundle");
+    let stem = final_dir
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("bundle");
     let tmp_dir = parent.join(format!(".{stem}.tmp.{pid}"));
     if tmp_dir.exists() {
         std::fs::remove_dir_all(&tmp_dir)?;
@@ -525,6 +535,7 @@ pub struct GcFlags {
 }
 
 /// Run the `gc` subcommand: evict old / oversized cache entries.
+#[must_use]
 pub fn run_gc(flags: &GcFlags) -> ExitCode {
     let max_size = match parse_size(&flags.max_size) {
         Ok(b) => b,
@@ -572,7 +583,11 @@ pub fn run_gc(flags: &GcFlags) -> ExitCode {
         }
     };
 
-    let verb = if flags.dry_run { "would remove" } else { "removed" };
+    let verb = if flags.dry_run {
+        "would remove"
+    } else {
+        "removed"
+    };
     eprintln!(
         "{verb} {} entries ({} bytes) from {} (had {} entries, {} bytes)",
         report.removed_count,

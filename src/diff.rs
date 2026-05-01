@@ -166,10 +166,7 @@ impl Serialize for IndexEntity {
 pub fn load_bundle_entities(bundle_dir: &Path) -> Result<Vec<IndexEntity>> {
     let index_path = bundle_dir.join("index.json");
     let bytes = std::fs::read(&index_path).map_err(|e| {
-        AstToMermaidError::InvalidInput(format!(
-            "load bundle {}: {e}",
-            index_path.display()
-        ))
+        AstToMermaidError::InvalidInput(format!("load bundle {}: {e}", index_path.display()))
     })?;
     let file: IndexFile = serde_json::from_slice(&bytes).map_err(|e| {
         AstToMermaidError::InvalidInput(format!("parse index.json {}: {e}", index_path.display()))
@@ -190,8 +187,10 @@ pub fn compute_diff(
     from_entities: Vec<IndexEntity>,
     to_entities: Vec<IndexEntity>,
 ) -> BundleDiff {
-    let from_ids: HashMap<String, IndexEntity> =
-        from_entities.into_iter().map(|e| (e.id.clone(), e)).collect();
+    let from_ids: HashMap<String, IndexEntity> = from_entities
+        .into_iter()
+        .map(|e| (e.id.clone(), e))
+        .collect();
     let mut to_ids: HashMap<String, IndexEntity> =
         to_entities.into_iter().map(|e| (e.id.clone(), e)).collect();
 
@@ -225,7 +224,10 @@ pub fn compute_diff(
     let mut hash_to_added: HashMap<String, Vec<usize>> = HashMap::new();
     for (idx, e) in added.iter().enumerate() {
         if !e.content_hash.is_empty() {
-            hash_to_added.entry(e.content_hash.clone()).or_default().push(idx);
+            hash_to_added
+                .entry(e.content_hash.clone())
+                .or_default()
+                .push(idx);
         }
     }
     let mut taken_added: Vec<bool> = vec![false; added.len()];
@@ -305,7 +307,11 @@ pub fn render_mermaid(diff: &BundleDiff, to_entities: &[IndexEntity]) -> String 
     // and dark Mermaid themes.
     writeln!(out, "    classDef added fill:#9f9,stroke:#0a0,color:#000").ok();
     writeln!(out, "    classDef removed fill:#f99,stroke:#a00,color:#000").ok();
-    writeln!(out, "    classDef modified fill:#fb8,stroke:#d60,color:#000").ok();
+    writeln!(
+        out,
+        "    classDef modified fill:#fb8,stroke:#d60,color:#000"
+    )
+    .ok();
     writeln!(out, "    classDef renamed fill:#9ff,stroke:#0aa,color:#000").ok();
 
     // Two passes: emit nodes (assigning short Mermaid-safe ids), then
@@ -313,11 +319,11 @@ pub fn render_mermaid(diff: &BundleDiff, to_entities: &[IndexEntity]) -> String 
     let mut id_to_node: HashMap<String, String> = HashMap::new();
     let mut next_idx = 0usize;
     let new_node = |out: &mut String,
-                        id_to_node: &mut HashMap<String, String>,
-                        idx: &mut usize,
-                        entity_id: &str,
-                        label: &str,
-                        class: &str| {
+                    id_to_node: &mut HashMap<String, String>,
+                    idx: &mut usize,
+                    entity_id: &str,
+                    label: &str,
+                    class: &str| {
         let n = format!("n{}", *idx);
         *idx += 1;
         let safe = label.replace('"', "'");
@@ -328,19 +334,40 @@ pub fn render_mermaid(diff: &BundleDiff, to_entities: &[IndexEntity]) -> String 
     if !diff.added.is_empty() {
         writeln!(out, "    %% added ({})", diff.added.len()).ok();
         for e in &diff.added {
-            new_node(&mut out, &mut id_to_node, &mut next_idx, &e.id, &e.id, "added");
+            new_node(
+                &mut out,
+                &mut id_to_node,
+                &mut next_idx,
+                &e.id,
+                &e.id,
+                "added",
+            );
         }
     }
     if !diff.removed.is_empty() {
         writeln!(out, "    %% removed ({})", diff.removed.len()).ok();
         for e in &diff.removed {
-            new_node(&mut out, &mut id_to_node, &mut next_idx, &e.id, &e.id, "removed");
+            new_node(
+                &mut out,
+                &mut id_to_node,
+                &mut next_idx,
+                &e.id,
+                &e.id,
+                "removed",
+            );
         }
     }
     if !diff.modified.is_empty() {
         writeln!(out, "    %% modified ({})", diff.modified.len()).ok();
         for e in &diff.modified {
-            new_node(&mut out, &mut id_to_node, &mut next_idx, &e.id, &e.id, "modified");
+            new_node(
+                &mut out,
+                &mut id_to_node,
+                &mut next_idx,
+                &e.id,
+                &e.id,
+                "modified",
+            );
         }
     }
     if !diff.renamed.is_empty() {
@@ -348,7 +375,14 @@ pub fn render_mermaid(diff: &BundleDiff, to_entities: &[IndexEntity]) -> String 
         for r in &diff.renamed {
             let label = format!("{} ↪ {}", r.from_id, r.to_id);
             // The post-state id is `to_id`; that's what edges from `to_entities` reference.
-            new_node(&mut out, &mut id_to_node, &mut next_idx, &r.to_id, &label, "renamed");
+            new_node(
+                &mut out,
+                &mut id_to_node,
+                &mut next_idx,
+                &r.to_id,
+                &label,
+                "renamed",
+            );
         }
     }
 
@@ -364,7 +398,11 @@ pub fn render_mermaid(diff: &BundleDiff, to_entities: &[IndexEntity]) -> String 
         for callee_id in &e.edges_out {
             if let Some(dst_node) = id_to_node.get(callee_id) {
                 if edge_count == 0 {
-                    writeln!(out, "    %% blast-radius edges (both endpoints in changeset)").ok();
+                    writeln!(
+                        out,
+                        "    %% blast-radius edges (both endpoints in changeset)"
+                    )
+                    .ok();
                 }
                 writeln!(out, "    {src_node} --> {dst_node}").ok();
                 edge_count += 1;
@@ -494,7 +532,10 @@ mod tests {
             "expected blast-radius header, got:\n{m}"
         );
         let arrow_count = m.matches(" --> ").count();
-        assert_eq!(arrow_count, 1, "expected 1 blast-radius edge, got: {arrow_count}\n{m}");
+        assert_eq!(
+            arrow_count, 1,
+            "expected 1 blast-radius edge, got: {arrow_count}\n{m}"
+        );
     }
 
     #[test]

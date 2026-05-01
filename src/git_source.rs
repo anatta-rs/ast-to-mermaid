@@ -68,10 +68,7 @@ pub fn show_toplevel(start: &Path) -> Result<PathBuf> {
 /// # Errors
 /// Returns `InvalidInput` when `git ls-tree` fails.
 pub fn ls_tree(repo_root: &Path, git_ref: &str) -> Result<Vec<TreeEntry>> {
-    let output = run_git(
-        repo_root,
-        &["ls-tree", "-r", "-z", "--full-tree", git_ref],
-    )?;
+    let output = run_git(repo_root, &["ls-tree", "-r", "-z", "--full-tree", git_ref])?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(AstToMermaidError::InvalidInput(format!(
@@ -153,12 +150,10 @@ mod tests {
         fs::write(&path, content).unwrap();
         run_or_panic(dir, &["add", file_rel]);
         run_or_panic(dir, &["commit", "-q", "-m", "init"]);
-        let blob = String::from_utf8(
-            run_or_panic(dir, &["hash-object", file_rel]).stdout,
-        )
-        .unwrap()
-        .trim()
-        .to_owned();
+        let blob = String::from_utf8(run_or_panic(dir, &["hash-object", file_rel]).stdout)
+            .unwrap()
+            .trim()
+            .to_owned();
         let commit = String::from_utf8(run_or_panic(dir, &["rev-parse", "HEAD"]).stdout)
             .unwrap()
             .trim()
