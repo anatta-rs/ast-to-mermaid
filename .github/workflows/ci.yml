@@ -95,3 +95,46 @@ jobs:
         with:
           files: lcov.info
           fail_ci_if_error: false
+
+  mermaid-validate:
+    name: mermaid syntax (mmdc)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # diff needs HEAD~1, full history is cheapest
+          fetch-depth: 2
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Install mermaid-cli
+        run: npm install -g @mermaid-js/mermaid-cli
+      - name: Build release a2m
+        run: cargo build --release
+      - name: Generate every CLI output and pipe through mmdc
+        # If mmdc exits non-zero on any input, the job fails. The renderer is
+        # the spec; mmdc is the validator. Fix bugs in the renderer (or
+        # `mermaid_id`'s reserved-word list), not in the diagrams.
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/mmd
+          BIN=./target/release/a2m
+
+          $BIN project  ./src                                  --out /tmp/mmd/project.mmd
+          $BIN overview ./src                                  --out /tmp/mmd/overview.mmd
+          $BIN module   ./src --target render/mod.rs           --out /tmp/mmd/module.mmd
+          $BIN function ./src --target analyze                 --out /tmp/mmd/function.mmd
+          $BIN impact   ./src --target analyze                 --out /tmp/mmd/impact.mmd
+          # diff prints to stdout
+          $BIN diff HEAD~1..HEAD --path ./src                  > /tmp/mmd/diff.mmd
+
+          # Render each .mmd to an SVG via mmdc — non-zero exit on parse error.
+          # We don't keep the SVGs; this is a syntax gate, not a build artifact.
+          for f in /tmp/mmd/*.mmd; do
+            echo "::group::validating $f"
+            mmdc -q -i "$f" -o "${f%.mmd}.svg"
+            echo "::endgroup::"
+          done
+          echo "all diagrams parsed cleanly"
