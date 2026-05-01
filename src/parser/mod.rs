@@ -155,7 +155,7 @@ impl CodeParser {
         // ── Module atom ───────────────────────────────────────────────────────
         let module_id = EntityId::new(format!("code:{file_path}"));
         let module_name = module_name(file_path).to_owned();
-        let module_hash = hex_sha256(content);
+        let module_hash = git_blob_sha1(content);
         let module_atom = CodeAtom {
             id: module_id.clone(),
             kind: "module".to_owned(),
@@ -255,7 +255,7 @@ fn extract_item(
     let item_name = extract_name(node, source, ts_kind)?;
 
     let item_text = node.utf8_text(source.as_bytes()).unwrap_or_default();
-    let content_hash = format!("sha256:{}", hex_sha256(item_text.as_bytes()));
+    let content_hash = git_blob_sha1(item_text.as_bytes());
 
     let line_start = u32::try_from(node.start_position().row).unwrap_or(u32::MAX) + 1;
     let line_end = u32::try_from(node.end_position().row).unwrap_or(u32::MAX) + 1;
@@ -573,21 +573,17 @@ fn python_docstring(node: &Node, source: &str) -> String {
 
 // ── Utilities ─────────────────────────────────────────────────────────────────
 
-/// SHA-256 hex digest of `bytes`.
-fn hex_sha256(bytes: &[u8]) -> String {
-    use std::fmt::Write as FmtWrite;
-    use std::num::Wrapping;
-    // Simple deterministic hash — not cryptographic, fast for content IDs.
-    // We use FNV-1a for now since we don't want a sha2 dep in this crate;
-    // the ingester used sha2 but we're decoupled here.
-    let mut hash = Wrapping(0xcbf2_9ce4_8422_2325_u64);
-    for &byte in bytes {
-        hash ^= Wrapping(u64::from(byte));
-        hash *= Wrapping(0x0100_0000_01b3_u64);
-    }
-    let mut out = String::with_capacity(16);
-    write!(out, "{:016x}", hash.0).expect("writing to String");
-    out
+/// Git blob SHA-1 hex digest: `SHA1("blob N\0" + bytes)`.
+///
+/// Matches the identity git itself assigns to file blobs — the same value
+/// you'd get from `git hash-object <path>`. Cache keys produced here align
+/// with `git ls-tree` output.
+#[must_use]
+pub fn git_blob_sha1(bytes: &[u8]) -> String {
+    let mut hasher = sha1_smol::Sha1::new();
+    hasher.update(format!("blob {}\0", bytes.len()).as_bytes());
+    hasher.update(bytes);
+    hasher.digest().to_string()
 }
 
 /// Extract the module name (file stem) from a path.
@@ -657,12 +653,26 @@ mod tests {
     }
 
     #[test]
-    fn hex_sha256_deterministic() {
-        let a = hex_sha256(b"hello");
-        let b = hex_sha256(b"hello");
+    fn git_blob_sha1_deterministic() {
+        let a = git_blob_sha1(b"hello");
+        let b = git_blob_sha1(b"hello");
         assert_eq!(a, b);
-        let c = hex_sha256(b"world");
+        let c = git_blob_sha1(b"world");
         assert_ne!(a, c);
+    }
+
+    #[test]
+    fn git_blob_sha1_matches_git_hash_object() {
+        // `git hash-object` for the empty blob is well-known.
+        assert_eq!(
+            git_blob_sha1(b""),
+            "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391"
+        );
+        // `git hash-object` of "hello\n" ↔ documented value.
+        assert_eq!(
+            git_blob_sha1(b"hello\n"),
+            "ce013625030ba8dba906f756967f9e9ca394464a"
+        );
     }
 
     #[test]

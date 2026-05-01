@@ -306,6 +306,7 @@ fn build_index(entities: &[EntityArtifact], source_root: &str, generated_at: &st
         .collect();
 
     json!({
+        "schema": 2,
         "entities": entity_list,
         "generated_at": generated_at,
         "source_root": source_root,
