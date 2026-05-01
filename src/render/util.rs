@@ -21,10 +21,25 @@ pub fn mermaid_id(name: &str) -> String {
 }
 
 /// Escape a string for safe inclusion in a Mermaid node label (the `[".."]`
-/// part). Replaces `"` with `&quot;` so the label string isn't truncated.
+/// part).
+///
+/// - `"` → `&quot;` so the label string isn't truncated.
+/// - `]` → `&rsqb;` so the bracket notation isn't escaped early. This matters
+///   for synthetic identifiers (proc-macro output, Python decorators, generic
+///   instantiations) that contain `]`.
+/// - newlines → space so multi-line signatures don't break Mermaid parsing.
 #[must_use]
 pub fn escape_label(s: &str) -> String {
-    s.replace('"', "&quot;")
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("&quot;"),
+            ']' => out.push_str("&rsqb;"),
+            '\n' | '\r' => out.push(' '),
+            other => out.push(other),
+        }
+    }
+    out
 }
 
 /// Best-effort crate-root extraction from a file path.

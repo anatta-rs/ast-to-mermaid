@@ -30,6 +30,7 @@ pub use impact::DEFAULT_HOPS;
 
 /// Which view to render.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum Level {
     /// One node per crate, cross-crate `calls` edges.
     Project,

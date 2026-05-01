@@ -1,8 +1,7 @@
-//! Storage implementation — self-contained, no external graph backend.
+//! In-memory storage for parsed code atoms + edges.
 //!
-//! The only backend shipped is the in-memory [`Store`], which is sufficient
-//! for CLI one-shot runs and tests. There is no polystore trait anywhere in
-//! this module.
+//! One backend ships: the [`Store`] in [`memory`]. It is enough for CLI
+//! one-shot runs, in-process library use, and the test suite.
 
 pub mod memory;
 

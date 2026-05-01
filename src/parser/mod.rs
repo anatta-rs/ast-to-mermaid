@@ -1,7 +1,4 @@
-//! Self-contained code parser — tree-sitter Rust + Python → [`CodeAtom`]s.
-//!
-//! No dependency on `ingester-core` or `ingester-code`. The parser lives
-//! entirely in this module.
+//! Code parser — tree-sitter Rust + Python → [`CodeAtom`]s.
 //!
 //! # Identity scheme
 //!
@@ -156,13 +153,15 @@ impl CodeParser {
         let module_id = EntityId::new(format!("code:{file_path}"));
         let module_name = module_name(file_path).to_owned();
         let module_hash = hex_sha256(content);
+        let root = tree.root_node();
+        let module_line_end = u32::try_from(root.end_position().row).unwrap_or(u32::MAX) + 1;
         let module_atom = CodeAtom {
             id: module_id.clone(),
             kind: "module".to_owned(),
             name: module_name,
             file_path: file_path.to_owned(),
             line_start: 1,
-            line_end: u32::try_from(text.lines().count()).unwrap_or(u32::MAX),
+            line_end: module_line_end,
             doc: String::new(),
             signature: String::new(),
             content_hash: module_hash,
@@ -172,7 +171,6 @@ impl CodeParser {
         let mut atom_count = 1;
 
         // ── File-scope use imports (Rust only) ────────────────────────────────
-        let root = tree.root_node();
         let imports: HashMap<String, String> = if self.language == Language::Rust {
             extract_use_imports(root, text)
         } else {
@@ -575,18 +573,15 @@ fn python_docstring(node: &Node, source: &str) -> String {
 
 /// SHA-256 hex digest of `bytes`.
 fn hex_sha256(bytes: &[u8]) -> String {
-    use std::fmt::Write as FmtWrite;
-    use std::num::Wrapping;
-    // Simple deterministic hash — not cryptographic, fast for content IDs.
-    // We use FNV-1a for now since we don't want a sha2 dep in this crate;
-    // the ingester used sha2 but we're decoupled here.
-    let mut hash = Wrapping(0xcbf2_9ce4_8422_2325_u64);
-    for &byte in bytes {
-        hash ^= Wrapping(u64::from(byte));
-        hash *= Wrapping(0x0100_0000_01b3_u64);
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    let digest = hasher.finalize();
+    let mut out = String::with_capacity(64);
+    for byte in digest {
+        use std::fmt::Write as FmtWrite;
+        write!(out, "{byte:02x}").expect("writing to String");
     }
-    let mut out = String::with_capacity(16);
-    write!(out, "{:016x}", hash.0).expect("writing to String");
     out
 }
 

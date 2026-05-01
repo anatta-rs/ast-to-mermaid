@@ -4,6 +4,7 @@ use thiserror::Error;
 
 /// Errors raised by the parser, renderer, resolver, or storage adapters.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum AstToMermaidError {
     /// The requested feature is not yet implemented at this version.
     #[error("not implemented: {0}")]

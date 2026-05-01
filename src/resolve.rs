@@ -1,9 +1,9 @@
 //! Cross-module call resolver.
 //!
-//! `ingester-code` already emits intra-module `calls` edges (function A
-//! calling function B in the SAME file). This module walks the populated
-//! [`Store`] and resolves CROSS-module calls — function A in `mod_a.rs`
-//! calling function B in `mod_b.rs`.
+//! The parser already emits intra-file `calls` edges (function A calling
+//! function B in the same file). This module walks the populated [`Store`]
+//! and resolves cross-module calls — function A in `mod_a.rs` calling
+//! function B in `mod_b.rs`.
 //!
 //! # Algorithm
 //!
@@ -34,6 +34,7 @@ use std::collections::{HashMap, HashSet};
 /// stdlib / iterator / Python builtin methods. Linking them produces
 /// huge call-graph noise without illuminating actual cross-module
 /// dependencies.
+#[doc(hidden)]
 pub const SKIP_CALLS: &[&str] = &[
     // Rust Option/Result
     "unwrap",

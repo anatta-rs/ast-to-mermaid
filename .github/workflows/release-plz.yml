@@ -8,34 +8,43 @@ permissions:
   contents: write
   pull-requests: write
 
-env:
-  CARGO_NET_GIT_FETCH_WITH_CLI: "true"
-
 concurrency:
   group: release-plz-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
-  release-plz:
-    name: release-plz
+  # Phase 1: keep a "chore: release" PR up to date on main, with the
+  # version bump + CHANGELOG entry derived from conventional commits.
+  release-plz-pr:
+    name: Open / update release PR
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
-
-      - uses: webfactory/ssh-agent@v0.9.0
-        with:
-          ssh-private-key: |
-            ${{ secrets.POLYSTORE_DEPLOY_KEY }}
-            ${{ secrets.INGESTER_DEPLOY_KEY }}
-
-      - name: Use SSH for anatta-rs private deps
-        run: git config --global url."git@github.com:anatta-rs/".insteadOf "https://github.com/anatta-rs/"
-
       - uses: dtolnay/rust-toolchain@stable
-
       - uses: MarcoIeni/release-plz-action@v0.5
+        with:
+          command: release-pr
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+  # Phase 2: when the release-PR is merged into main, tag the commit
+  # and publish to crates.io + cut the GitHub Release.
+  release-plz-release:
+    name: Publish to crates.io
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: MarcoIeni/release-plz-action@v0.5
+        with:
+          command: release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
