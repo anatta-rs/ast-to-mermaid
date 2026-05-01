@@ -20,26 +20,31 @@ graph TD
     bin["bin — 1 mod, 2 fn, 1 struct"]
     cache_rs["cache.rs — 1 mod, 5 fn, 5 struct"]
     cli_support_rs["cli_support.rs — 1 mod, 12 fn, 7 struct"]
-    diff_rs["diff.rs — 1 mod, 3 fn, 5 struct"]
+    diff_rs["diff.rs — 1 mod, 4 fn, 7 struct"]
+    error_rs["error.rs — 1 mod, 0 fn, 0 struct"]
     git_source_rs["git_source.rs — 1 mod, 5 fn, 1 struct"]
-    graph_mod["graph — 2 mod, 2 struct"]
+    graph_["graph — 2 mod, 0 fn, 2 struct"]
+    lib_rs["lib.rs — 1 mod, 0 fn, 0 struct"]
+    model_rs["model.rs — 1 mod, 0 fn, 3 struct"]
     parser["parser — 1 mod, 9 fn, 2 struct"]
     pipeline_rs["pipeline.rs — 1 mod, 14 fn, 3 struct"]
     render["render — 8 mod, 14 fn, 2 struct"]
-    resolve_rs["resolve.rs — 1 mod, 4 fn"]
+    resolve_rs["resolve.rs — 1 mod, 4 fn, 0 struct"]
+    artifacts -->|"1 calls"| render
     bin -->|"6 calls"| cli_support_rs
-    cli_support_rs -->|"7 calls"| pipeline_rs
-    cli_support_rs -->|"3 calls"| git_source_rs
     cli_support_rs -->|"2 calls"| artifacts
+    cli_support_rs -->|"1 calls"| cache_rs
     cli_support_rs -->|"2 calls"| diff_rs
-    cli_support_rs -->|"1 call"| cache_rs
+    cli_support_rs -->|"3 calls"| git_source_rs
+    cli_support_rs -->|"7 calls"| pipeline_rs
+    pipeline_rs -->|"1 calls"| artifacts
     pipeline_rs -->|"4 calls"| git_source_rs
     pipeline_rs -->|"2 calls"| parser
-    pipeline_rs -->|"1 call"| render
-    pipeline_rs -->|"1 call"| resolve_rs
-    pipeline_rs -->|"1 call"| artifacts
-    artifacts -->|"1 call"| render
+    pipeline_rs -->|"1 calls"| render
+    pipeline_rs -->|"1 calls"| resolve_rs
 ```
+
+(Note the `graph_` node id: the `graph/` module's name collides with Mermaid's `graph TD` keyword, so `mermaid_id` suffixes it with `_`. Without that escape, the diagram fails to parse — the same kind of reserved-keyword guard that pretty much every codegen tool that emits a target language has to deal with.)
 
 ### Convergence: `a2m impact ./src --target analyze`
 
