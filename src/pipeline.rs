@@ -3,6 +3,7 @@
 //! No external graph backend. No `async` I/O — all store operations are
 //! synchronous in-memory.
 
+use crate::artifacts::{ArtifactSet, emit_artifacts};
 use crate::error::{AstToMermaidError, Result};
 use crate::graph::Store;
 use crate::parser::{CodeParser, Language};
@@ -94,6 +95,65 @@ pub fn analyze(root: &Path, opts: &AnalyzeOptions) -> Result<AnalyzeReport> {
         atoms_indexed,
         edges_resolved,
     })
+}
+
+/// Walk `root`, parse every supported file, resolve cross-module calls,
+/// and produce the full 4-layer artifact bundle (`overview.mmd` +
+/// per-entity `.mmd` / `.meta.json` + `index.json`).
+///
+/// Caller writes the result to disk via
+/// [`crate::artifacts::write_artifacts`]. Splitting compute and write
+/// keeps the function pure-ish for tests and lets downstream code
+/// inspect the [`ArtifactSet`] in memory.
+///
+/// `opts.level` and `opts.target` are ignored — the bundle always
+/// emits every level. `opts.exclude` still applies to the walk.
+///
+/// # Errors
+///
+/// Returns the first error from filesystem walk, parsing, or
+/// resolver. Individual files that fail to parse are propagated.
+pub fn bundle(root: &Path, opts: &AnalyzeOptions) -> Result<(ArtifactSet, AnalyzeReport)> {
+    if !root.exists() {
+        return Err(AstToMermaidError::InvalidInput(format!(
+            "path does not exist: {}",
+            root.display()
+        )));
+    }
+
+    let files = walk_for_languages_with_exclude(root, &opts.exclude)?;
+    let store = Store::new();
+
+    let mut atoms_indexed = 0;
+    let mut files_parsed = 0;
+    for (path, lang) in &files {
+        let bytes = std::fs::read(path)?;
+        let parser = match lang {
+            Language::Rust => CodeParser::rust(),
+            Language::Python => CodeParser::python(),
+        };
+        let display_path = display_path(root, path);
+        let count = parser
+            .parse_into(&bytes, &display_path, &store)
+            .map_err(|e| AstToMermaidError::InvalidInput(format!("parse {display_path}: {e}")))?;
+        atoms_indexed += count;
+        files_parsed += 1;
+    }
+
+    let edges_resolved = resolve_cross_module_calls(&store);
+
+    let source_root = root.to_string_lossy();
+    let artifacts = emit_artifacts(&store, source_root.as_ref());
+
+    let report = AnalyzeReport {
+        // The "rendered" mermaid for a bundle is the project view —
+        // matches what `analyze --level project` would have returned.
+        mermaid: artifacts.overview_mmd.clone(),
+        files_parsed,
+        atoms_indexed,
+        edges_resolved,
+    };
+    Ok((artifacts, report))
 }
 
 /// Walk `root` recursively and return `(path, language)` pairs for every
