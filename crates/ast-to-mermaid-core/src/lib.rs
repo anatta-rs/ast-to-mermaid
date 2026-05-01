@@ -16,6 +16,7 @@
 #![warn(missing_docs)]
 #![deny(unsafe_code)]
 
+pub mod artifacts;
 pub mod cli;
 pub mod error;
 pub mod mcp;

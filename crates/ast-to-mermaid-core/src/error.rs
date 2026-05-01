@@ -16,6 +16,16 @@ pub enum AstToMermaidError {
     /// Invalid CLI arguments or MCP request.
     #[error("invalid input: {0}")]
     InvalidInput(String),
+
+    /// Filesystem I/O failure (read / write / mkdir while building or
+    /// loading an artifact bundle).
+    #[error("io: {0}")]
+    Io(String),
+
+    /// A required artifact file (overview.mmd, index.json, a meta.json
+    /// referenced from .mmd) was not found in the bundle directory.
+    #[error("artifact not found: {0}")]
+    ArtifactNotFound(String),
 }
 
 /// Convenience alias used throughout the crate.
