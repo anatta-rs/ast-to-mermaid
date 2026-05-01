@@ -19,6 +19,7 @@
 pub mod artifacts;
 pub mod cache;
 pub mod cli_support;
+pub mod diff;
 pub mod error;
 pub mod git_source;
 pub mod graph;

@@ -6,9 +6,10 @@
 
 use crate::artifacts::write_artifacts;
 use crate::cache::Cache;
+use crate::diff::{compute_diff, load_bundle_entities, render_mermaid};
 use crate::pipeline::{AnalyzeOptions, analyze, bundle, snapshot_id, walk_for_languages_with_exclude};
 use crate::render::Level;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process;
 
 /// Exit code returned by CLI functions, convertible into [`process::ExitCode`].
@@ -274,6 +275,127 @@ pub fn run_index(flags: &IndexFlags) -> ExitCode {
         report.edges_resolved,
     );
     ExitCode::Success
+}
+
+/// CLI args for the `diff` subcommand.
+#[derive(Debug, Clone, clap::Args)]
+pub struct DiffFlags {
+    /// `<ref-a>..<ref-b>` — set-diff bundle(a) → bundle(b). Mirrors
+    /// `git diff a..b` syntax.
+    pub range: String,
+
+    /// Path inside the repo (subdir hint). Default = current directory.
+    #[arg(long, default_value = ".")]
+    pub path: PathBuf,
+
+    /// Output format.
+    #[arg(long, value_enum, default_value_t = DiffFormat::Mermaid)]
+    pub format: DiffFormat,
+
+    /// Override the cache root (default: `<repo>/.a2m/cache`).
+    #[arg(long, value_name = "DIR")]
+    pub cache_dir: Option<PathBuf>,
+}
+
+/// Output format for `a2m diff`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum DiffFormat {
+    /// Annotated Mermaid graph (human-readable).
+    Mermaid,
+    /// Structured JSON delta (machine-readable).
+    Json,
+}
+
+/// Run the `diff` subcommand: compute the structural diff between two
+/// cached bundles. Auto-runs `index` for any ref that isn't already cached.
+pub fn run_diff(flags: &DiffFlags) -> ExitCode {
+    let Some((ref_a, ref_b)) = flags.range.split_once("..") else {
+        eprintln!("diff: expected `<ref-a>..<ref-b>`, got `{}`", flags.range);
+        return ExitCode::UsageError;
+    };
+    if ref_a.is_empty() || ref_b.is_empty() {
+        eprintln!("diff: both refs must be non-empty in `{}`", flags.range);
+        return ExitCode::UsageError;
+    }
+
+    let cache_root = flags.cache_dir.clone().unwrap_or_else(|| {
+        let toplevel =
+            crate::git_source::show_toplevel(&flags.path).unwrap_or_else(|_| flags.path.clone());
+        Cache::default_root(&toplevel)
+    });
+    let cache = match Cache::open(&cache_root) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("diff: open cache {}: {e}", cache_root.display());
+            return ExitCode::Failure;
+        }
+    };
+
+    let from_sha = match ensure_indexed(&cache, &flags.path, ref_a) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("diff: index {ref_a}: {e}");
+            return ExitCode::Failure;
+        }
+    };
+    let to_sha = match ensure_indexed(&cache, &flags.path, ref_b) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("diff: index {ref_b}: {e}");
+            return ExitCode::Failure;
+        }
+    };
+
+    let from_entities = match load_bundle_entities(&cache.bundle_dir(&from_sha)) {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("diff: {e}");
+            return ExitCode::Failure;
+        }
+    };
+    let to_entities = match load_bundle_entities(&cache.bundle_dir(&to_sha)) {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("diff: {e}");
+            return ExitCode::Failure;
+        }
+    };
+
+    let result = compute_diff(ref_a, ref_b, &from_sha, &to_sha, from_entities, to_entities);
+
+    match flags.format {
+        DiffFormat::Mermaid => print!("{}", render_mermaid(&result)),
+        DiffFormat::Json => match serde_json::to_string_pretty(&result) {
+            Ok(s) => println!("{s}"),
+            Err(e) => {
+                eprintln!("diff: serialize json: {e}");
+                return ExitCode::Failure;
+            }
+        },
+    }
+
+    eprintln!(
+        "diff {ref_a} → {ref_b}: +{} -{} ~{} ↪{}",
+        result.added.len(),
+        result.removed.len(),
+        result.modified.len(),
+        result.renamed.len(),
+    );
+    ExitCode::Success
+}
+
+fn ensure_indexed(cache: &Cache, path: &Path, git_ref: &str) -> Result<String, crate::error::AstToMermaidError> {
+    let sha = snapshot_id(path, Some(git_ref))?;
+    if cache.has_bundle(&sha) {
+        return Ok(sha);
+    }
+    let opts = AnalyzeOptions {
+        git_ref: Some(git_ref.to_owned()),
+        ..AnalyzeOptions::default()
+    };
+    let (artifacts, _report) = bundle(path, &opts)?;
+    write_artifacts(&artifacts, &cache.bundle_dir(&sha))?;
+    Ok(sha)
 }
 
 /// CLI args for the `bundle` subcommand.
