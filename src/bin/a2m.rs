@@ -21,6 +21,7 @@ use ast_to_mermaid::cli_support::{
 };
 use ast_to_mermaid::render::Level;
 use clap::{Parser, Subcommand};
+use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
 #[derive(Parser)]
 #[command(
@@ -29,6 +30,11 @@ use clap::{Parser, Subcommand};
     about = "Tree-sitter-based code-graph builder that emits Mermaid diagrams at five zoom levels"
 )]
 struct Cli {
+    /// Trace verbosity. Honors `RUST_LOG` env var; this flag is a shortcut
+    /// (e.g. `--trace=info` to see parse/resolve phase timings).
+    #[arg(long, value_name = "LEVEL", global = true)]
+    trace: Option<String>,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -60,6 +66,7 @@ enum Command {
 
 fn main() -> std::process::ExitCode {
     let cli = Cli::parse();
+    init_tracing(cli.trace.as_deref());
     let code: ExitCode = match cli.command {
         Command::Project(f) => run_analyze(Level::Project, &f),
         Command::Overview(f) => run_analyze(Level::Overview, &f),
@@ -72,4 +79,18 @@ fn main() -> std::process::ExitCode {
         Command::Diff(f) => run_diff(&f),
     };
     code.into()
+}
+
+/// Initialize the tracing subscriber. Resolves verbosity in this order:
+/// explicit `--trace <level>`, then `RUST_LOG`, then default (warn).
+/// Silently no-ops if a subscriber is already set (e.g. integration tests).
+fn init_tracing(trace_flag: Option<&str>) {
+    let filter = match trace_flag {
+        Some(level) => EnvFilter::new(level),
+        None => EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn")),
+    };
+    let _ = tracing_subscriber::registry()
+        .with(filter)
+        .with(fmt::layer().with_target(false).with_writer(std::io::stderr))
+        .try_init();
 }

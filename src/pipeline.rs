@@ -147,23 +147,8 @@ pub fn analyze(root: &Path, opts: &AnalyzeOptions) -> Result<AnalyzeReport> {
     let inputs = collect_inputs(root, opts)?;
     let store = Store::new();
 
-    let mut atoms_indexed = 0;
-    let mut files_parsed = 0;
-    for input in &inputs {
-        let parser = match input.language {
-            Language::Rust => CodeParser::rust(),
-            Language::Python => CodeParser::python(),
-        };
-        let count = parser
-            .parse_into(&input.content, &input.display_path, &store)
-            .map_err(|e| {
-                AstToMermaidError::InvalidInput(format!("parse {}: {e}", input.display_path))
-            })?;
-        atoms_indexed += count;
-        files_parsed += 1;
-    }
-
-    let edges_resolved = resolve_cross_module_calls(&store);
+    let (files_parsed, atoms_indexed) = parse_phase(&inputs, &store)?;
+    let edges_resolved = resolve_phase(&store, atoms_indexed);
     let mermaid = render(opts.level, &store, opts.target.as_deref())?;
 
     Ok(AnalyzeReport {
@@ -172,6 +157,55 @@ pub fn analyze(root: &Path, opts: &AnalyzeOptions) -> Result<AnalyzeReport> {
         atoms_indexed,
         edges_resolved,
     })
+}
+
+/// Run the parse pass over `inputs`, threading each one into `store`.
+/// Wrapped in a `tracing::info_span!("parse_phase", ...)` so users can see
+/// breakdown via `--trace=info`. Returns `(files_parsed, atoms_indexed)`.
+fn parse_phase(inputs: &[ParseInput], store: &Store) -> Result<(usize, usize)> {
+    let span = tracing::info_span!("parse_phase", files = inputs.len());
+    let _enter = span.enter();
+    let started = std::time::Instant::now();
+
+    let mut atoms_indexed = 0;
+    let mut files_parsed = 0;
+    for input in inputs {
+        let parser = match input.language {
+            Language::Rust => CodeParser::rust(),
+            Language::Python => CodeParser::python(),
+        };
+        let count = parser
+            .parse_into(&input.content, &input.display_path, store)
+            .map_err(|e| {
+                AstToMermaidError::InvalidInput(format!("parse {}: {e}", input.display_path))
+            })?;
+        atoms_indexed += count;
+        files_parsed += 1;
+    }
+
+    let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    tracing::info!(parsed = files_parsed, atoms = atoms_indexed, elapsed_ms, "parse_phase done");
+    Ok((files_parsed, atoms_indexed))
+}
+
+/// Run the cross-module resolver. Wrapped in
+/// `tracing::info_span!("resolve_phase", ...)`. Returns the number of edges
+/// added by the resolver.
+///
+/// **V1.5 decision gate**: the per-call elapsed and atom-count fields are
+/// the data we'll use to decide whether V2 (edge-level cache) is justified
+/// (resolve-phase wall-time as a fraction of the whole pipeline on real
+/// repos — see issue #47).
+fn resolve_phase(store: &Store, atoms: usize) -> usize {
+    let span = tracing::info_span!("resolve_phase", atoms);
+    let _enter = span.enter();
+    let started = std::time::Instant::now();
+
+    let edges_resolved = resolve_cross_module_calls(store);
+
+    let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    tracing::info!(edges = edges_resolved, elapsed_ms, "resolve_phase done");
+    edges_resolved
 }
 
 /// Walk `root`, parse every supported file, resolve cross-module calls,
@@ -201,23 +235,8 @@ pub fn bundle(root: &Path, opts: &AnalyzeOptions) -> Result<(ArtifactSet, Analyz
     let inputs = collect_inputs(root, opts)?;
     let store = Store::new();
 
-    let mut atoms_indexed = 0;
-    let mut files_parsed = 0;
-    for input in &inputs {
-        let parser = match input.language {
-            Language::Rust => CodeParser::rust(),
-            Language::Python => CodeParser::python(),
-        };
-        let count = parser
-            .parse_into(&input.content, &input.display_path, &store)
-            .map_err(|e| {
-                AstToMermaidError::InvalidInput(format!("parse {}: {e}", input.display_path))
-            })?;
-        atoms_indexed += count;
-        files_parsed += 1;
-    }
-
-    let edges_resolved = resolve_cross_module_calls(&store);
+    let (files_parsed, atoms_indexed) = parse_phase(&inputs, &store)?;
+    let edges_resolved = resolve_phase(&store, atoms_indexed);
 
     let source_root = match opts.git_ref.as_deref() {
         Some(ref_name) => format!("{}@{ref_name}", root.display()),
