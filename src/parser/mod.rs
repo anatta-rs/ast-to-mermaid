@@ -17,6 +17,39 @@
 use crate::error::{AstToMermaidError, Result};
 use crate::graph::Store;
 use crate::model::{CodeAtom, Edge, EdgeKind, EntityId};
+use serde::{Deserialize, Serialize};
+
+/// Output of parsing one file: the atoms (module + items) and the
+/// intra-file edges (Contains module→item, intra-file Calls). Cross-module
+/// edges are not in here — they're produced later by the resolver.
+///
+/// This is the unit the content-addressed cache stores keyed by git blob
+/// SHA. Two files with identical content produce identical `ParseUnit`s.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ParseUnit {
+    /// Module atom + per-item atoms.
+    pub atoms: Vec<CodeAtom>,
+    /// Contains edges (module → item) and intra-file Calls edges.
+    pub edges: Vec<Edge>,
+}
+
+impl ParseUnit {
+    /// Apply this unit's atoms and edges to `store`, in order.
+    pub fn apply_to(&self, store: &Store) {
+        for a in &self.atoms {
+            store.add_atom(a.clone());
+        }
+        for e in &self.edges {
+            store.add_edge(e.clone());
+        }
+    }
+
+    /// How many atoms this unit contributed (cache-hit replay metric).
+    #[must_use]
+    pub fn atom_count(&self) -> usize {
+        self.atoms.len()
+    }
+}
 use std::collections::{HashMap, HashSet};
 use tree_sitter::{Node, Parser as TsParser};
 
@@ -127,14 +160,17 @@ impl CodeParser {
         self.language
     }
 
-    /// Parse `content` (UTF-8 source bytes) from `file_path`, ingesting atoms
-    /// and edges directly into `store`.
+    /// Parse `content` (UTF-8 source bytes) from `file_path` into a
+    /// [`ParseUnit`] (atoms + intra-file edges). The output is fully
+    /// determined by `(content, file_path, language)` — same inputs always
+    /// produce byte-identical outputs, which is what makes content-addressed
+    /// caching by git blob SHA correct.
     ///
     /// # Errors
     ///
     /// - `InvalidInput` for non-UTF-8 content.
     /// - `InvalidInput` when tree-sitter fails to parse.
-    pub fn parse_into(&self, content: &[u8], file_path: &str, store: &Store) -> Result<usize> {
+    pub fn parse(&self, content: &[u8], file_path: &str) -> Result<ParseUnit> {
         let text = std::str::from_utf8(content).map_err(|e| {
             AstToMermaidError::InvalidInput(format!("invalid utf-8 in {file_path}: {e}"))
         })?;
@@ -152,11 +188,14 @@ impl CodeParser {
             AstToMermaidError::InvalidInput(format!("tree-sitter parse failed for {file_path}"))
         })?;
 
+        let mut atoms: Vec<CodeAtom> = Vec::new();
+        let mut edges: Vec<Edge> = Vec::new();
+
         // ── Module atom ───────────────────────────────────────────────────────
         let module_id = EntityId::new(format!("code:{file_path}"));
         let module_name = module_name(file_path).to_owned();
         let module_hash = git_blob_sha1(content);
-        let module_atom = CodeAtom {
+        atoms.push(CodeAtom {
             id: module_id.clone(),
             kind: "module".to_owned(),
             name: module_name,
@@ -167,9 +206,7 @@ impl CodeParser {
             signature: String::new(),
             content_hash: module_hash,
             calls: Vec::new(),
-        };
-        store.add_atom(module_atom);
-        let mut atom_count = 1;
+        });
 
         // ── File-scope use imports (Rust only) ────────────────────────────────
         let root = tree.root_node();
@@ -182,7 +219,7 @@ impl CodeParser {
         // ── Item atoms ────────────────────────────────────────────────────────
         let mut cursor = root.walk();
         let mut name_to_id: HashMap<String, EntityId> = HashMap::new();
-        let mut items: Vec<(EntityId, Vec<String>)> = Vec::new(); // (id, calls)
+        let mut items: Vec<(EntityId, Vec<String>)> = Vec::new();
 
         for child in root.children(&mut cursor) {
             let Some((atom, call_names)) =
@@ -194,14 +231,13 @@ impl CodeParser {
             let item_name = atom.name.clone();
             name_to_id.insert(item_name, item_id.clone());
 
-            store.add_edge(Edge::new(
+            edges.push(Edge::new(
                 module_id.clone(),
                 item_id.clone(),
                 EdgeKind::Contains,
             ));
             items.push((item_id.clone(), call_names));
-            store.add_atom(atom);
-            atom_count += 1;
+            atoms.push(atom);
         }
 
         // ── Intra-file call edges ─────────────────────────────────────────────
@@ -215,7 +251,7 @@ impl CodeParser {
                 if let Some(callee_id) = name_to_id.get(&callee_name)
                     && *callee_id != caller_id
                 {
-                    store.add_edge(Edge::new(
+                    edges.push(Edge::new(
                         caller_id.clone(),
                         callee_id.clone(),
                         EdgeKind::Calls,
@@ -224,7 +260,20 @@ impl CodeParser {
             }
         }
 
-        Ok(atom_count)
+        Ok(ParseUnit { atoms, edges })
+    }
+
+    /// Backward-compat wrapper: parse and write the result into `store`.
+    /// Equivalent to `self.parse(...)?.apply_to(store)` then returning the
+    /// atom count. Existing callers don't see a behaviour change.
+    ///
+    /// # Errors
+    /// Forwards errors from [`Self::parse`].
+    pub fn parse_into(&self, content: &[u8], file_path: &str, store: &Store) -> Result<usize> {
+        let unit = self.parse(content, file_path)?;
+        let count = unit.atom_count();
+        unit.apply_to(store);
+        Ok(count)
     }
 }
 

@@ -14,6 +14,8 @@ Tested on macOS, M-series, single-threaded a2m. Numbers are in milliseconds.
 
 ## Results
 
+### Cold-path (no cache)
+
 | Repo | Files | LOC | Atoms | Edges | Parse | Resolve | Total | Resolve % |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
 | polystore | 6 | 772 | 21 | 0 | 1 ms | 0 ms | 1 ms | 0% |
@@ -21,22 +23,54 @@ Tested on macOS, M-series, single-threaded a2m. Numbers are in milliseconds.
 | ingester | 55 | 8 387 | 352 | 32 | 22 ms | 0 ms | 22 ms | 0% |
 | sigil-engine | 92 | 36 496 | 955 | 213 | 114 ms | 1 ms | 115 ms | 0.8% |
 | anatta-crates (workspace) | 143 | 37 288 | 1 068 | 142 | 90 ms | 1 ms | 91 ms | 1.0% |
+| **rust-analyzer** | **1 463** | **570 752** | **15 867** | **5 924** | **1 432 ms** | **102 ms** | **1 534 ms** | **6.6%** |
 
 Median across three cold runs per repo. Variance < 5% on all measurements.
 
+### Cache effectiveness (rust-analyzer)
+
+Two distinct caches now ship — the **bundle-level cache** (`refs/<sha>/`) for whole-bundle reuse on identical refs, and the **atom-level cache** (`blobs/<git_blob_sha>.cbor`) for per-file dedup across branches.
+
+**`a2m index` bundle-level (idempotent on identical ref)**
+
+| Operation | Wall time |
+|---|---:|
+| Cold (full materialization) | **5.05 s** |
+| Hot (cache hit, idempotent) | **0.057 s** |
+| **Speedup** | **88×** |
+
+**`a2m project` atom-level (parse-phase only)**
+
+| Operation | parse_phase | resolve_phase | Total |
+|---|---:|---:|---:|
+| Cold (1464 files, 0 hits) | **1 592 ms** | 98 ms | 1 690 ms |
+| Warm (1464 hits, 0 misses) | **42 ms** | 98 ms | 140 ms |
+| 1 file modified (1463 hits, 1 miss) | **47 ms** | 93 ms | 140 ms |
+| **parse-phase speedup** | **38×** | — | **12×** |
+
+Headline interpretation:
+- **Bundle-level (`a2m index`) is the right knob for CI / batch workflows**: same ref → instant.
+- **Atom-level (`a2m project`/`overview`/`module`/etc.) is the right knob for dev loops**: 95%+ of files unchanged between branches → parse skipped almost entirely.
+- Total speedup is currently 12× on warm runs because resolve still runs (98 ms). When V2 ships an edge-level cache, the warm-path total approaches 100× of cold.
+- Cache size is modest: 11 MB for 1463 blobs on rust-analyzer (~7.5 KB / blob avg).
+
 ## Decision-gate verdict
 
-**V2 (edge-level cache) is NOT justified by this baseline.**
+**V2 (edge-level cache) is still NOT justified at current scale, but the trend is no longer dismissive.**
 
-- Resolve is ≤ 1% of wall time on every tested repo, **30× under the 30% threshold**.
-- The largest repo measured (143 files, 37k LOC, 1k atoms) finishes in 91 ms cold. Adding a Salsa-style invalidation graph would save microseconds at the cost of significant implementation complexity.
-- Parse time dominates — ~0.6 ms/file on average, scaling linearly with file count. Future perf wins should target the parse loop (parallel parsing per #46.7 in the design doc, parser instance caching) before going after resolve.
+- Resolve grew from ≤ 1% (≤ 1k atoms) to **6.6% on rust-analyzer** (15k atoms, 6k edges). Still 4.5× under the 30% threshold, but the curve is real.
+- Linear extrapolation:
+  - rustc-scale (~30k atoms): ~12-15%
+  - 60k+ atoms (large monorepos): could approach 30%
+- For now, V1's full re-resolve is appropriate. **Re-evaluate when a real workload's resolve crosses 15%.**
+- Parse still dominates everywhere (~93% on rust-analyzer). Future perf wins should target parallel parsing first.
 
 ## What this baseline does NOT cover
 
-- **Truly large monorepos** (10k+ files): not tested locally. The author's intuition + Bazel/SCIP prior art suggests resolve becomes super-linear in the number of unresolved cross-module call sites, so 1k → 100k atoms could shift this curve. The threshold could conceivably be hit on rust-analyzer / rustc / chromium-scale codebases.
+- **Truly massive codebases** (rustc / chromium / google-internal-scale, > 100k files). rust-analyzer (~570k LOC) is the largest publicly-cloneable Rust codebase the author has on disk.
 - **Repos with deep `use`-import ambiguity**: the disambiguation logic added in `36f1585` walks candidate sets per call. A pathological case (many same-named functions across modules) would inflate resolve specifically.
 - **Python-heavy codebases**: only Rust crates measured. Python parser may have different cost characteristics.
+- **Bundle write cost on huge repos**: at rust-analyzer size the cold `a2m index` is ~5s, of which only 1.5s is parse+resolve — the remaining 3.5s is writing 15k+ small files. Atomic-rename pattern (#46) doesn't help here; parallel writes (rayon) would.
 
 ## Recommended next checkpoints
 

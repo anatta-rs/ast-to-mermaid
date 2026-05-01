@@ -24,22 +24,23 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{AstToMermaidError, Result};
-use crate::model::CodeAtom;
+use crate::parser::ParseUnit;
 
 /// Magic bytes for `<sha>.cbor` blob files. Detects garbage on read.
 const BLOB_MAGIC: u32 = 0xa2_a2_b1_0b;
 
 /// Schema version embedded in each blob envelope. Bump when the layout
 /// of `BlobEnvelope` changes; mismatched files are treated as cache miss.
-const BLOB_ENVELOPE_VERSION: u32 = 1;
+/// V2 (this) carries `ParseUnit` (atoms + intra-file edges) instead of just atoms.
+const BLOB_ENVELOPE_VERSION: u32 = 2;
 
-/// On-disk envelope wrapping cached atoms. Mismatched magic or version on
-/// read returns `None` from `get_atoms` (treated as cache miss).
+/// On-disk envelope wrapping a cached parse unit. Mismatched magic or
+/// version on read returns `None` from `get_unit` (treated as cache miss).
 #[derive(Serialize, Deserialize)]
 struct BlobEnvelope {
     magic: u32,
     version: u32,
-    atoms: Vec<CodeAtom>,
+    unit: ParseUnit,
 }
 
 /// Cache schema version. Bump when the on-disk layout changes incompatibly.
@@ -132,32 +133,32 @@ impl Cache {
         self.root.join("blobs").join(format!("{blob_sha}.cbor"))
     }
 
-    /// Read cached atoms for a blob, if present and parseable.
+    /// Read cached `ParseUnit` for a blob, if present and parseable.
     ///
     /// Returns `None` on any miss (file absent, deserialize failure, or
     /// magic/version mismatch) — the caller re-parses on miss; corrupt or
     /// stale-format entries don't escalate to errors.
     #[must_use]
-    pub fn get_atoms(&self, blob_sha: &str) -> Option<Vec<CodeAtom>> {
+    pub fn get_unit(&self, blob_sha: &str) -> Option<ParseUnit> {
         let path = self.blob_path(blob_sha);
         let bytes = fs::read(&path).ok()?;
         let env: BlobEnvelope = ciborium::de::from_reader(&bytes[..]).ok()?;
         if env.magic != BLOB_MAGIC || env.version != BLOB_ENVELOPE_VERSION {
             return None;
         }
-        Some(env.atoms)
+        Some(env.unit)
     }
 
-    /// Write atoms for a blob to the cache. Uses write-tmp + atomic rename
-    /// so concurrent runs cannot observe a partially-written file.
+    /// Write a `ParseUnit` for a blob to the cache. Uses write-tmp + atomic
+    /// rename so concurrent runs cannot observe a partially-written file.
     ///
     /// # Errors
     /// CBOR serialization failures or filesystem write errors.
-    pub fn put_atoms(&self, blob_sha: &str, atoms: &[CodeAtom]) -> Result<()> {
+    pub fn put_unit(&self, blob_sha: &str, unit: &ParseUnit) -> Result<()> {
         let env = BlobEnvelope {
             magic: BLOB_MAGIC,
             version: BLOB_ENVELOPE_VERSION,
-            atoms: atoms.to_vec(),
+            unit: unit.clone(),
         };
         let mut buf = Vec::new();
         ciborium::ser::into_writer(&env, &mut buf)
@@ -363,7 +364,7 @@ fn dir_size_recursive(dir: &Path) -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::EntityId;
+    use crate::model::{CodeAtom, EntityId};
     use tempfile::tempdir;
 
     fn dummy_atom(id: &str) -> CodeAtom {
@@ -381,6 +382,13 @@ mod tests {
         }
     }
 
+    fn dummy_unit(id: &str) -> ParseUnit {
+        ParseUnit {
+            atoms: vec![dummy_atom(id)],
+            edges: vec![],
+        }
+    }
+
     #[test]
     fn open_creates_dirs_and_version() {
         let tmp = tempdir().unwrap();
@@ -392,21 +400,21 @@ mod tests {
     }
 
     #[test]
-    fn put_then_get_atoms_roundtrips() {
+    fn put_then_get_unit_roundtrips() {
         let tmp = tempdir().unwrap();
         let cache = Cache::open(tmp.path().join("c")).unwrap();
-        let atoms = vec![dummy_atom("code:foo.rs::function::x")];
-        cache.put_atoms("abc123", &atoms).unwrap();
-        let got = cache.get_atoms("abc123").unwrap();
-        assert_eq!(got.len(), 1);
-        assert_eq!(got[0].id, atoms[0].id);
+        let unit = dummy_unit("code:foo.rs::function::x");
+        cache.put_unit("abc123", &unit).unwrap();
+        let got = cache.get_unit("abc123").unwrap();
+        assert_eq!(got.atoms.len(), 1);
+        assert_eq!(got.atoms[0].id, unit.atoms[0].id);
     }
 
     #[test]
-    fn get_atoms_returns_none_on_miss() {
+    fn get_unit_returns_none_on_miss() {
         let tmp = tempdir().unwrap();
         let cache = Cache::open(tmp.path().join("c")).unwrap();
-        assert!(cache.get_atoms("nonexistent").is_none());
+        assert!(cache.get_unit("nonexistent").is_none());
     }
 
     #[test]
@@ -415,13 +423,13 @@ mod tests {
         let root = tmp.path().join("c");
         {
             let cache = Cache::open(&root).unwrap();
-            cache.put_atoms("abc", &[dummy_atom("code:x")]).unwrap();
-            assert!(cache.get_atoms("abc").is_some());
+            cache.put_unit("abc", &dummy_unit("code:x")).unwrap();
+            assert!(cache.get_unit("abc").is_some());
         }
         // Tamper with version.
         fs::write(root.join("version"), "stale").unwrap();
         let cache = Cache::open(&root).unwrap();
-        assert!(cache.get_atoms("abc").is_none());
+        assert!(cache.get_unit("abc").is_none());
     }
 
     #[test]
@@ -471,7 +479,7 @@ mod tests {
         // Three blobs, each ~ same size; touch in order to set mtime ordering.
         for sha in &["a", "b", "c"] {
             cache
-                .put_atoms(sha, &[dummy_atom(&format!("code:{sha}"))])
+                .put_unit(sha, &dummy_unit(&format!("code:{sha}")))
                 .unwrap();
             // Sleep a hair so mtimes differ on filesystems with coarse mtime.
             std::thread::sleep(std::time::Duration::from_millis(10));
@@ -494,14 +502,14 @@ mod tests {
             .unwrap();
         assert!(report.removed_count >= 1, "removed: {report:?}");
         // The most-recently-written one should still be there.
-        assert!(cache.get_atoms("c").is_some());
+        assert!(cache.get_unit("c").is_some());
     }
 
     #[test]
     fn gc_dry_run_touches_nothing() {
         let tmp = tempdir().unwrap();
         let cache = Cache::open(tmp.path().join("c")).unwrap();
-        cache.put_atoms("x", &[dummy_atom("code:x")]).unwrap();
+        cache.put_unit("x", &dummy_unit("code:x")).unwrap();
         let report = cache
             .gc(&GcOptions {
                 max_size_bytes: Some(0), // would normally evict everything
@@ -512,7 +520,7 @@ mod tests {
         assert!(report.dry_run);
         assert_eq!(report.removed_count, 1);
         // File still on disk.
-        assert!(cache.get_atoms("x").is_some());
+        assert!(cache.get_unit("x").is_some());
     }
 
     #[test]
@@ -534,13 +542,13 @@ mod tests {
     }
 
     #[test]
-    fn put_atoms_uses_atomic_rename() {
-        // Concurrent put_atoms calls on the same blob_sha must not see
+    fn put_unit_uses_atomic_rename() {
+        // Concurrent put_unit calls on the same blob_sha must not see
         // partial content. We can't easily test true concurrency here,
         // but we can confirm the .tmp file doesn't linger.
         let tmp = tempdir().unwrap();
         let cache = Cache::open(tmp.path().join("c")).unwrap();
-        cache.put_atoms("ab", &[dummy_atom("code:y")]).unwrap();
+        cache.put_unit("ab", &dummy_unit("code:y")).unwrap();
         let blobs_dir = cache.root().join("blobs");
         let entries: Vec<_> = fs::read_dir(&blobs_dir)
             .unwrap()
@@ -550,13 +558,13 @@ mod tests {
     }
 
     #[test]
-    fn corrupt_blob_returns_none_from_get_atoms() {
+    fn corrupt_blob_returns_none_from_get_unit() {
         let tmp = tempdir().unwrap();
         let cache = Cache::open(tmp.path().join("c")).unwrap();
         // Hand-write garbage with a valid filename.
         let p = cache.root().join("blobs").join("corrupt.cbor");
         fs::write(&p, b"not even cbor").unwrap();
-        assert!(cache.get_atoms("corrupt").is_none());
+        assert!(cache.get_unit("corrupt").is_none());
     }
 
     #[test]
@@ -567,13 +575,13 @@ mod tests {
         let env = BlobEnvelope {
             magic: BLOB_MAGIC,
             version: 9999,
-            atoms: vec![dummy_atom("code:y")],
+            unit: dummy_unit("code:y"),
         };
         let mut buf = Vec::new();
         ciborium::ser::into_writer(&env, &mut buf).unwrap();
         let p = cache.root().join("blobs").join("vmm.cbor");
         fs::write(&p, buf).unwrap();
-        assert!(cache.get_atoms("vmm").is_none());
+        assert!(cache.get_unit("vmm").is_none());
     }
 
     #[test]

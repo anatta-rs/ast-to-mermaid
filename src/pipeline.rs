@@ -4,6 +4,7 @@
 //! synchronous in-memory.
 
 use crate::artifacts::{ArtifactSet, emit_artifacts};
+use crate::cache::Cache;
 use crate::error::{AstToMermaidError, Result};
 use crate::git_source;
 use crate::graph::Store;
@@ -11,9 +12,10 @@ use crate::parser::{CodeParser, Language, git_blob_sha1};
 use crate::render::{Level, render};
 use crate::resolve::resolve_cross_module_calls;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 /// Options controlling [`analyze`].
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct AnalyzeOptions {
     /// Mermaid view to render.
     pub level: Level,
@@ -29,6 +31,12 @@ pub struct AnalyzeOptions {
     /// `git cat-file` rather than walking the working tree, and ignores
     /// `exclude` (git ls-tree already excludes ignored files).
     pub git_ref: Option<String>,
+    /// Optional cache for atom-level memoization. When set, the parse
+    /// loop checks `<cache>/blobs/<git_blob_sha>.cbor` per file and
+    /// replays cached parse units on hit (skipping tree-sitter entirely
+    /// for unchanged files). On miss, parse output is written back to
+    /// the cache for future runs.
+    pub cache: Option<Arc<Cache>>,
 }
 
 impl Default for AnalyzeOptions {
@@ -38,7 +46,20 @@ impl Default for AnalyzeOptions {
             target: None,
             exclude: Vec::new(),
             git_ref: None,
+            cache: None,
         }
+    }
+}
+
+impl std::fmt::Debug for AnalyzeOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AnalyzeOptions")
+            .field("level", &self.level)
+            .field("target", &self.target)
+            .field("exclude", &self.exclude)
+            .field("git_ref", &self.git_ref)
+            .field("cache", &self.cache.as_ref().map(|c| c.root().display().to_string()))
+            .finish()
     }
 }
 
@@ -51,6 +72,10 @@ struct ParseInput {
     content: Vec<u8>,
     /// Language detected from the file extension.
     language: Language,
+    /// Git blob SHA-1 of the content. In git-ref mode this comes straight
+    /// from `git ls-tree`; in worktree mode we compute it inline. Either
+    /// way it's the cache key for atom-level memoization.
+    blob_sha: String,
 }
 
 /// Collect parse inputs from either the working tree (FS walk) or a git ref
@@ -68,11 +93,13 @@ fn collect_from_worktree(root: &Path, exclude: &[String]) -> Result<Vec<ParseInp
     let mut out = Vec::with_capacity(files.len());
     for (path, language) in files {
         let content = std::fs::read(&path)?;
+        let blob_sha = git_blob_sha1(&content);
         let display_path = display_path(root, &path);
         out.push(ParseInput {
             display_path,
             content,
             language,
+            blob_sha,
         });
     }
     Ok(out)
@@ -104,6 +131,7 @@ fn collect_from_git_ref(root: &Path, git_ref: &str) -> Result<Vec<ParseInput>> {
             display_path: entry.path,
             content,
             language,
+            blob_sha: entry.blob_sha,
         });
     }
     Ok(out)
@@ -147,7 +175,7 @@ pub fn analyze(root: &Path, opts: &AnalyzeOptions) -> Result<AnalyzeReport> {
     let inputs = collect_inputs(root, opts)?;
     let store = Store::new();
 
-    let (files_parsed, atoms_indexed) = parse_phase(&inputs, &store)?;
+    let (files_parsed, atoms_indexed) = parse_phase(&inputs, &store, opts.cache.as_deref())?;
     let edges_resolved = resolve_phase(&store, atoms_indexed);
     let mermaid = render(opts.level, &store, opts.target.as_deref())?;
 
@@ -160,31 +188,73 @@ pub fn analyze(root: &Path, opts: &AnalyzeOptions) -> Result<AnalyzeReport> {
 }
 
 /// Run the parse pass over `inputs`, threading each one into `store`.
-/// Wrapped in a `tracing::info_span!("parse_phase", ...)` so users can see
-/// breakdown via `--trace=info`. Returns `(files_parsed, atoms_indexed)`.
-fn parse_phase(inputs: &[ParseInput], store: &Store) -> Result<(usize, usize)> {
+///
+/// When `cache` is `Some`, each input's `blob_sha` is checked against
+/// `<cache>/blobs/<sha>.cbor` first:
+/// - **Hit**: the cached `ParseUnit` is replayed straight into `store`,
+///   skipping tree-sitter entirely. This is the workflow-level dedup that
+///   makes branch switches cheap (most blobs are unchanged).
+/// - **Miss**: tree-sitter parses, the result is written into `store` AND
+///   persisted to the cache for future runs.
+///
+/// Wrapped in a `tracing::info_span!("parse_phase", …)`; counters
+/// (`hits`, `misses`) are emitted as a `tracing::info!` line on completion
+/// so users can see the cache effectiveness via `--trace=info`.
+fn parse_phase(
+    inputs: &[ParseInput],
+    store: &Store,
+    cache: Option<&Cache>,
+) -> Result<(usize, usize)> {
     let span = tracing::info_span!("parse_phase", files = inputs.len());
     let _enter = span.enter();
     let started = std::time::Instant::now();
 
     let mut atoms_indexed = 0;
     let mut files_parsed = 0;
+    let mut hits = 0usize;
+    let mut misses = 0usize;
+
     for input in inputs {
+        if let Some(c) = cache
+            && let Some(unit) = c.get_unit(&input.blob_sha)
+        {
+            // Cache hit: replay the unit and skip parsing.
+            atoms_indexed += unit.atom_count();
+            unit.apply_to(store);
+            hits += 1;
+            files_parsed += 1;
+            continue;
+        }
+
         let parser = match input.language {
             Language::Rust => CodeParser::rust(),
             Language::Python => CodeParser::python(),
         };
-        let count = parser
-            .parse_into(&input.content, &input.display_path, store)
-            .map_err(|e| {
-                AstToMermaidError::InvalidInput(format!("parse {}: {e}", input.display_path))
-            })?;
-        atoms_indexed += count;
+        let unit = parser.parse(&input.content, &input.display_path).map_err(|e| {
+            AstToMermaidError::InvalidInput(format!("parse {}: {e}", input.display_path))
+        })?;
+        atoms_indexed += unit.atom_count();
+        unit.apply_to(store);
+        if let Some(c) = cache {
+            // Cache write failures don't fail the pipeline — the parse is
+            // valid, only the cache is unreachable. Log and continue.
+            if let Err(e) = c.put_unit(&input.blob_sha, &unit) {
+                tracing::warn!(blob_sha = %input.blob_sha, "cache.put_unit failed: {e}");
+            }
+        }
+        misses += 1;
         files_parsed += 1;
     }
 
     let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
-    tracing::info!(parsed = files_parsed, atoms = atoms_indexed, elapsed_ms, "parse_phase done");
+    tracing::info!(
+        parsed = files_parsed,
+        atoms = atoms_indexed,
+        hits,
+        misses,
+        elapsed_ms,
+        "parse_phase done",
+    );
     Ok((files_parsed, atoms_indexed))
 }
 
@@ -235,7 +305,7 @@ pub fn bundle(root: &Path, opts: &AnalyzeOptions) -> Result<(ArtifactSet, Analyz
     let inputs = collect_inputs(root, opts)?;
     let store = Store::new();
 
-    let (files_parsed, atoms_indexed) = parse_phase(&inputs, &store)?;
+    let (files_parsed, atoms_indexed) = parse_phase(&inputs, &store, opts.cache.as_deref())?;
     let edges_resolved = resolve_phase(&store, atoms_indexed);
 
     let source_root = match opts.git_ref.as_deref() {
@@ -495,6 +565,7 @@ mod tests {
                 target: None,
                 exclude: Vec::new(),
                 git_ref: None,
+                cache: None,
             },
         )
         .expect("analyze");

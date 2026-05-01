@@ -11,7 +11,18 @@ use crate::pipeline::{AnalyzeOptions, analyze, bundle, snapshot_id, walk_for_lan
 use crate::render::Level;
 use std::path::{Path, PathBuf};
 use std::process;
+use std::sync::Arc;
 use std::time::Duration;
+
+/// Open the default cache (`<git-toplevel>/.a2m/cache`) for transparent
+/// atom-level caching on the analyze/bundle subcommands. Returns `None` if
+/// not in a git repo or if the cache can't be opened — both are non-fatal,
+/// the caller falls back to running without atom caching.
+fn open_default_cache(start: &Path) -> Option<Arc<Cache>> {
+    let toplevel = crate::git_source::show_toplevel(start).ok()?;
+    let root = Cache::default_root(&toplevel);
+    Cache::open(&root).ok().map(Arc::new)
+}
 
 /// Exit code returned by CLI functions, convertible into [`process::ExitCode`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -85,11 +96,17 @@ pub fn run_analyze(level: Level, flags: &AnalyzeFlags) -> ExitCode {
         .map(str::to_owned)
         .collect();
 
+    // Wire the cache transparently for analyze-flavoured subcommands when we
+    // can find a git toplevel. Failures (not in a git repo, can't open cache)
+    // are non-fatal — fall back to no caching.
+    let cache = open_default_cache(&flags.path);
+
     let opts = AnalyzeOptions {
         level,
         target: flags.target.clone(),
         exclude,
         git_ref: flags.r#ref.clone(),
+        cache,
     };
 
     let report = match analyze(&flags.path, &opts) {
@@ -287,8 +304,12 @@ pub fn run_index(flags: &IndexFlags) -> ExitCode {
         return ExitCode::Success;
     }
 
+    // The parse loop also gets the cache so atom-level dedup applies even
+    // during a fresh `index` (cross-ref blob reuse). Cache::open errors are
+    // non-fatal; skip atom caching in that case.
     let opts = AnalyzeOptions {
         git_ref: flags.r#ref.clone(),
+        cache: Cache::open(&cache_root).ok().map(Arc::new),
         ..AnalyzeOptions::default()
     };
     let (artifacts, report) = match bundle(&flags.path, &opts) {
@@ -437,6 +458,7 @@ fn ensure_indexed(
     }
     let opts = AnalyzeOptions {
         git_ref: Some(git_ref.to_owned()),
+        cache: Some(Arc::new(Cache::open(cache.root())?)),
         ..AnalyzeOptions::default()
     };
     let (artifacts, _report) = bundle(path, &opts)?;
@@ -626,9 +648,12 @@ pub fn run_bundle(flags: &BundleFlags) -> ExitCode {
         .map(str::to_owned)
         .collect();
 
+    let cache = open_default_cache(&flags.path);
+
     let opts = AnalyzeOptions {
         exclude,
         git_ref: flags.r#ref.clone(),
+        cache,
         ..AnalyzeOptions::default()
     };
 
