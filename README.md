@@ -6,60 +6,9 @@ Self-contained Rust crate. **No database, no graph backend, no async runtime, no
 
 A content-addressed cache keyed on git blob SHA-1 makes branch switches cheap: 95%+ of files unchanged → parse skipped, **38× warm-path speedup** on rust-analyzer (1500 files).
 
-## Architecture at a glance
-
-Hand-curated layered view of the crate — what each module is responsible for and how the layers depend on each other. (The diagrams below this one are real CLI output; this one is a manual pitch.)
-
-```mermaid
-graph TD
-    subgraph UI ["1. Interface & orchestration"]
-        bin["bin (CLI entry)"]
-        cli_support["cli_support (per-subcommand glue)"]
-    end
-
-    subgraph Core ["2. Pipeline & processing"]
-        pipeline["pipeline (workflow)"]
-        parser["parser (tree-sitter → ParseUnit)"]
-        resolve["resolve (cross-module Calls)"]
-        diff["diff (BundleDiff)"]
-    end
-
-    subgraph Infra ["3. Infrastructure & I/O"]
-        git_source["git_source (rev-parse / ls-tree / cat-file)"]
-        cache["cache (.a2m/cache/ blobs + refs)"]
-        render["render (Store → Mermaid string)"]
-        artifacts["artifacts (ArtifactSet → on-disk bundle)"]
-    end
-
-    subgraph Data ["4. Model & types"]
-        model["model (CodeAtom, Edge, EntityId, …)"]
-        error["error (AstToMermaidError, Result)"]
-    end
-
-    bin --> cli_support
-    cli_support --> pipeline
-    cli_support --> diff
-    cli_support --> cache
-    cli_support --> artifacts
-
-    pipeline --> git_source
-    pipeline --> cache
-    pipeline --> parser
-    pipeline --> resolve
-    pipeline --> render
-
-    diff --> render
-
-    Core -.-> Data
-    Infra -.-> Data
-    UI -.-> Data
-```
-
-Reading top-to-bottom: the CLI dispatches to per-verb glue, which drives a workflow that pulls source through git or the FS, runs tree-sitter, resolves cross-module calls, and renders Mermaid. The cache sits in Infra because it's pure persistence — the pipeline reads/writes it but doesn't depend on its internals. `model` and `error` are dependency-free leaves used everywhere.
-
 ## See it on real code
 
-Every diagram in this section is real CLI output from this crate on its own `src/`. Long entity ids (which the CLI emits as `code_src_some_module_rs__function__foo`) are shortened to the trailing segment in some labels for visual breathing room — the structure, edges, and counts are unmodified.
+Every diagram below is real CLI output from this crate on its own `src/`. Long entity ids (which the CLI emits as `code_src_some_module_rs__function__foo`) are shortened to the trailing segment in some labels for visual breathing room — the structure, edges, and counts are unmodified.
 
 ### Bird's-eye: `a2m project ./src`
 
