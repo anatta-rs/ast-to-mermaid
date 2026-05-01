@@ -1,15 +1,24 @@
 # release-plz configuration
 # Docs: https://release-plz.dev/docs/config
+#
+# Requires the `CARGO_REGISTRY_TOKEN` repository secret to publish to
+# crates.io. The action runs in two phases via `.github/workflows/release-plz.yml`:
+#   1. release-pr — opens / updates a "chore: release" PR with the version
+#      bump + CHANGELOG.md update.
+#   2. release    — when that PR is merged into main, tags the commit and
+#      publishes the crate to crates.io.
 
 [workspace]
-publish = false
+# Publish ast-to-mermaid to crates.io when a release-PR is merged.
+publish = true
+# Cut a GitHub Release alongside the crates.io publish.
 git_release_enable = true
 git_release_type = "auto"
+# Keep CHANGELOG.md up to date in the release PR.
 changelog_update = true
-semver_check = false
-
-# All three crates move in lockstep — release-plz creates one Release PR.
-dependencies_update = true
+# Keep semver-checks on — release-plz uses cargo-semver-checks to flag
+# accidental breaking changes in the public API.
+semver_check = true
 
 [changelog]
 header = """# Changelog
@@ -47,4 +56,3 @@ commit_parsers = [
   { message = "^ci", skip = true },
   { body = ".*BREAKING CHANGE.*", group = "Breaking changes" },
 ]
-filter_commits = false

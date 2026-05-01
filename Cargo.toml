@@ -3,13 +3,22 @@ name = "ast-to-mermaid"
 description = "Git-aware tree-sitter-based code-graph builder. Emits Mermaid diagrams at five zoom levels, materializes per-commit bundles into a content-addressed cache, and computes coloured structural diffs between any two refs. Single binary `a2m` with ten subcommands."
 version = "0.2.0"
 edition = "2024"
+rust-version = "1.88"
 authors = ["Anatta <noreply@anatta.dev>"]
 license = "Apache-2.0"
 repository = "https://github.com/anatta-rs/ast-to-mermaid"
 homepage = "https://github.com/anatta-rs/ast-to-mermaid"
+documentation = "https://docs.rs/ast-to-mermaid"
 readme = "README.md"
 keywords = ["mermaid", "tree-sitter", "ast", "code-graph", "visualization"]
 categories = ["command-line-utilities", "visualization", "development-tools"]
+exclude = [
+    ".githooks/*",
+    ".github/*",
+    "Makefile",
+    "release-plz.toml",
+    "rust-toolchain.toml",
+]
 
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }
@@ -17,6 +26,8 @@ serde_json = "1.0"
 thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+sha2 = "0.10"
+time = { version = "0.3", features = ["formatting"] }
 tree-sitter = "0.25"
 tree-sitter-rust = "0.24"
 tree-sitter-python = "0.25"

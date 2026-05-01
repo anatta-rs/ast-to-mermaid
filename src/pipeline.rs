@@ -10,12 +10,13 @@ use crate::git_source;
 use crate::graph::Store;
 use crate::parser::{CodeParser, Language, git_blob_sha1};
 use crate::render::{Level, render};
-use crate::resolve::resolve_cross_module_calls;
+use crate::resolve::{resolve_cross_module_calls, resolve_implements_edges};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 /// Options controlling [`analyze`].
 #[derive(Clone)]
+#[non_exhaustive]
 pub struct AnalyzeOptions {
     /// Mermaid view to render.
     pub level: Level,
@@ -31,11 +32,10 @@ pub struct AnalyzeOptions {
     /// `git cat-file` rather than walking the working tree, and ignores
     /// `exclude` (git ls-tree already excludes ignored files).
     pub git_ref: Option<String>,
-    /// Optional cache for atom-level memoization. When set, the parse
-    /// loop checks `<cache>/blobs/<git_blob_sha>.cbor` per file and
-    /// replays cached parse units on hit (skipping tree-sitter entirely
-    /// for unchanged files). On miss, parse output is written back to
-    /// the cache for future runs.
+    /// Optional content-addressed cache for atom-level memoization. When set,
+    /// the parse loop checks `<cache>/blobs/<git_blob_sha>.cbor` per file and
+    /// replays cached `ParseUnit`s on hit (skipping tree-sitter entirely).
+    /// On miss, the fresh `ParseUnit` is written back to the cache.
     pub cache: Option<Arc<Cache>>,
 }
 
@@ -58,7 +58,10 @@ impl std::fmt::Debug for AnalyzeOptions {
             .field("target", &self.target)
             .field("exclude", &self.exclude)
             .field("git_ref", &self.git_ref)
-            .field("cache", &self.cache.as_ref().map(|c| c.root().display().to_string()))
+            .field(
+                "cache",
+                &self.cache.as_ref().map(|c| c.root().display().to_string()),
+            )
             .finish()
     }
 }
@@ -72,9 +75,8 @@ struct ParseInput {
     content: Vec<u8>,
     /// Language detected from the file extension.
     language: Language,
-    /// Git blob SHA-1 of the content. In git-ref mode this comes straight
-    /// from `git ls-tree`; in worktree mode we compute it inline. Either
-    /// way it's the cache key for atom-level memoization.
+    /// Git blob SHA-1 of the content. From `git ls-tree` in `--ref` mode,
+    /// computed inline in worktree mode. Used as the atom-cache key.
     blob_sha: String,
 }
 
@@ -139,6 +141,7 @@ fn collect_from_git_ref(root: &Path, git_ref: &str) -> Result<Vec<ParseInput>> {
 
 /// What [`analyze`] returns.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct AnalyzeReport {
     /// Rendered Mermaid source.
     pub mermaid: String,
@@ -189,17 +192,16 @@ pub fn analyze(root: &Path, opts: &AnalyzeOptions) -> Result<AnalyzeReport> {
 
 /// Run the parse pass over `inputs`, threading each one into `store`.
 ///
-/// When `cache` is `Some`, each input's `blob_sha` is checked against
-/// `<cache>/blobs/<sha>.cbor` first:
-/// - **Hit**: the cached `ParseUnit` is replayed straight into `store`,
-///   skipping tree-sitter entirely. This is the workflow-level dedup that
-///   makes branch switches cheap (most blobs are unchanged).
-/// - **Miss**: tree-sitter parses, the result is written into `store` AND
+/// When `cache` is `Some`, each input's `blob_sha` is checked against the
+/// atom cache first:
+/// - **Hit**: cached `ParseUnit` is replayed straight into `store`,
+///   skipping tree-sitter entirely. This is the cross-branch dedup that
+///   makes branch switches cheap.
+/// - **Miss**: tree-sitter parses, the result is applied to `store` AND
 ///   persisted to the cache for future runs.
 ///
-/// Wrapped in a `tracing::info_span!("parse_phase", …)`; counters
-/// (`hits`, `misses`) are emitted as a `tracing::info!` line on completion
-/// so users can see the cache effectiveness via `--trace=info`.
+/// Cache hit/miss counts are emitted on completion as a `tracing::info!`
+/// line so users see the cache effectiveness via `--trace=info`.
 fn parse_phase(
     inputs: &[ParseInput],
     store: &Store,
@@ -218,7 +220,6 @@ fn parse_phase(
         if let Some(c) = cache
             && let Some(unit) = c.get_unit(&input.blob_sha)
         {
-            // Cache hit: replay the unit and skip parsing.
             atoms_indexed += unit.atom_count();
             unit.apply_to(store);
             hits += 1;
@@ -230,17 +231,17 @@ fn parse_phase(
             Language::Rust => CodeParser::rust(),
             Language::Python => CodeParser::python(),
         };
-        let unit = parser.parse(&input.content, &input.display_path).map_err(|e| {
-            AstToMermaidError::InvalidInput(format!("parse {}: {e}", input.display_path))
-        })?;
+        let unit = parser
+            .parse(&input.content, &input.display_path)
+            .map_err(|e| {
+                AstToMermaidError::InvalidInput(format!("parse {}: {e}", input.display_path))
+            })?;
         atoms_indexed += unit.atom_count();
         unit.apply_to(store);
-        if let Some(c) = cache {
-            // Cache write failures don't fail the pipeline — the parse is
-            // valid, only the cache is unreachable. Log and continue.
-            if let Err(e) = c.put_unit(&input.blob_sha, &unit) {
-                tracing::warn!(blob_sha = %input.blob_sha, "cache.put_unit failed: {e}");
-            }
+        if let Some(c) = cache
+            && let Err(e) = c.put_unit(&input.blob_sha, &unit)
+        {
+            tracing::warn!(blob_sha = %input.blob_sha, "cache.put_unit failed: {e}");
         }
         misses += 1;
         files_parsed += 1;
@@ -258,20 +259,19 @@ fn parse_phase(
     Ok((files_parsed, atoms_indexed))
 }
 
-/// Run the cross-module resolver. Wrapped in
-/// `tracing::info_span!("resolve_phase", ...)`. Returns the number of edges
-/// added by the resolver.
+/// Run the cross-module resolver (Calls + Implements edges). Wrapped in
+/// `tracing::info_span!("resolve_phase", ...)`. Returns the total edge count.
 ///
 /// **V1.5 decision gate**: the per-call elapsed and atom-count fields are
 /// the data we'll use to decide whether V2 (edge-level cache) is justified
 /// (resolve-phase wall-time as a fraction of the whole pipeline on real
-/// repos — see issue #47).
+/// repos — see `docs/perf/2026-05-01-resolve-cost-baseline.md`).
 fn resolve_phase(store: &Store, atoms: usize) -> usize {
     let span = tracing::info_span!("resolve_phase", atoms);
     let _enter = span.enter();
     let started = std::time::Instant::now();
 
-    let edges_resolved = resolve_cross_module_calls(store);
+    let edges_resolved = resolve_cross_module_calls(store) + resolve_implements_edges(store);
 
     let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
     tracing::info!(edges = edges_resolved, elapsed_ms, "resolve_phase done");
@@ -337,9 +337,8 @@ pub fn walk_for_languages(root: &Path) -> Result<Vec<(PathBuf, Language)>> {
 }
 
 /// Same as [`walk_for_languages`] but skips any directory whose basename
-/// matches an entry in `extra_exclude`. The built-in skip set
-/// (`target`, `node_modules`, `.git`, any dotfile dir) is always applied
-/// on top.
+/// matches an entry in `extra_exclude`. See [`DEFAULT_EXCLUDED_DIRS`] for
+/// the built-in skip set; it is always applied on top.
 ///
 /// # Errors
 ///
@@ -350,38 +349,81 @@ pub fn walk_for_languages_with_exclude<S: AsRef<str>>(
 ) -> Result<Vec<(PathBuf, Language)>> {
     let extra: Vec<&str> = extra_exclude.iter().map(AsRef::as_ref).collect();
     let mut out = Vec::new();
-    walk_into(root, &extra, &mut out)?;
+    let mut visited: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+    walk_into(root, &extra, &mut out, &mut visited)?;
     out.sort_by(|a, b| a.0.cmp(&b.0));
     Ok(out)
 }
 
+/// Directory basenames the walker skips by default — output dirs and
+/// virtual-env / cache dirs that almost never contain source you want
+/// indexed.
+///
+/// Rust: `target`. JavaScript: `node_modules`. Python: `__pycache__`,
+/// `venv`. Generic: `.git`, `dist`, `build`, `vendor`. Any directory whose
+/// name starts with `.` is also skipped (covers `.venv`, `.tox`,
+/// `.pytest_cache`, `.mypy_cache`, `.ruff_cache`, `.idea`, `.vscode`, etc.).
+pub const DEFAULT_EXCLUDED_DIRS: &[&str] = &[
+    "target",
+    "node_modules",
+    ".git",
+    "__pycache__",
+    "venv",
+    "dist",
+    "build",
+    "vendor",
+];
+
 fn is_excluded(name: &str, extra_exclude: &[&str]) -> bool {
-    matches!(name, "target" | "node_modules" | ".git")
-        || name.starts_with('.')
-        || extra_exclude.contains(&name)
+    DEFAULT_EXCLUDED_DIRS.contains(&name) || name.starts_with('.') || extra_exclude.contains(&name)
 }
 
-fn walk_into(dir: &Path, extra_exclude: &[&str], out: &mut Vec<(PathBuf, Language)>) -> Result<()> {
-    if dir.is_file() {
+fn walk_into(
+    dir: &Path,
+    extra_exclude: &[&str],
+    out: &mut Vec<(PathBuf, Language)>,
+    visited: &mut std::collections::HashSet<PathBuf>,
+) -> Result<()> {
+    // Use symlink_metadata so we don't follow links — symlink loops would
+    // otherwise blow the stack on real-world repos (vendored crates,
+    // recursive node_modules links, etc.).
+    let Ok(meta) = std::fs::symlink_metadata(dir) else {
+        return Ok(());
+    };
+    if meta.file_type().is_symlink() {
+        return Ok(());
+    }
+    if meta.is_file() {
         if let Some(lang) = language_for(dir) {
             out.push((dir.to_path_buf(), lang));
         }
         return Ok(());
     }
-    if !dir.is_dir() {
+    if !meta.is_dir() {
+        return Ok(());
+    }
+    // Belt-and-braces: even with the symlink check above, a hardlink cycle
+    // (rare but possible) would still recurse. Track canonical paths.
+    if let Ok(canon) = dir.canonicalize()
+        && !visited.insert(canon)
+    {
         return Ok(());
     }
     let entries = std::fs::read_dir(dir)?;
     for entry in entries {
         let entry = entry?;
         let path = entry.path();
+        let file_type = entry.file_type()?;
+        if file_type.is_symlink() {
+            continue;
+        }
         let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-        if path.is_dir() {
+        if file_type.is_dir() {
             if is_excluded(name, extra_exclude) {
                 continue;
             }
-            walk_into(&path, extra_exclude, out)?;
-        } else if path.is_file()
+            walk_into(&path, extra_exclude, out, visited)?;
+        } else if file_type.is_file()
             && let Some(lang) = language_for(&path)
         {
             out.push((path, lang));
@@ -621,14 +663,16 @@ mod tests {
         let tmp = tempdir().expect("tmp");
         let root = tmp.path();
         write(root, "src/a.rs", "fn a() {}");
-        write(root, "vendor/junk.rs", "fn dont_parse() {}");
-        write(root, "workspaces/inner.rs", "fn dont_parse() {}");
+        // Use names that are NOT in DEFAULT_EXCLUDED_DIRS so the default
+        // walk picks them up; the explicit exclude must then drop them.
+        write(root, "workspaces/junk.rs", "fn dont_parse() {}");
+        write(root, "examples/inner.rs", "fn dont_parse() {}");
 
         let default = walk_for_languages(root).expect("walk");
         assert_eq!(default.len(), 3, "default should walk all 3");
 
         let filtered =
-            walk_for_languages_with_exclude(root, &["vendor", "workspaces"]).expect("walk");
+            walk_for_languages_with_exclude(root, &["workspaces", "examples"]).expect("walk");
         assert_eq!(filtered.len(), 1);
         assert!(filtered[0].0.to_string_lossy().ends_with("a.rs"));
     }
@@ -647,11 +691,49 @@ mod tests {
     }
 
     #[test]
+    fn walk_skips_default_excluded_dirs_for_each_ecosystem() {
+        let tmp = tempdir().expect("tmp");
+        let root = tmp.path();
+        // One real source file…
+        write(root, "src/main.rs", "fn main() {}");
+        // …plus a sample of every default-excluded dir.
+        for dir in [
+            "target",
+            "node_modules",
+            "__pycache__",
+            "venv",
+            "dist",
+            "build",
+            "vendor",
+        ] {
+            write(root, &format!("{dir}/junk.rs"), "fn nope() {}");
+        }
+        let files = walk_for_languages(root).expect("walk");
+        assert_eq!(files.len(), 1, "only src/main.rs should survive");
+        assert!(files[0].0.to_string_lossy().ends_with("main.rs"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn walk_does_not_follow_symlinks_or_recurse_loops() {
+        // A self-referential symlink inside the tree must not crash or hang.
+        let tmp = tempdir().expect("tmp");
+        let root = tmp.path();
+        write(root, "src/a.rs", "fn a() {}");
+        // Create `src/loop` → `src` (relative). Walking through this would
+        // infinite-loop without the symlink guard.
+        std::os::unix::fs::symlink(".", root.join("src/loop")).expect("symlink");
+        let files = walk_for_languages(root).expect("walk");
+        assert_eq!(files.len(), 1);
+        assert!(files[0].0.to_string_lossy().ends_with("a.rs"));
+    }
+
+    #[test]
     fn analyze_with_exclude_skips_directory() {
         let tmp = tempdir().expect("tmp");
         let root = tmp.path();
         write(root, "src/main.rs", "pub fn main() {}");
-        write(root, "vendor/lib.rs", "pub fn vendored() {}");
+        write(root, "examples/lib.rs", "pub fn example() {}");
 
         let report = analyze(root, &AnalyzeOptions::default()).expect("analyze");
         assert_eq!(report.files_parsed, 2);
@@ -659,7 +741,7 @@ mod tests {
         let report = analyze(
             root,
             &AnalyzeOptions {
-                exclude: vec!["vendor".to_owned()],
+                exclude: vec!["examples".to_owned()],
                 ..AnalyzeOptions::default()
             },
         )

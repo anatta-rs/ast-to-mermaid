@@ -1,25 +1,20 @@
 //! Mermaid rendering primitives shared by every level.
 
-/// Mermaid keywords that the parser refuses as node ids — using any of these
-/// as a bare identifier (e.g. `graph["label"]`) raises a parse error because
-/// the keyword is consumed by surrounding grammar (diagram-type declarations,
-/// subgraph blocks, classDef/style statements, etc.).
-///
-/// Sourced from the mermaid-js flowchart grammar
-/// (`packages/mermaid/src/diagrams/flowchart/parser/flow.jison`). When in
-/// doubt, prefer to suffix — false positives only cost a `_`, false negatives
-/// produce a broken diagram.
+/// Words Mermaid's flowchart grammar treats as reserved tokens; using one
+/// as a node identifier triggers a parse error like
+/// `Expecting ..., got 'GRAPH'`. We escape any clash by prefixing with
+/// `n_` so renaming is mechanical and reversible by inspection.
 const MERMAID_RESERVED: &[&str] = &[
     "graph",
-    "flowchart",
     "subgraph",
     "end",
+    "flowchart",
     "direction",
-    "classDef",
-    "class",
-    "style",
-    "linkStyle",
     "click",
+    "class",
+    "classDef",
+    "linkStyle",
+    "style",
     "default",
     "interpolate",
     "accTitle",
@@ -30,8 +25,9 @@ const MERMAID_RESERVED: &[&str] = &[
 ///
 /// Mermaid IDs must be alphanumeric or `_`. Any other character is replaced
 /// with `_`. Empty input becomes a single `_` to keep IDs syntactically valid.
-/// Reserved Mermaid keywords get a trailing `_` to avoid grammar collisions
-/// (e.g. a module named `graph` becomes `graph_`).
+/// Reserved Mermaid keywords (e.g. `graph`, `subgraph`, `end`) are prefixed
+/// with `n_` because using them as bare IDs makes the parser interpret the
+/// node line as a new diagram-type declaration.
 #[must_use]
 pub fn mermaid_id(name: &str) -> String {
     if name.is_empty() {
@@ -48,16 +44,32 @@ pub fn mermaid_id(name: &str) -> String {
         })
         .collect();
     if MERMAID_RESERVED.contains(&sanitized.as_str()) {
-        return format!("{sanitized}_");
+        format!("n_{sanitized}")
+    } else {
+        sanitized
     }
-    sanitized
 }
 
 /// Escape a string for safe inclusion in a Mermaid node label (the `[".."]`
-/// part). Replaces `"` with `&quot;` so the label string isn't truncated.
+/// part).
+///
+/// - `"` → `&quot;` so the label string isn't truncated.
+/// - `]` → `&rsqb;` so the bracket notation isn't escaped early. This matters
+///   for synthetic identifiers (proc-macro output, Python decorators, generic
+///   instantiations) that contain `]`.
+/// - newlines → space so multi-line signatures don't break Mermaid parsing.
 #[must_use]
 pub fn escape_label(s: &str) -> String {
-    s.replace('"', "&quot;")
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("&quot;"),
+            ']' => out.push_str("&rsqb;"),
+            '\n' | '\r' => out.push(' '),
+            other => out.push(other),
+        }
+    }
+    out
 }
 
 /// Best-effort crate-root extraction from a file path.
@@ -102,37 +114,29 @@ mod tests {
     }
 
     #[test]
-    fn mermaid_id_suffixes_reserved_keywords() {
-        // The bug that motivated the reserved-keyword guard: a module called
-        // `graph` rendered as `graph["graph — 2 mod, 0 fn, 2 struct"]` clashed
-        // with the `graph TD` declaration on line 1 and crashed the parser.
-        assert_eq!(mermaid_id("graph"), "graph_");
-        assert_eq!(mermaid_id("flowchart"), "flowchart_");
-        assert_eq!(mermaid_id("subgraph"), "subgraph_");
-        assert_eq!(mermaid_id("end"), "end_");
-        assert_eq!(mermaid_id("classDef"), "classDef_");
-        assert_eq!(mermaid_id("style"), "style_");
-        assert_eq!(mermaid_id("click"), "click_");
+    fn mermaid_id_escapes_reserved_keywords() {
+        // `graph` as an ID makes the Mermaid parser see a nested diagram
+        // declaration. Prefix with `n_` to keep it syntactically a node.
+        assert_eq!(mermaid_id("graph"), "n_graph");
+        assert_eq!(mermaid_id("subgraph"), "n_subgraph");
+        assert_eq!(mermaid_id("end"), "n_end");
+        assert_eq!(mermaid_id("flowchart"), "n_flowchart");
+        assert_eq!(mermaid_id("classDef"), "n_classDef");
+        assert_eq!(mermaid_id("style"), "n_style");
+        assert_eq!(mermaid_id("click"), "n_click");
+        // Sanitized-but-not-equal-to-reserved still needs no escape.
+        assert_eq!(mermaid_id("graph!"), "graph_");
+        assert_eq!(mermaid_id("graphical"), "graphical");
     }
 
     #[test]
-    fn mermaid_id_does_not_suffix_substring_matches() {
-        // Only exact reserved-word matches get the suffix; substrings are fine.
+    fn mermaid_id_does_not_escape_substring_matches() {
+        // Only exact reserved-word matches get the prefix; substrings are fine.
         assert_eq!(mermaid_id("graphics"), "graphics");
         assert_eq!(mermaid_id("subgraph_inner"), "subgraph_inner");
         assert_eq!(mermaid_id("my_graph"), "my_graph");
         assert_eq!(mermaid_id("ending"), "ending");
-    }
-
-    #[test]
-    fn mermaid_id_collision_via_punctuation_replacement_also_suffixed() {
-        // Inputs that *become* a reserved keyword after punctuation replacement
-        // must still be suffixed.
-        assert_eq!(mermaid_id("graph!"), "graph_"); // `!` → `_`, but the result `graph_` is fine
-        // …but check the trickier case: a name that sanitizes to bare `graph`.
-        // Actually any sanitized form ending in `_` won't collide — only a bare
-        // name like "graph" or a name like "Graph" (which stays alphanumeric)
-        // is at risk. Verify Graph stays as Graph (case-sensitive list).
+        // Case-sensitive: `Graph` is not in the reserved list.
         assert_eq!(mermaid_id("Graph"), "Graph");
     }
 

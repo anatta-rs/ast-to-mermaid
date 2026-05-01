@@ -6,3 +6,4 @@ lcov.info
 *.profraw
 Cargo.lock
 .cargo/config.toml
+e2etest/

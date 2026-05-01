@@ -4,7 +4,7 @@
 //! call/dependency graph, and renders [Mermaid](https://mermaid.js.org) diagrams
 //! at five levels of detail.
 //!
-//! **No external graph backend.** No polystore. No ingester. Tree-sitter only.
+//! Self-contained — no external graph backend, no async runtime, no database.
 //!
 //! Five rendering levels:
 //! - [`Level::Project`] — one node per crate, cross-crate calls.

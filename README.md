@@ -77,7 +77,7 @@ Five entry points, two private helpers, all converging on one impacted function.
 
 ### Dispatcher: `a2m module ./src --target render/mod.rs`
 
-`render::render` is one function name shared by **six** modules. The resolver disambiguates via `use` imports + qualified call paths, so the dispatch fan-out and the two real callers land on the right node:
+`render::render` is one function name shared by **six** modules. The resolver disambiguates via `use` imports + qualified call paths, so the dispatch fan-out and the two real callers land on the right node. Methods inside `impl` blocks are first-class too — addressable via `--target Type::method` (e.g. `--target HnswBuilder::build`) without spelling out generic params:
 
 ```mermaid
 graph TD
@@ -169,6 +169,9 @@ a2m module ./my-repo --target src/server/handlers.rs
 # Reverse call chain into a function (who calls it?)
 a2m function ./my-repo --target parse_config
 
+# Methods on a type — `Type::method` shorthand handles generics for you
+a2m function ./my-repo --target HnswBuilder::build
+
 # Forward + backward impact (3 hops by default)
 a2m impact ./my-repo --target execute
 
@@ -225,7 +228,9 @@ a2m bundle ./src --out ./.artifacts
     └── code_src_pipeline.rs__function__analyze.meta.json #   ↳ callers, callees, line range, signature, doc
 ```
 
-Each `.meta.json` carries the entity's id, kind, file/line range, signature, doc, content hash, and full caller/callee lists. The bundle is plain JSON + Mermaid — load it into any graph store (Neo4j, DuckDB, in-memory) without re-parsing.
+Each `.meta.json` carries the entity's id, kind, file/line range, signature, doc, SHA-256 content hash, and the full edge surface — `callers`, `callees`, plus `implements` / `implemented_by` for impl/trait pairs. Calls into crates outside the analysed tree (e.g. `serde_json::to_string`, `divan::main`) become synthetic `extern:` atoms in the bundle so external dependencies are visible at the boundary instead of disappearing silently.
+
+The bundle is plain JSON + Mermaid — load it into any graph store (Neo4j, DuckDB, in-memory) without re-parsing.
 
 `content_hash` is the **git blob SHA-1** of the entity's source slice — the same value `git hash-object` produces. Cache keys, dedup across branches, and the `a2m diff` rename heuristic all rely on this identity.
 
@@ -284,7 +289,7 @@ The `hits` / `misses` counters tell you exactly how much work the atom cache sav
 - **Rust** — `tree-sitter-rust`
 - **Python** — `tree-sitter-python`
 
-Anything else is silently skipped during the walk. Adding a language is a matter of wiring up one tree-sitter grammar in `src/parser/mod.rs`.
+Anything else is silently skipped during the walk. The parser is **query-driven**: each supported language gets a small set of `.scm` tree-sitter query files in `src/parser/queries/<lang>/` (items, calls, uses, impl-methods). Adding a language is roughly: add the `tree-sitter-<lang>` dep, drop the queries, add a `Language` enum variant. No new walker code per language.
 
 ## Use as a library
 
@@ -296,26 +301,26 @@ ast-to-mermaid = "0.2"
 ```
 
 ```rust
-use ast_to_mermaid::pipeline::{analyze, bundle, AnalyzeOptions};
+use ast_to_mermaid::artifacts::write_artifacts;
+use ast_to_mermaid::pipeline::{AnalyzeOptions, analyze, bundle};
 use ast_to_mermaid::render::Level;
 use std::path::Path;
 
-// Render a single Mermaid string at a given level.
-let report = analyze(
-    Path::new("./my-repo"),
-    &AnalyzeOptions {
-        level: Level::Overview,
-        ..Default::default()
-    },
-)?;
-println!("{}", report.mermaid);
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Render a single Mermaid string at a given level.
+    let mut opts = AnalyzeOptions::default();
+    opts.level = Level::Overview;
+    let report = analyze(Path::new("./my-repo"), &opts)?;
+    println!("{}", report.mermaid);
 
-// Or build the full artifact bundle.
-let (artifacts, _report) = bundle(Path::new("./my-repo"), &AnalyzeOptions::default())?;
-ast_to_mermaid::artifacts::write_artifacts(&artifacts, Path::new("./.artifacts"))?;
+    // Or build the full artifact bundle.
+    let (artifacts, _report) = bundle(Path::new("./my-repo"), &AnalyzeOptions::default())?;
+    write_artifacts(&artifacts, Path::new("./.artifacts"))?;
+    Ok(())
+}
 ```
 
-Lower-level pieces are public for embedders that want to drive the pipeline by hand: `parser::CodeParser`, `graph::Store`, `resolve::resolve_cross_module_calls`, `render::render`.
+Lower-level pieces are public for embedders that want to drive the pipeline by hand: `parser::{CodeParser, Language}`, `graph::Store`, `resolve::{resolve_cross_module_calls, resolve_implements_edges, EXTERN_KIND}`, `render::{render, Level}`, `pipeline::{bundle, DEFAULT_EXCLUDED_DIRS}`.
 
 ## How it works
 

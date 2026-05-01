@@ -77,7 +77,13 @@ pub fn resolve_module(store: &Store, target: &str) -> Result<EntityId> {
 ///
 /// Resolution order:
 /// 1. Exact `EntityId` match.
-/// 2. Exact `name` match — errors if multiple functions share that name.
+/// 2. `Type::method` shorthand — when the target contains `::`, the last
+///    segment is treated as the method name and the preceding segments as
+///    a substring hint matched against the candidate's id. This lets you
+///    write `--target HnswBuilder::build` and find
+///    `code:src/hnsw.rs::function::HnswBuilder<'a, D, M, M0>::build`
+///    (the substring `HnswBuilder` is present in the id).
+/// 3. Exact `name` match — errors if multiple functions share that name.
 ///    Tip: pass a fully-qualified id like
 ///    `code:crates/foo/src/lib.rs::function::bar` to disambiguate.
 ///
@@ -98,12 +104,42 @@ pub fn resolve_function(store: &Store, target: &str) -> Result<EntityId> {
 
     let functions = store.atoms_by_kind("function");
 
+    // Pass 1: exact id.
     for f in &functions {
         if f.id.as_str() == target {
             return Ok(f.id.clone());
         }
     }
 
+    // Pass 2: Type::method shorthand.
+    if let Some((owner_hint, method_name)) = target.rsplit_once("::")
+        && !owner_hint.is_empty()
+        && !method_name.is_empty()
+    {
+        let matches: Vec<EntityId> = functions
+            .iter()
+            .filter(|f| f.name == method_name && f.id.as_str().contains(owner_hint))
+            .map(|f| f.id.clone())
+            .collect();
+        match matches.len() {
+            0 => {} // fall through to bare-name pass
+            1 => return Ok(matches.into_iter().next().expect("len==1")),
+            n => {
+                return Err(AstToMermaidError::InvalidInput(format!(
+                    "ambiguous function target {target:?}: {n} candidates ({}{})",
+                    matches
+                        .iter()
+                        .take(3)
+                        .map(|id| id.as_str().to_owned())
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    if n > 3 { ", ..." } else { "" }
+                )));
+            }
+        }
+    }
+
+    // Pass 3: exact name (may be ambiguous).
     let matches: Vec<EntityId> = functions
         .iter()
         .filter(|f| f.name == target)
@@ -281,6 +317,62 @@ mod tests {
             "foo",
         ));
         let err = resolve_function(&store, "ghost").expect_err("missing");
+        assert!(err.to_string().contains("no function"));
+    }
+
+    #[test]
+    fn resolve_function_type_method_shorthand_disambiguates_by_owner() {
+        // Three impls all have `build`. `Foo::build` must match exactly one.
+        let store = Store::new();
+        for owner in ["Foo", "Bar", "Baz"] {
+            let id = format!(
+                "code:src/{}.rs::function::{owner}::build",
+                owner.to_lowercase()
+            );
+            let file = format!("src/{}.rs", owner.to_lowercase());
+            store.add_atom(function(&id, &file, "build"));
+        }
+        let id = resolve_function(&store, "Foo::build").expect("ok");
+        assert_eq!(id.as_str(), "code:src/foo.rs::function::Foo::build");
+    }
+
+    #[test]
+    fn resolve_function_type_method_shorthand_handles_generics_in_id() {
+        // The user passes `HnswBuilder::build` but the actual id has the
+        // generics: `HnswBuilder<'a, D, M, M0>::build`. Substring match on
+        // the owner hint must still succeed.
+        let store = Store::new();
+        store.add_atom(function(
+            "code:src/hnsw.rs::function::HnswBuilder<'a, D, M, M0>::build",
+            "src/hnsw.rs",
+            "build",
+        ));
+        // Decoy with the same method name but a different owner.
+        store.add_atom(function(
+            "code:src/python.rs::function::PyWriter::build",
+            "src/python.rs",
+            "build",
+        ));
+        let id = resolve_function(&store, "HnswBuilder::build").expect("ok");
+        assert!(
+            id.as_str().contains("HnswBuilder<'a, D, M, M0>"),
+            "got {id}"
+        );
+    }
+
+    #[test]
+    fn resolve_function_type_method_shorthand_falls_through_when_no_match() {
+        // The owner hint matches no atom; resolver falls through to bare-name
+        // matching on the method portion.
+        let store = Store::new();
+        store.add_atom(function(
+            "code:src/lib.rs::function::foo",
+            "src/lib.rs",
+            "foo",
+        ));
+        // `Nonexistent::foo` — no atom contains `Nonexistent`. Falls through
+        // to bare-name match on `Nonexistent::foo` which fails too.
+        let err = resolve_function(&store, "Nonexistent::foo").expect_err("no match");
         assert!(err.to_string().contains("no function"));
     }
 }

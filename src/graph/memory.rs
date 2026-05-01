@@ -56,9 +56,8 @@ impl Store {
 
     /// Record a directed edge.
     ///
-    /// Unlike the old `polystore` store, both endpoints are allowed to be
-    /// absent at insertion time — dangling edges are simply ignored by the
-    /// renderers when they fetch the atoms.
+    /// Both endpoints may be absent at insertion time — dangling edges are
+    /// simply ignored by the renderers when they fetch the atoms.
     ///
     /// # Panics
     ///

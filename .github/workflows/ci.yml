@@ -8,8 +8,6 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
-  # Make cargo use system git so the `git config insteadOf` rules apply.
-  CARGO_NET_GIT_FETCH_WITH_CLI: "true"
 
 jobs:
   fmt:
@@ -27,13 +25,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: webfactory/ssh-agent@v0.9.0
-        with:
-          ssh-private-key: |
-            ${{ secrets.POLYSTORE_DEPLOY_KEY }}
-            ${{ secrets.INGESTER_DEPLOY_KEY }}
-      - name: Use SSH for anatta-rs private deps
-        run: git config --global url."git@github.com:anatta-rs/".insteadOf "https://github.com/anatta-rs/"
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
@@ -45,13 +36,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: webfactory/ssh-agent@v0.9.0
-        with:
-          ssh-private-key: |
-            ${{ secrets.POLYSTORE_DEPLOY_KEY }}
-            ${{ secrets.INGESTER_DEPLOY_KEY }}
-      - name: Use SSH for anatta-rs private deps
-        run: git config --global url."git@github.com:anatta-rs/".insteadOf "https://github.com/anatta-rs/"
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --all-features --workspace
@@ -61,23 +45,16 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: webfactory/ssh-agent@v0.9.0
-        with:
-          ssh-private-key: |
-            ${{ secrets.POLYSTORE_DEPLOY_KEY }}
-            ${{ secrets.INGESTER_DEPLOY_KEY }}
-      - name: Use SSH for anatta-rs private deps
-        run: git config --global url."git@github.com:anatta-rs/".insteadOf "https://github.com/anatta-rs/"
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: llvm-tools-preview
       - uses: taiki-e/install-action@cargo-llvm-cov
       - uses: Swatinem/rust-cache@v2
       - name: Generate lcov + JSON summary
-        # Exclude bin crate `main.rs` files — 3-line wrappers, untestable without subprocess.
+        # Exclude bin crate `main.rs` files — thin clap wrappers, untestable without subprocess.
         run: |
-          cargo llvm-cov --all-features --workspace --ignore-filename-regex '(main|bin/[^/]+)\.rs$|workspaces/(ingester|polystore|dork|pm)/' --lcov --output-path lcov.info
-          cargo llvm-cov --all-features --workspace --ignore-filename-regex '(main|bin/[^/]+)\.rs$|workspaces/(ingester|polystore|dork|pm)/' --json --summary-only > coverage.json
+          cargo llvm-cov --all-features --workspace --ignore-filename-regex '(main|bin/[^/]+)\.rs$' --lcov --output-path lcov.info
+          cargo llvm-cov --all-features --workspace --ignore-filename-regex '(main|bin/[^/]+)\.rs$' --json --summary-only > coverage.json
       - name: Enforce coverage gate
         run: |
           PCT=$(jq -r '.data[0].totals.lines.percent' coverage.json)

@@ -59,16 +59,6 @@ Bypass with `git commit --no-verify` / `git push --no-verify` only if absolutely
 - Feature work in `feat/<short-name>` branches.
 - Direct commits to `main` are forbidden (use PRs).
 
-## Dependency on polystore
-
-This workspace depends on [polystore](https://github.com/anatta-rs/polystore)
-via `branch = "main"` (declared in workspace `Cargo.toml`). Cargo resolves the
-latest commit each time we update `Cargo.lock` locally; downstream consumers
-that vendor `ast-to-mermaid` will pin via the lockfile they create.
-
-When polystore ships a breaking change, we update accordingly here and bump
-`ast-to-mermaid` minor (pre-1.0).
-
 ## License
 
 By contributing you agree that your contributions are licensed under
