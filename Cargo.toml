@@ -22,10 +22,10 @@ tree-sitter-python = "0.25"
 clap = { version = "4", features = ["derive"] }
 sha1_smol = "1"
 ciborium = "0.2"
+tempfile = "3"
 
 [dev-dependencies]
 pretty_assertions = "1"
-tempfile = "3"
 
 [[bin]]
 name = "a2m"

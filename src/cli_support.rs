@@ -195,6 +195,42 @@ fn run_walk_ref(start: &std::path::Path, git_ref: &str) -> ExitCode {
     ExitCode::Success
 }
 
+/// Shared CLI args for cache-touching subcommands (`index`, `diff`).
+#[derive(Debug, Clone, Default, clap::Args)]
+pub struct CacheArgs {
+    /// Override the cache root (default: `<git-toplevel>/.a2m/cache`).
+    /// Useful for CI (per-job dirs), shared caches, or XDG opt-in.
+    #[arg(long, value_name = "DIR", global = true)]
+    pub cache_dir: Option<PathBuf>,
+
+    /// Bypass the persistent cache entirely. Bundles are materialized in
+    /// a tempdir for the duration of the command and cleaned up at exit.
+    /// Useful for cold-path benchmarks or to verify the persistent cache
+    /// isn't lying. Cannot share data across runs.
+    #[arg(long, global = true)]
+    pub no_cache: bool,
+}
+
+impl CacheArgs {
+    /// Resolve the effective cache root for `path`, honoring overrides.
+    /// Returns `(root, ephemeral_handle)` — keep `ephemeral_handle` alive
+    /// for the duration of the command; dropping it deletes the tempdir.
+    pub fn resolve(&self, path: &Path) -> Result<(PathBuf, Option<tempfile::TempDir>), crate::error::AstToMermaidError> {
+        if self.no_cache {
+            let dir = tempfile::Builder::new()
+                .prefix("a2m-no-cache-")
+                .tempdir()?;
+            return Ok((dir.path().to_path_buf(), Some(dir)));
+        }
+        let root = self.cache_dir.clone().unwrap_or_else(|| {
+            let toplevel =
+                crate::git_source::show_toplevel(path).unwrap_or_else(|_| path.to_path_buf());
+            Cache::default_root(&toplevel)
+        });
+        Ok((root, None))
+    }
+}
+
 /// CLI args for the `index` subcommand.
 #[derive(Debug, Clone, clap::Args)]
 pub struct IndexFlags {
@@ -210,20 +246,22 @@ pub struct IndexFlags {
     #[arg(long)]
     pub force: bool,
 
-    /// Override the cache root (default: `<repo>/.a2m/cache`).
-    #[arg(long, value_name = "DIR")]
-    pub cache_dir: Option<PathBuf>,
+    /// Shared cache flags (`--cache-dir`, `--no-cache`).
+    #[command(flatten)]
+    pub cache: CacheArgs,
 }
 
 /// Run the `index` subcommand: materialize a bundle for a ref (or the
 /// working tree) into the cache. Idempotent — cached re-runs are a no-op
 /// unless `--force` is set.
 pub fn run_index(flags: &IndexFlags) -> ExitCode {
-    let cache_root = flags.cache_dir.clone().unwrap_or_else(|| {
-        let repo_root = crate::git_source::show_toplevel(&flags.path)
-            .unwrap_or_else(|_| flags.path.clone());
-        Cache::default_root(&repo_root)
-    });
+    let (cache_root, _ephemeral) = match flags.cache.resolve(&flags.path) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("index: resolve cache root: {e}");
+            return ExitCode::Failure;
+        }
+    };
     let cache = match Cache::open(&cache_root) {
         Ok(c) => c,
         Err(e) => {
@@ -243,7 +281,7 @@ pub fn run_index(flags: &IndexFlags) -> ExitCode {
         }
     };
 
-    if cache.has_bundle(&sha) && !flags.force {
+    if cache.has_bundle(&sha) && !flags.force && !flags.cache.no_cache {
         eprintln!("cached {} → {}", sha, cache.bundle_dir(&sha).display());
         return ExitCode::Success;
     }
@@ -292,9 +330,9 @@ pub struct DiffFlags {
     #[arg(long, value_enum, default_value_t = DiffFormat::Mermaid)]
     pub format: DiffFormat,
 
-    /// Override the cache root (default: `<repo>/.a2m/cache`).
-    #[arg(long, value_name = "DIR")]
-    pub cache_dir: Option<PathBuf>,
+    /// Shared cache flags (`--cache-dir`, `--no-cache`).
+    #[command(flatten)]
+    pub cache: CacheArgs,
 }
 
 /// Output format for `a2m diff`.
@@ -318,11 +356,13 @@ pub fn run_diff(flags: &DiffFlags) -> ExitCode {
         return ExitCode::UsageError;
     }
 
-    let cache_root = flags.cache_dir.clone().unwrap_or_else(|| {
-        let toplevel =
-            crate::git_source::show_toplevel(&flags.path).unwrap_or_else(|_| flags.path.clone());
-        Cache::default_root(&toplevel)
-    });
+    let (cache_root, _ephemeral) = match flags.cache.resolve(&flags.path) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("diff: resolve cache root: {e}");
+            return ExitCode::Failure;
+        }
+    };
     let cache = match Cache::open(&cache_root) {
         Ok(c) => c,
         Err(e) => {
@@ -331,14 +371,14 @@ pub fn run_diff(flags: &DiffFlags) -> ExitCode {
         }
     };
 
-    let from_sha = match ensure_indexed(&cache, &flags.path, ref_a) {
+    let from_sha = match ensure_indexed(&cache, &flags.path, ref_a, flags.cache.no_cache) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("diff: index {ref_a}: {e}");
             return ExitCode::Failure;
         }
     };
-    let to_sha = match ensure_indexed(&cache, &flags.path, ref_b) {
+    let to_sha = match ensure_indexed(&cache, &flags.path, ref_b, flags.cache.no_cache) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("diff: index {ref_b}: {e}");
@@ -384,9 +424,14 @@ pub fn run_diff(flags: &DiffFlags) -> ExitCode {
     ExitCode::Success
 }
 
-fn ensure_indexed(cache: &Cache, path: &Path, git_ref: &str) -> Result<String, crate::error::AstToMermaidError> {
+fn ensure_indexed(
+    cache: &Cache,
+    path: &Path,
+    git_ref: &str,
+    no_cache: bool,
+) -> Result<String, crate::error::AstToMermaidError> {
     let sha = snapshot_id(path, Some(git_ref))?;
-    if cache.has_bundle(&sha) {
+    if !no_cache && cache.has_bundle(&sha) {
         return Ok(sha);
     }
     let opts = AnalyzeOptions {
