@@ -1,6 +1,28 @@
 graph TD
-    ast_to_mermaid_cli["ast-to-mermaid-cli — 1 mod, 1 fn, 0 struct"]
-    ast_to_mermaid_core["ast-to-mermaid-core — 12 mod, 23 fn, 8 struct"]
-    ast_to_mermaid_mcp["ast-to-mermaid-mcp — 1 mod, 1 fn, 0 struct"]
-    ast_to_mermaid_cli -->|"1 calls"| ast_to_mermaid_core
-    ast_to_mermaid_mcp -->|"1 calls"| ast_to_mermaid_core
+    artifacts["artifacts — 1 mod, 9 fn, 2 struct"]
+    bin["bin — 1 mod, 1 fn, 1 struct"]
+    cli_support_rs["cli_support.rs — 1 mod, 4 fn, 3 struct"]
+    error_rs["error.rs — 1 mod, 0 fn, 0 struct"]
+    n_graph["graph — 2 mod, 18 fn, 2 struct"]
+    lib_rs["lib.rs — 1 mod, 0 fn, 0 struct"]
+    model_rs["model.rs — 1 mod, 10 fn, 3 struct"]
+    parser["parser — 2 mod, 25 fn, 5 struct"]
+    pipeline_rs["pipeline.rs — 1 mod, 9 fn, 2 struct"]
+    render["render — 8 mod, 22 fn, 2 struct"]
+    resolve_rs["resolve.rs — 1 mod, 8 fn, 0 struct"]
+    artifacts -->|"6 calls"| n_graph
+    artifacts -->|"1 calls"| parser
+    artifacts -->|"2 calls"| render
+    bin -->|"3 calls"| cli_support_rs
+    cli_support_rs -->|"1 calls"| artifacts
+    cli_support_rs -->|"3 calls"| pipeline_rs
+    cli_support_rs -->|"1 calls"| render
+    parser -->|"4 calls"| n_graph
+    pipeline_rs -->|"1 calls"| artifacts
+    pipeline_rs -->|"2 calls"| parser
+    pipeline_rs -->|"1 calls"| render
+    pipeline_rs -->|"4 calls"| resolve_rs
+    render -->|"19 calls"| n_graph
+    render -->|"6 calls"| parser
+    resolve_rs -->|"7 calls"| n_graph
+    resolve_rs -->|"2 calls"| parser
