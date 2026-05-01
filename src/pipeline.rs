@@ -4,15 +4,18 @@
 //! synchronous in-memory.
 
 use crate::artifacts::{ArtifactSet, emit_artifacts};
+use crate::cache::Cache;
 use crate::error::{AstToMermaidError, Result};
+use crate::git_source;
 use crate::graph::Store;
-use crate::parser::{CodeParser, Language};
+use crate::parser::{CodeParser, Language, git_blob_sha1};
 use crate::render::{Level, render};
 use crate::resolve::{resolve_cross_module_calls, resolve_implements_edges};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 /// Options controlling [`analyze`].
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 #[non_exhaustive]
 pub struct AnalyzeOptions {
     /// Mermaid view to render.
@@ -24,6 +27,16 @@ pub struct AnalyzeOptions {
     /// walk. Always combined with the built-in skip set
     /// (`target`, `node_modules`, `.git`, any dotfile dir).
     pub exclude: Vec<String>,
+    /// Optional git ref to read source from (e.g. `main`, `v0.1.0`,
+    /// `HEAD~3`). When set, the pipeline reads file contents via
+    /// `git cat-file` rather than walking the working tree, and ignores
+    /// `exclude` (git ls-tree already excludes ignored files).
+    pub git_ref: Option<String>,
+    /// Optional content-addressed cache for atom-level memoization. When set,
+    /// the parse loop checks `<cache>/blobs/<git_blob_sha>.cbor` per file and
+    /// replays cached `ParseUnit`s on hit (skipping tree-sitter entirely).
+    /// On miss, the fresh `ParseUnit` is written back to the cache.
+    pub cache: Option<Arc<Cache>>,
 }
 
 impl Default for AnalyzeOptions {
@@ -32,8 +45,98 @@ impl Default for AnalyzeOptions {
             level: Level::Project,
             target: None,
             exclude: Vec::new(),
+            git_ref: None,
+            cache: None,
         }
     }
+}
+
+impl std::fmt::Debug for AnalyzeOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AnalyzeOptions")
+            .field("level", &self.level)
+            .field("target", &self.target)
+            .field("exclude", &self.exclude)
+            .field("git_ref", &self.git_ref)
+            .field(
+                "cache",
+                &self.cache.as_ref().map(|c| c.root().display().to_string()),
+            )
+            .finish()
+    }
+}
+
+/// One unit of work for the parse loop: a logical path label, the bytes to
+/// parse, and the language. Produced by either the FS walk or the git tree.
+struct ParseInput {
+    /// Display path used for entity ids (relative-to-root, slash-separated).
+    display_path: String,
+    /// File contents as bytes.
+    content: Vec<u8>,
+    /// Language detected from the file extension.
+    language: Language,
+    /// Git blob SHA-1 of the content. From `git ls-tree` in `--ref` mode,
+    /// computed inline in worktree mode. Used as the atom-cache key.
+    blob_sha: String,
+}
+
+/// Collect parse inputs from either the working tree (FS walk) or a git ref
+/// (`git ls-tree` + `git cat-file`).
+fn collect_inputs(root: &Path, opts: &AnalyzeOptions) -> Result<Vec<ParseInput>> {
+    if let Some(git_ref) = opts.git_ref.as_deref() {
+        collect_from_git_ref(root, git_ref)
+    } else {
+        collect_from_worktree(root, &opts.exclude)
+    }
+}
+
+fn collect_from_worktree(root: &Path, exclude: &[String]) -> Result<Vec<ParseInput>> {
+    let files = walk_for_languages_with_exclude(root, exclude)?;
+    let mut out = Vec::with_capacity(files.len());
+    for (path, language) in files {
+        let content = std::fs::read(&path)?;
+        let blob_sha = git_blob_sha1(&content);
+        let display_path = display_path(root, &path);
+        out.push(ParseInput {
+            display_path,
+            content,
+            language,
+            blob_sha,
+        });
+    }
+    Ok(out)
+}
+
+fn collect_from_git_ref(root: &Path, git_ref: &str) -> Result<Vec<ParseInput>> {
+    let toplevel = git_source::show_toplevel(root)?;
+    // If the user pointed at a subdirectory, only keep entries under it.
+    let prefix = root
+        .canonicalize()
+        .ok()
+        .and_then(|abs| abs.strip_prefix(&toplevel).ok().map(Path::to_path_buf))
+        .map(|p| p.to_string_lossy().into_owned())
+        .filter(|s| !s.is_empty());
+
+    let entries = git_source::ls_tree(&toplevel, git_ref)?;
+    let mut out = Vec::new();
+    for entry in entries {
+        if let Some(p) = prefix.as_deref()
+            && !entry.path.starts_with(p)
+        {
+            continue;
+        }
+        let Some(language) = language_for(Path::new(&entry.path)) else {
+            continue;
+        };
+        let content = git_source::cat_file(&toplevel, &entry.blob_sha)?;
+        out.push(ParseInput {
+            display_path: entry.path,
+            content,
+            language,
+            blob_sha: entry.blob_sha,
+        });
+    }
+    Ok(out)
 }
 
 /// What [`analyze`] returns.
@@ -62,33 +165,21 @@ pub struct AnalyzeReport {
 /// Returns the first error from filesystem walk, parsing, or renderer.
 /// Individual files that fail to parse are propagated.
 pub fn analyze(root: &Path, opts: &AnalyzeOptions) -> Result<AnalyzeReport> {
-    if !root.exists() {
+    // FS-mode requires the path to exist. In git-ref mode the path can be a
+    // subdir hint that was deleted on HEAD but present in the ref; defer the
+    // check to `git_source::show_toplevel`.
+    if opts.git_ref.is_none() && !root.exists() {
         return Err(AstToMermaidError::InvalidInput(format!(
             "path does not exist: {}",
             root.display()
         )));
     }
 
-    let files = walk_for_languages_with_exclude(root, &opts.exclude)?;
+    let inputs = collect_inputs(root, opts)?;
     let store = Store::new();
 
-    let mut atoms_indexed = 0;
-    let mut files_parsed = 0;
-    for (path, lang) in &files {
-        let bytes = std::fs::read(path)?;
-        let parser = match lang {
-            Language::Rust => CodeParser::rust(),
-            Language::Python => CodeParser::python(),
-        };
-        let display_path = display_path(root, path);
-        let count = parser
-            .parse_into(&bytes, &display_path, &store)
-            .map_err(|e| AstToMermaidError::InvalidInput(format!("parse {display_path}: {e}")))?;
-        atoms_indexed += count;
-        files_parsed += 1;
-    }
-
-    let edges_resolved = resolve_cross_module_calls(&store) + resolve_implements_edges(&store);
+    let (files_parsed, atoms_indexed) = parse_phase(&inputs, &store, opts.cache.as_deref())?;
+    let edges_resolved = resolve_phase(&store, atoms_indexed);
     let mermaid = render(opts.level, &store, opts.target.as_deref())?;
 
     Ok(AnalyzeReport {
@@ -97,6 +188,94 @@ pub fn analyze(root: &Path, opts: &AnalyzeOptions) -> Result<AnalyzeReport> {
         atoms_indexed,
         edges_resolved,
     })
+}
+
+/// Run the parse pass over `inputs`, threading each one into `store`.
+///
+/// When `cache` is `Some`, each input's `blob_sha` is checked against the
+/// atom cache first:
+/// - **Hit**: cached `ParseUnit` is replayed straight into `store`,
+///   skipping tree-sitter entirely. This is the cross-branch dedup that
+///   makes branch switches cheap.
+/// - **Miss**: tree-sitter parses, the result is applied to `store` AND
+///   persisted to the cache for future runs.
+///
+/// Cache hit/miss counts are emitted on completion as a `tracing::info!`
+/// line so users see the cache effectiveness via `--trace=info`.
+fn parse_phase(
+    inputs: &[ParseInput],
+    store: &Store,
+    cache: Option<&Cache>,
+) -> Result<(usize, usize)> {
+    let span = tracing::info_span!("parse_phase", files = inputs.len());
+    let _enter = span.enter();
+    let started = std::time::Instant::now();
+
+    let mut atoms_indexed = 0;
+    let mut files_parsed = 0;
+    let mut hits = 0usize;
+    let mut misses = 0usize;
+
+    for input in inputs {
+        if let Some(c) = cache
+            && let Some(unit) = c.get_unit(&input.blob_sha)
+        {
+            atoms_indexed += unit.atom_count();
+            unit.apply_to(store);
+            hits += 1;
+            files_parsed += 1;
+            continue;
+        }
+
+        let parser = match input.language {
+            Language::Rust => CodeParser::rust(),
+            Language::Python => CodeParser::python(),
+        };
+        let unit = parser
+            .parse(&input.content, &input.display_path)
+            .map_err(|e| {
+                AstToMermaidError::InvalidInput(format!("parse {}: {e}", input.display_path))
+            })?;
+        atoms_indexed += unit.atom_count();
+        unit.apply_to(store);
+        if let Some(c) = cache
+            && let Err(e) = c.put_unit(&input.blob_sha, &unit)
+        {
+            tracing::warn!(blob_sha = %input.blob_sha, "cache.put_unit failed: {e}");
+        }
+        misses += 1;
+        files_parsed += 1;
+    }
+
+    let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    tracing::info!(
+        parsed = files_parsed,
+        atoms = atoms_indexed,
+        hits,
+        misses,
+        elapsed_ms,
+        "parse_phase done",
+    );
+    Ok((files_parsed, atoms_indexed))
+}
+
+/// Run the cross-module resolver (Calls + Implements edges). Wrapped in
+/// `tracing::info_span!("resolve_phase", ...)`. Returns the total edge count.
+///
+/// **V1.5 decision gate**: the per-call elapsed and atom-count fields are
+/// the data we'll use to decide whether V2 (edge-level cache) is justified
+/// (resolve-phase wall-time as a fraction of the whole pipeline on real
+/// repos — see `docs/perf/2026-05-01-resolve-cost-baseline.md`).
+fn resolve_phase(store: &Store, atoms: usize) -> usize {
+    let span = tracing::info_span!("resolve_phase", atoms);
+    let _enter = span.enter();
+    let started = std::time::Instant::now();
+
+    let edges_resolved = resolve_cross_module_calls(store) + resolve_implements_edges(store);
+
+    let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    tracing::info!(edges = edges_resolved, elapsed_ms, "resolve_phase done");
+    edges_resolved
 }
 
 /// Walk `root`, parse every supported file, resolve cross-module calls,
@@ -116,36 +295,24 @@ pub fn analyze(root: &Path, opts: &AnalyzeOptions) -> Result<AnalyzeReport> {
 /// Returns the first error from filesystem walk, parsing, or
 /// resolver. Individual files that fail to parse are propagated.
 pub fn bundle(root: &Path, opts: &AnalyzeOptions) -> Result<(ArtifactSet, AnalyzeReport)> {
-    if !root.exists() {
+    if opts.git_ref.is_none() && !root.exists() {
         return Err(AstToMermaidError::InvalidInput(format!(
             "path does not exist: {}",
             root.display()
         )));
     }
 
-    let files = walk_for_languages_with_exclude(root, &opts.exclude)?;
+    let inputs = collect_inputs(root, opts)?;
     let store = Store::new();
 
-    let mut atoms_indexed = 0;
-    let mut files_parsed = 0;
-    for (path, lang) in &files {
-        let bytes = std::fs::read(path)?;
-        let parser = match lang {
-            Language::Rust => CodeParser::rust(),
-            Language::Python => CodeParser::python(),
-        };
-        let display_path = display_path(root, path);
-        let count = parser
-            .parse_into(&bytes, &display_path, &store)
-            .map_err(|e| AstToMermaidError::InvalidInput(format!("parse {display_path}: {e}")))?;
-        atoms_indexed += count;
-        files_parsed += 1;
-    }
+    let (files_parsed, atoms_indexed) = parse_phase(&inputs, &store, opts.cache.as_deref())?;
+    let edges_resolved = resolve_phase(&store, atoms_indexed);
 
-    let edges_resolved = resolve_cross_module_calls(&store) + resolve_implements_edges(&store);
-
-    let source_root = root.to_string_lossy();
-    let artifacts = emit_artifacts(&store, source_root.as_ref());
+    let source_root = match opts.git_ref.as_deref() {
+        Some(ref_name) => format!("{}@{ref_name}", root.display()),
+        None => root.to_string_lossy().into_owned(),
+    };
+    let artifacts = emit_artifacts(&store, &source_root);
 
     let report = AnalyzeReport {
         // The "rendered" mermaid for a bundle is the project view —
@@ -271,6 +438,39 @@ fn language_for(path: &Path) -> Option<Language> {
         Some("py") => Some(Language::Python),
         _ => None,
     }
+}
+
+/// Resolve `<root>` to a snapshot id used as the cache bundle key.
+///
+/// - If `git_ref` is `Some`, returns the commit SHA from `git rev-parse`.
+/// - If `git_ref` is `None`, walks the working tree and returns
+///   `wt-<digest>` where `<digest>` is the first 16 hex chars of
+///   `SHA1(<path>:<blob_sha>\0…)` over all source files sorted by path.
+///   Deterministic — a clean working tree always hashes the same.
+///
+/// # Errors
+/// I/O errors from the FS walk, or git errors from `rev-parse`.
+pub fn snapshot_id(root: &Path, git_ref: Option<&str>) -> Result<String> {
+    if let Some(r) = git_ref {
+        return git_source::rev_parse(root, r);
+    }
+    let files = walk_for_languages_with_exclude::<&str>(root, &[])?;
+    let mut pairs: Vec<(String, String)> = Vec::with_capacity(files.len());
+    for (file, _lang) in files {
+        let content = std::fs::read(&file)?;
+        let blob = git_blob_sha1(&content);
+        let display = display_path(root, &file);
+        pairs.push((display, blob));
+    }
+    pairs.sort();
+    let mut hasher = sha1_smol::Sha1::new();
+    for (p, b) in pairs {
+        hasher.update(p.as_bytes());
+        hasher.update(b":");
+        hasher.update(b.as_bytes());
+        hasher.update(b"\0");
+    }
+    Ok(format!("wt-{}", &hasher.digest().to_string()[..16]))
 }
 
 /// Render an absolute path as relative-to-root for tidier IDs.
@@ -406,6 +606,8 @@ mod tests {
                 level: Level::Project,
                 target: None,
                 exclude: Vec::new(),
+                git_ref: None,
+                cache: None,
             },
         )
         .expect("analyze");

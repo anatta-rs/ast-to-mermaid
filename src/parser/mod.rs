@@ -14,10 +14,60 @@
 use crate::error::{AstToMermaidError, Result};
 use crate::graph::Store;
 use crate::model::{CodeAtom, Edge, EdgeKind, EntityId};
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use tree_sitter::{Node, Parser as TsParser, QueryCursor, StreamingIterator};
 
 mod queries;
+
+// ── Parse output ─────────────────────────────────────────────────────────────
+
+/// Output of parsing one file: the atoms (module + items + lifted impl
+/// methods) and the intra-file edges (Contains, intra-file Calls). Cross-
+/// module edges are added later by the resolver.
+///
+/// This is the unit the content-addressed cache stores keyed by git blob
+/// SHA-1 — two files with identical content produce identical `ParseUnit`s,
+/// so a `git ls-tree` blob hit avoids tree-sitter entirely.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ParseUnit {
+    /// Module atom + per-item atoms + lifted impl-method atoms.
+    pub atoms: Vec<CodeAtom>,
+    /// Contains edges (module → item, impl → method) and intra-file Calls
+    /// edges (free-fn → free-fn, intra-impl method → method).
+    pub edges: Vec<Edge>,
+}
+
+impl ParseUnit {
+    /// Apply this unit's atoms and edges to `store`, in their recorded order.
+    pub fn apply_to(&self, store: &Store) {
+        for a in &self.atoms {
+            store.add_atom(a.clone());
+        }
+        for e in &self.edges {
+            store.add_edge(e.clone());
+        }
+    }
+
+    /// Number of atoms this unit contributed (cache-hit replay metric).
+    #[must_use]
+    pub fn atom_count(&self) -> usize {
+        self.atoms.len()
+    }
+}
+
+/// Git blob SHA-1 hex digest of `bytes`: `SHA1("blob {len}\0" + bytes)`.
+///
+/// Produces the same value as `git hash-object <file>` — used as the
+/// cache key for atom-level memoization. Distinct from `hex_sha256`,
+/// which we use for the user-visible `content_hash` field on atoms.
+#[must_use]
+pub fn git_blob_sha1(bytes: &[u8]) -> String {
+    let mut hasher = sha1_smol::Sha1::new();
+    hasher.update(format!("blob {}\0", bytes.len()).as_bytes());
+    hasher.update(bytes);
+    hasher.digest().to_string()
+}
 
 // ── Language ──────────────────────────────────────────────────────────────────
 
@@ -126,15 +176,17 @@ impl CodeParser {
         self.language
     }
 
-    /// Parse `content` (UTF-8 source bytes) from `file_path`, ingesting atoms
-    /// and edges directly into `store`.
+    /// Parse `content` from `file_path` into a [`ParseUnit`] (atoms + intra-
+    /// file edges). Output is fully determined by `(content, file_path,
+    /// language)` — same inputs always produce byte-identical units, which
+    /// is what makes content-addressed caching by git blob SHA-1 correct.
     ///
     /// # Errors
     ///
     /// - `InvalidInput` for non-UTF-8 content.
     /// - `InvalidInput` when tree-sitter fails to parse.
     #[allow(clippy::too_many_lines)]
-    pub fn parse_into(&self, content: &[u8], file_path: &str, store: &Store) -> Result<usize> {
+    pub fn parse(&self, content: &[u8], file_path: &str) -> Result<ParseUnit> {
         let text = std::str::from_utf8(content).map_err(|e| {
             AstToMermaidError::InvalidInput(format!("invalid utf-8 in {file_path}: {e}"))
         })?;
@@ -152,13 +204,16 @@ impl CodeParser {
             AstToMermaidError::InvalidInput(format!("tree-sitter parse failed for {file_path}"))
         })?;
 
+        let mut atoms: Vec<CodeAtom> = Vec::new();
+        let mut edges: Vec<Edge> = Vec::new();
+
         // ── Module atom ───────────────────────────────────────────────────────
         let module_id = EntityId::new(format!("code:{file_path}"));
         let module_name = module_name(file_path).to_owned();
         let module_hash = hex_sha256(content);
         let root = tree.root_node();
         let module_line_end = u32::try_from(root.end_position().row).unwrap_or(u32::MAX) + 1;
-        let module_atom = CodeAtom {
+        atoms.push(CodeAtom {
             id: module_id.clone(),
             kind: "module".to_owned(),
             name: module_name,
@@ -169,9 +224,7 @@ impl CodeParser {
             signature: String::new(),
             content_hash: module_hash,
             calls: Vec::new(),
-        };
-        store.add_atom(module_atom);
-        let mut atom_count = 1;
+        });
 
         // ── File-scope use imports (Rust only) ────────────────────────────────
         let use_decls: Vec<UseDecl> = if self.language == Language::Rust {
@@ -182,15 +235,12 @@ impl CodeParser {
         let imports: HashMap<String, String> = use_decls_to_imports(&use_decls);
 
         // ── Item atoms ────────────────────────────────────────────────────────
-        // Top-level items are matched via a tree-sitter query (see
-        // `queries/{lang}/items.scm`). The query restricts matches to
-        // direct children of the file root, so we don't recurse manually.
         let items_query = match self.language {
             Language::Rust => &queries::RUST.items,
             Language::Python => &queries::PYTHON.items,
         };
         let mut name_to_id: HashMap<String, EntityId> = HashMap::new();
-        let mut items: Vec<(EntityId, Vec<String>)> = Vec::new(); // (id, calls)
+        let mut items: Vec<(EntityId, Vec<String>)> = Vec::new();
 
         let mut cursor = QueryCursor::new();
         let mut matches = cursor.matches(items_query, root, text.as_bytes());
@@ -207,17 +257,15 @@ impl CodeParser {
                 let item_kind = atom.kind.clone();
                 name_to_id.insert(item_name.clone(), item_id.clone());
 
-                store.add_edge(Edge::new(
+                edges.push(Edge::new(
                     module_id.clone(),
                     item_id.clone(),
                     EdgeKind::Contains,
                 ));
                 items.push((item_id.clone(), call_names));
-                store.add_atom(atom);
-                atom_count += 1;
+                atoms.push(atom);
 
-                // For Rust `impl` blocks, descend into the body and lift
-                // every method to a first-class function atom.
+                // For Rust `impl` blocks, lift every method as a function atom.
                 if item_kind == "impl" {
                     let methods = extract_impl_methods(
                         &item_node,
@@ -229,17 +277,15 @@ impl CodeParser {
                             language: self.language,
                             imports: &imports,
                         },
-                        store,
+                        &mut atoms,
+                        &mut edges,
                     );
-                    atom_count += methods.len();
                     items.extend(methods);
                 }
             }
         }
 
         // ── Intra-file call edges ─────────────────────────────────────────────
-        // Only resolve bare-name calls intra-file; qualified calls are
-        // intentionally cross-module and handled by [`crate::resolve`].
         for (caller_id, call_names) in items {
             for callee_name in call_names {
                 if callee_name.contains("::") {
@@ -248,7 +294,7 @@ impl CodeParser {
                 if let Some(callee_id) = name_to_id.get(&callee_name)
                     && *callee_id != caller_id
                 {
-                    store.add_edge(Edge::new(
+                    edges.push(Edge::new(
                         caller_id.clone(),
                         callee_id.clone(),
                         EdgeKind::Calls,
@@ -257,7 +303,19 @@ impl CodeParser {
             }
         }
 
-        Ok(atom_count)
+        Ok(ParseUnit { atoms, edges })
+    }
+
+    /// Parse and write the result into `store`. Backward-compatible wrapper
+    /// over [`Self::parse`]; existing callers see no behaviour change.
+    ///
+    /// # Errors
+    /// Forwards errors from [`Self::parse`].
+    pub fn parse_into(&self, content: &[u8], file_path: &str, store: &Store) -> Result<usize> {
+        let unit = self.parse(content, file_path)?;
+        let count = unit.atom_count();
+        unit.apply_to(store);
+        Ok(count)
     }
 }
 
@@ -369,7 +427,8 @@ struct ImplCtx<'a> {
 fn extract_impl_methods(
     impl_node: &Node,
     ctx: &ImplCtx,
-    store: &Store,
+    out_atoms: &mut Vec<CodeAtom>,
+    out_edges: &mut Vec<Edge>,
 ) -> Vec<(EntityId, Vec<String>)> {
     let ImplCtx {
         impl_atom_id,
@@ -440,7 +499,7 @@ fn extract_impl_methods(
     let owner_prefix = format!("{impl_owner_name}::");
     let mut out: Vec<(EntityId, Vec<String>)> = Vec::with_capacity(pending.len());
     for (method_id, atom, call_names) in pending {
-        store.add_edge(Edge::new(
+        out_edges.push(Edge::new(
             impl_atom_id.clone(),
             method_id.clone(),
             EdgeKind::Contains,
@@ -461,14 +520,14 @@ fn extract_impl_methods(
             if let Some(target_id) = method_id_by_name.get(target_name)
                 && *target_id != method_id
             {
-                store.add_edge(Edge::new(
+                out_edges.push(Edge::new(
                     method_id.clone(),
                     target_id.clone(),
                     EdgeKind::Calls,
                 ));
             }
         }
-        store.add_atom(atom);
+        out_atoms.push(atom);
         out.push((method_id, call_names));
     }
 

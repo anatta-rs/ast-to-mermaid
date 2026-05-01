@@ -314,6 +314,7 @@ fn build_index(entities: &[EntityArtifact], source_root: &str, generated_at: &st
                 "kind": e.kind.as_str(),
                 "name": e.meta.get("name").and_then(|v| v.as_str()).unwrap_or(""),
                 "file": e.meta.get("file").and_then(|v| v.as_str()).unwrap_or(""),
+                "content_hash": e.meta.get("content_hash").and_then(|v| v.as_str()).unwrap_or(""),
                 "mmd_path": format!("entities/{base}.mmd"),
                 "meta_path": format!("entities/{base}.meta.json"),
                 "edges": {
@@ -325,6 +326,7 @@ fn build_index(entities: &[EntityArtifact], source_root: &str, generated_at: &st
         .collect();
 
     json!({
+        "schema": 2,
         "entities": entity_list,
         "generated_at": generated_at,
         "source_root": source_root,

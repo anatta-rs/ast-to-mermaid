@@ -16,6 +16,9 @@ const MERMAID_RESERVED: &[&str] = &[
     "linkStyle",
     "style",
     "default",
+    "interpolate",
+    "accTitle",
+    "accDescr",
 ];
 
 /// Sanitize a name so it can be used as a Mermaid node ID.
@@ -118,9 +121,23 @@ mod tests {
         assert_eq!(mermaid_id("subgraph"), "n_subgraph");
         assert_eq!(mermaid_id("end"), "n_end");
         assert_eq!(mermaid_id("flowchart"), "n_flowchart");
+        assert_eq!(mermaid_id("classDef"), "n_classDef");
+        assert_eq!(mermaid_id("style"), "n_style");
+        assert_eq!(mermaid_id("click"), "n_click");
         // Sanitized-but-not-equal-to-reserved still needs no escape.
         assert_eq!(mermaid_id("graph!"), "graph_");
         assert_eq!(mermaid_id("graphical"), "graphical");
+    }
+
+    #[test]
+    fn mermaid_id_does_not_escape_substring_matches() {
+        // Only exact reserved-word matches get the prefix; substrings are fine.
+        assert_eq!(mermaid_id("graphics"), "graphics");
+        assert_eq!(mermaid_id("subgraph_inner"), "subgraph_inner");
+        assert_eq!(mermaid_id("my_graph"), "my_graph");
+        assert_eq!(mermaid_id("ending"), "ending");
+        // Case-sensitive: `Graph` is not in the reserved list.
+        assert_eq!(mermaid_id("Graph"), "Graph");
     }
 
     #[test]

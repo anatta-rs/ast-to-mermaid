@@ -124,7 +124,8 @@ pub struct CodeAtom {
     pub doc: String,
     /// Declaration signature (e.g. `pub fn foo(x: u32) -> bool`).
     pub signature: String,
-    /// SHA-256 hex hash of the atom's source text.
+    /// Git blob SHA-1 hex hash of the atom's source text (`SHA1("blob N\0" + content)`).
+    /// Same value as `git hash-object` on the enclosing source slice.
     pub content_hash: String,
     /// Names of functions this atom calls (for cross-module resolution).
     pub calls: Vec<String>,
