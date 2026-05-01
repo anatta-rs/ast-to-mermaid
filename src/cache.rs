@@ -21,8 +21,26 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use serde::{Deserialize, Serialize};
+
 use crate::error::{AstToMermaidError, Result};
 use crate::model::CodeAtom;
+
+/// Magic bytes for `<sha>.cbor` blob files. Detects garbage on read.
+const BLOB_MAGIC: u32 = 0xa2_a2_b1_0b;
+
+/// Schema version embedded in each blob envelope. Bump when the layout
+/// of `BlobEnvelope` changes; mismatched files are treated as cache miss.
+const BLOB_ENVELOPE_VERSION: u32 = 1;
+
+/// On-disk envelope wrapping cached atoms. Mismatched magic or version on
+/// read returns `None` from `get_atoms` (treated as cache miss).
+#[derive(Serialize, Deserialize)]
+struct BlobEnvelope {
+    magic: u32,
+    version: u32,
+    atoms: Vec<CodeAtom>,
+}
 
 /// Cache schema version. Bump when the on-disk layout changes incompatibly.
 const SCHEMA_VERSION: u32 = 1;
@@ -116,24 +134,36 @@ impl Cache {
 
     /// Read cached atoms for a blob, if present and parseable.
     ///
-    /// Returns `None` on any miss (file absent or deserialize failure) — the
-    /// caller re-parses on miss; corrupt entries don't escalate to errors.
+    /// Returns `None` on any miss (file absent, deserialize failure, or
+    /// magic/version mismatch) — the caller re-parses on miss; corrupt or
+    /// stale-format entries don't escalate to errors.
     #[must_use]
     pub fn get_atoms(&self, blob_sha: &str) -> Option<Vec<CodeAtom>> {
         let path = self.blob_path(blob_sha);
         let bytes = fs::read(&path).ok()?;
-        ciborium::de::from_reader(&bytes[..]).ok()
+        let env: BlobEnvelope = ciborium::de::from_reader(&bytes[..]).ok()?;
+        if env.magic != BLOB_MAGIC || env.version != BLOB_ENVELOPE_VERSION {
+            return None;
+        }
+        Some(env.atoms)
     }
 
-    /// Write atoms for a blob to the cache.
+    /// Write atoms for a blob to the cache. Uses write-tmp + atomic rename
+    /// so concurrent runs cannot observe a partially-written file.
     ///
     /// # Errors
     /// CBOR serialization failures or filesystem write errors.
     pub fn put_atoms(&self, blob_sha: &str, atoms: &[CodeAtom]) -> Result<()> {
+        let env = BlobEnvelope {
+            magic: BLOB_MAGIC,
+            version: BLOB_ENVELOPE_VERSION,
+            atoms: atoms.to_vec(),
+        };
         let mut buf = Vec::new();
-        ciborium::ser::into_writer(atoms, &mut buf)
+        ciborium::ser::into_writer(&env, &mut buf)
             .map_err(|e| AstToMermaidError::InvalidInput(format!("cbor serialize: {e}")))?;
-        fs::write(self.blob_path(blob_sha), buf)?;
+        let final_path = self.blob_path(blob_sha);
+        atomic_write(&final_path, &buf)?;
         Ok(())
     }
 
@@ -261,6 +291,40 @@ struct GcEntry {
 enum GcKind {
     Blob,
     Bundle,
+}
+
+/// Write `bytes` to `path` atomically: a temp sibling is written and
+/// `rename`'d into place. Concurrent readers either see the old content
+/// or the new content — never partial bytes.
+///
+/// # Errors
+/// Propagates I/O errors. If `rename` fails, the temp file is left on
+/// disk for diagnosis (caller can retry or `gc`).
+pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
+    let parent = path.parent().ok_or_else(|| {
+        AstToMermaidError::InvalidInput(format!("atomic_write: path has no parent: {}", path.display()))
+    })?;
+    fs::create_dir_all(parent)?;
+    let pid = std::process::id();
+    let stem = path.file_name().and_then(|s| s.to_str()).unwrap_or("file");
+    let tmp = parent.join(format!(".{stem}.tmp.{pid}"));
+    fs::write(&tmp, bytes)?;
+    fs::rename(&tmp, path)?;
+    Ok(())
+}
+
+/// Atomically rename `from` (existing dir or file) to `to`. Replaces any
+/// existing file at `to`; for directories, requires `to` to not exist
+/// (Unix `rename` semantics over a non-empty target are platform-defined).
+///
+/// # Errors
+/// Propagates I/O errors.
+pub fn atomic_rename(from: &Path, to: &Path) -> Result<()> {
+    if let Some(parent) = to.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::rename(from, to)?;
+    Ok(())
 }
 
 fn collect_gc_entries(dir: &Path, kind: GcKind, out: &mut Vec<GcEntry>) -> Result<()> {
@@ -449,6 +513,67 @@ mod tests {
         assert_eq!(report.removed_count, 1);
         // File still on disk.
         assert!(cache.get_atoms("x").is_some());
+    }
+
+    #[test]
+    fn atomic_write_replaces_existing() {
+        let tmp = tempdir().unwrap();
+        let p = tmp.path().join("x");
+        atomic_write(&p, b"hello").unwrap();
+        atomic_write(&p, b"world").unwrap();
+        assert_eq!(fs::read(&p).unwrap(), b"world");
+    }
+
+    #[test]
+    fn atomic_write_leaves_no_tmp_on_success() {
+        let tmp = tempdir().unwrap();
+        let p = tmp.path().join("x");
+        atomic_write(&p, b"hello").unwrap();
+        let entries: Vec<_> = fs::read_dir(tmp.path()).unwrap().collect();
+        assert_eq!(entries.len(), 1, "tmp file leaked: {entries:?}");
+    }
+
+    #[test]
+    fn put_atoms_uses_atomic_rename() {
+        // Concurrent put_atoms calls on the same blob_sha must not see
+        // partial content. We can't easily test true concurrency here,
+        // but we can confirm the .tmp file doesn't linger.
+        let tmp = tempdir().unwrap();
+        let cache = Cache::open(tmp.path().join("c")).unwrap();
+        cache.put_atoms("ab", &[dummy_atom("code:y")]).unwrap();
+        let blobs_dir = cache.root().join("blobs");
+        let entries: Vec<_> = fs::read_dir(&blobs_dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        assert_eq!(entries, vec!["ab.cbor"], "no .tmp residue: {entries:?}");
+    }
+
+    #[test]
+    fn corrupt_blob_returns_none_from_get_atoms() {
+        let tmp = tempdir().unwrap();
+        let cache = Cache::open(tmp.path().join("c")).unwrap();
+        // Hand-write garbage with a valid filename.
+        let p = cache.root().join("blobs").join("corrupt.cbor");
+        fs::write(&p, b"not even cbor").unwrap();
+        assert!(cache.get_atoms("corrupt").is_none());
+    }
+
+    #[test]
+    fn version_mismatch_envelope_is_treated_as_miss() {
+        let tmp = tempdir().unwrap();
+        let cache = Cache::open(tmp.path().join("c")).unwrap();
+        // Hand-write a CBOR envelope with bogus version.
+        let env = BlobEnvelope {
+            magic: BLOB_MAGIC,
+            version: 9999,
+            atoms: vec![dummy_atom("code:y")],
+        };
+        let mut buf = Vec::new();
+        ciborium::ser::into_writer(&env, &mut buf).unwrap();
+        let p = cache.root().join("blobs").join("vmm.cbor");
+        fs::write(&p, buf).unwrap();
+        assert!(cache.get_atoms("vmm").is_none());
     }
 
     #[test]
