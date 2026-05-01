@@ -45,6 +45,10 @@ path = "src/bin/a2m-impact.rs"
 name = "a2m-walk"
 path = "src/bin/a2m-walk.rs"
 
+[[bin]]
+name = "a2m-bundle"
+path = "src/bin/a2m-bundle.rs"
+
 [lints.rust]
 unsafe_code = "deny"
 missing_docs = "warn"
