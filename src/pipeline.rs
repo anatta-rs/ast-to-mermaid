@@ -8,7 +8,7 @@ use crate::error::{AstToMermaidError, Result};
 use crate::graph::Store;
 use crate::parser::{CodeParser, Language};
 use crate::render::{Level, render};
-use crate::resolve::resolve_cross_module_calls;
+use crate::resolve::{resolve_cross_module_calls, resolve_implements_edges};
 use std::path::{Path, PathBuf};
 
 /// Options controlling [`analyze`].
@@ -88,7 +88,7 @@ pub fn analyze(root: &Path, opts: &AnalyzeOptions) -> Result<AnalyzeReport> {
         files_parsed += 1;
     }
 
-    let edges_resolved = resolve_cross_module_calls(&store);
+    let edges_resolved = resolve_cross_module_calls(&store) + resolve_implements_edges(&store);
     let mermaid = render(opts.level, &store, opts.target.as_deref())?;
 
     Ok(AnalyzeReport {
@@ -142,7 +142,7 @@ pub fn bundle(root: &Path, opts: &AnalyzeOptions) -> Result<(ArtifactSet, Analyz
         files_parsed += 1;
     }
 
-    let edges_resolved = resolve_cross_module_calls(&store);
+    let edges_resolved = resolve_cross_module_calls(&store) + resolve_implements_edges(&store);
 
     let source_root = root.to_string_lossy();
     let artifacts = emit_artifacts(&store, source_root.as_ref());
