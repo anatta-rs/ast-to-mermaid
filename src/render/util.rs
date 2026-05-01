@@ -1,15 +1,37 @@
 //! Mermaid rendering primitives shared by every level.
 
+/// Words Mermaid's flowchart grammar treats as reserved tokens; using one
+/// as a node identifier triggers a parse error like
+/// `Expecting ..., got 'GRAPH'`. We escape any clash by prefixing with
+/// `n_` so renaming is mechanical and reversible by inspection.
+const MERMAID_RESERVED: &[&str] = &[
+    "graph",
+    "subgraph",
+    "end",
+    "flowchart",
+    "direction",
+    "click",
+    "class",
+    "classDef",
+    "linkStyle",
+    "style",
+    "default",
+];
+
 /// Sanitize a name so it can be used as a Mermaid node ID.
 ///
 /// Mermaid IDs must be alphanumeric or `_`. Any other character is replaced
 /// with `_`. Empty input becomes a single `_` to keep IDs syntactically valid.
+/// Reserved Mermaid keywords (e.g. `graph`, `subgraph`, `end`) are prefixed
+/// with `n_` because using them as bare IDs makes the parser interpret the
+/// node line as a new diagram-type declaration.
 #[must_use]
 pub fn mermaid_id(name: &str) -> String {
     if name.is_empty() {
         return "_".to_owned();
     }
-    name.chars()
+    let sanitized: String = name
+        .chars()
         .map(|c| {
             if c.is_alphanumeric() || c == '_' {
                 c
@@ -17,7 +39,12 @@ pub fn mermaid_id(name: &str) -> String {
                 '_'
             }
         })
-        .collect()
+        .collect();
+    if MERMAID_RESERVED.contains(&sanitized.as_str()) {
+        format!("n_{sanitized}")
+    } else {
+        sanitized
+    }
 }
 
 /// Escape a string for safe inclusion in a Mermaid node label (the `[".."]`
@@ -81,6 +108,19 @@ mod tests {
         // is_alphanumeric is unicode-aware
         assert_eq!(mermaid_id("café"), "café");
         assert_eq!(mermaid_id("ε-greedy"), "ε_greedy");
+    }
+
+    #[test]
+    fn mermaid_id_escapes_reserved_keywords() {
+        // `graph` as an ID makes the Mermaid parser see a nested diagram
+        // declaration. Prefix with `n_` to keep it syntactically a node.
+        assert_eq!(mermaid_id("graph"), "n_graph");
+        assert_eq!(mermaid_id("subgraph"), "n_subgraph");
+        assert_eq!(mermaid_id("end"), "n_end");
+        assert_eq!(mermaid_id("flowchart"), "n_flowchart");
+        // Sanitized-but-not-equal-to-reserved still needs no escape.
+        assert_eq!(mermaid_id("graph!"), "graph_");
+        assert_eq!(mermaid_id("graphical"), "graphical");
     }
 
     #[test]
