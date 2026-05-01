@@ -159,23 +159,23 @@ ast-to-mermaid = "0.1"
 ```
 
 ```rust
-use ast_to_mermaid::pipeline::{analyze, bundle, AnalyzeOptions};
+use ast_to_mermaid::artifacts::write_artifacts;
+use ast_to_mermaid::pipeline::{AnalyzeOptions, analyze, bundle};
 use ast_to_mermaid::render::Level;
 use std::path::Path;
 
-// Render a single Mermaid string at a given level.
-let report = analyze(
-    Path::new("./my-repo"),
-    &AnalyzeOptions {
-        level: Level::Overview,
-        ..Default::default()
-    },
-)?;
-println!("{}", report.mermaid);
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Render a single Mermaid string at a given level.
+    let mut opts = AnalyzeOptions::default();
+    opts.level = Level::Overview;
+    let report = analyze(Path::new("./my-repo"), &opts)?;
+    println!("{}", report.mermaid);
 
-// Or build the full artifact bundle.
-let (artifacts, _report) = bundle(Path::new("./my-repo"), &AnalyzeOptions::default())?;
-ast_to_mermaid::artifacts::write_artifacts(&artifacts, Path::new("./.artifacts"))?;
+    // Or build the full artifact bundle.
+    let (artifacts, _report) = bundle(Path::new("./my-repo"), &AnalyzeOptions::default())?;
+    write_artifacts(&artifacts, Path::new("./.artifacts"))?;
+    Ok(())
+}
 ```
 
 Lower-level pieces are public for embedders that want to drive the pipeline by hand: `parser::CodeParser`, `graph::Store`, `resolve::resolve_cross_module_calls`, `render::render`.

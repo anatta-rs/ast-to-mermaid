@@ -1,7 +1,5 @@
-//! Self-contained domain model for ast-to-mermaid.
-//!
-//! All types here are owned by this crate — no polystore, no ingester-core
-//! leakage. The public surface matches what the renderers and pipeline need.
+//! Domain model: code atoms, edges, ids — the public types renderers and
+//! the pipeline consume.
 
 use serde::{Deserialize, Serialize};
 
@@ -35,6 +33,7 @@ impl std::fmt::Display for EntityId {
 
 /// Coarse-grained category of a code entity.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum AtomKind {
     /// A function or method.
     Function,
@@ -135,6 +134,7 @@ pub struct CodeAtom {
 
 /// What a directed edge means.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum EdgeKind {
     /// `from` calls `to`.
     Calls,

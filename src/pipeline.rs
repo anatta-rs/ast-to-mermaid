@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 
 /// Options controlling [`analyze`].
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct AnalyzeOptions {
     /// Mermaid view to render.
     pub level: Level,
@@ -37,6 +38,7 @@ impl Default for AnalyzeOptions {
 
 /// What [`analyze`] returns.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct AnalyzeReport {
     /// Rendered Mermaid source.
     pub mermaid: String,
@@ -168,9 +170,8 @@ pub fn walk_for_languages(root: &Path) -> Result<Vec<(PathBuf, Language)>> {
 }
 
 /// Same as [`walk_for_languages`] but skips any directory whose basename
-/// matches an entry in `extra_exclude`. The built-in skip set
-/// (`target`, `node_modules`, `.git`, any dotfile dir) is always applied
-/// on top.
+/// matches an entry in `extra_exclude`. See [`DEFAULT_EXCLUDED_DIRS`] for
+/// the built-in skip set; it is always applied on top.
 ///
 /// # Errors
 ///
@@ -181,38 +182,81 @@ pub fn walk_for_languages_with_exclude<S: AsRef<str>>(
 ) -> Result<Vec<(PathBuf, Language)>> {
     let extra: Vec<&str> = extra_exclude.iter().map(AsRef::as_ref).collect();
     let mut out = Vec::new();
-    walk_into(root, &extra, &mut out)?;
+    let mut visited: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+    walk_into(root, &extra, &mut out, &mut visited)?;
     out.sort_by(|a, b| a.0.cmp(&b.0));
     Ok(out)
 }
 
+/// Directory basenames the walker skips by default — output dirs and
+/// virtual-env / cache dirs that almost never contain source you want
+/// indexed.
+///
+/// Rust: `target`. JavaScript: `node_modules`. Python: `__pycache__`,
+/// `venv`. Generic: `.git`, `dist`, `build`, `vendor`. Any directory whose
+/// name starts with `.` is also skipped (covers `.venv`, `.tox`,
+/// `.pytest_cache`, `.mypy_cache`, `.ruff_cache`, `.idea`, `.vscode`, etc.).
+pub const DEFAULT_EXCLUDED_DIRS: &[&str] = &[
+    "target",
+    "node_modules",
+    ".git",
+    "__pycache__",
+    "venv",
+    "dist",
+    "build",
+    "vendor",
+];
+
 fn is_excluded(name: &str, extra_exclude: &[&str]) -> bool {
-    matches!(name, "target" | "node_modules" | ".git")
-        || name.starts_with('.')
-        || extra_exclude.contains(&name)
+    DEFAULT_EXCLUDED_DIRS.contains(&name) || name.starts_with('.') || extra_exclude.contains(&name)
 }
 
-fn walk_into(dir: &Path, extra_exclude: &[&str], out: &mut Vec<(PathBuf, Language)>) -> Result<()> {
-    if dir.is_file() {
+fn walk_into(
+    dir: &Path,
+    extra_exclude: &[&str],
+    out: &mut Vec<(PathBuf, Language)>,
+    visited: &mut std::collections::HashSet<PathBuf>,
+) -> Result<()> {
+    // Use symlink_metadata so we don't follow links — symlink loops would
+    // otherwise blow the stack on real-world repos (vendored crates,
+    // recursive node_modules links, etc.).
+    let Ok(meta) = std::fs::symlink_metadata(dir) else {
+        return Ok(());
+    };
+    if meta.file_type().is_symlink() {
+        return Ok(());
+    }
+    if meta.is_file() {
         if let Some(lang) = language_for(dir) {
             out.push((dir.to_path_buf(), lang));
         }
         return Ok(());
     }
-    if !dir.is_dir() {
+    if !meta.is_dir() {
+        return Ok(());
+    }
+    // Belt-and-braces: even with the symlink check above, a hardlink cycle
+    // (rare but possible) would still recurse. Track canonical paths.
+    if let Ok(canon) = dir.canonicalize()
+        && !visited.insert(canon)
+    {
         return Ok(());
     }
     let entries = std::fs::read_dir(dir)?;
     for entry in entries {
         let entry = entry?;
         let path = entry.path();
+        let file_type = entry.file_type()?;
+        if file_type.is_symlink() {
+            continue;
+        }
         let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-        if path.is_dir() {
+        if file_type.is_dir() {
             if is_excluded(name, extra_exclude) {
                 continue;
             }
-            walk_into(&path, extra_exclude, out)?;
-        } else if path.is_file()
+            walk_into(&path, extra_exclude, out, visited)?;
+        } else if file_type.is_file()
             && let Some(lang) = language_for(&path)
         {
             out.push((path, lang));
@@ -417,14 +461,16 @@ mod tests {
         let tmp = tempdir().expect("tmp");
         let root = tmp.path();
         write(root, "src/a.rs", "fn a() {}");
-        write(root, "vendor/junk.rs", "fn dont_parse() {}");
-        write(root, "workspaces/inner.rs", "fn dont_parse() {}");
+        // Use names that are NOT in DEFAULT_EXCLUDED_DIRS so the default
+        // walk picks them up; the explicit exclude must then drop them.
+        write(root, "workspaces/junk.rs", "fn dont_parse() {}");
+        write(root, "examples/inner.rs", "fn dont_parse() {}");
 
         let default = walk_for_languages(root).expect("walk");
         assert_eq!(default.len(), 3, "default should walk all 3");
 
         let filtered =
-            walk_for_languages_with_exclude(root, &["vendor", "workspaces"]).expect("walk");
+            walk_for_languages_with_exclude(root, &["workspaces", "examples"]).expect("walk");
         assert_eq!(filtered.len(), 1);
         assert!(filtered[0].0.to_string_lossy().ends_with("a.rs"));
     }
@@ -443,11 +489,49 @@ mod tests {
     }
 
     #[test]
+    fn walk_skips_default_excluded_dirs_for_each_ecosystem() {
+        let tmp = tempdir().expect("tmp");
+        let root = tmp.path();
+        // One real source file…
+        write(root, "src/main.rs", "fn main() {}");
+        // …plus a sample of every default-excluded dir.
+        for dir in [
+            "target",
+            "node_modules",
+            "__pycache__",
+            "venv",
+            "dist",
+            "build",
+            "vendor",
+        ] {
+            write(root, &format!("{dir}/junk.rs"), "fn nope() {}");
+        }
+        let files = walk_for_languages(root).expect("walk");
+        assert_eq!(files.len(), 1, "only src/main.rs should survive");
+        assert!(files[0].0.to_string_lossy().ends_with("main.rs"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn walk_does_not_follow_symlinks_or_recurse_loops() {
+        // A self-referential symlink inside the tree must not crash or hang.
+        let tmp = tempdir().expect("tmp");
+        let root = tmp.path();
+        write(root, "src/a.rs", "fn a() {}");
+        // Create `src/loop` → `src` (relative). Walking through this would
+        // infinite-loop without the symlink guard.
+        std::os::unix::fs::symlink(".", root.join("src/loop")).expect("symlink");
+        let files = walk_for_languages(root).expect("walk");
+        assert_eq!(files.len(), 1);
+        assert!(files[0].0.to_string_lossy().ends_with("a.rs"));
+    }
+
+    #[test]
     fn analyze_with_exclude_skips_directory() {
         let tmp = tempdir().expect("tmp");
         let root = tmp.path();
         write(root, "src/main.rs", "pub fn main() {}");
-        write(root, "vendor/lib.rs", "pub fn vendored() {}");
+        write(root, "examples/lib.rs", "pub fn example() {}");
 
         let report = analyze(root, &AnalyzeOptions::default()).expect("analyze");
         assert_eq!(report.files_parsed, 2);
@@ -455,7 +539,7 @@ mod tests {
         let report = analyze(
             root,
             &AnalyzeOptions {
-                exclude: vec!["vendor".to_owned()],
+                exclude: vec!["examples".to_owned()],
                 ..AnalyzeOptions::default()
             },
         )

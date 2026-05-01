@@ -136,21 +136,29 @@ pub fn write_artifacts(
 // ── Per-entity mermaid ────────────────────────────────────────────────────────
 
 fn entity_mmd(atom: &CodeAtom, outgoing: &[EntityId], incoming: &[EntityId]) -> String {
+    use crate::render::util::escape_label;
     use std::fmt::Write as FmtWrite;
+
+    // Single-line, comment-safe text for `%% ...` headers — no newlines,
+    // no leading `%` that would re-open a comment, just collapse them to
+    // spaces.
+    let one_line = |s: &str| -> String { s.replace(['\n', '\r'], " ").trim().to_owned() };
 
     let mut out = String::new();
     // Header comments.
-    writeln!(out, "%% id: {}", atom.id.as_str()).expect("write");
-    writeln!(out, "%% kind: {}", atom.kind).expect("write");
+    writeln!(out, "%% id: {}", one_line(atom.id.as_str())).expect("write");
+    writeln!(out, "%% kind: {}", one_line(&atom.kind)).expect("write");
     writeln!(
         out,
         "%% file: {}:{}-{}",
-        atom.file_path, atom.line_start, atom.line_end
+        one_line(&atom.file_path),
+        atom.line_start,
+        atom.line_end
     )
     .expect("write");
-    writeln!(out, "%% content_hash: {}", atom.content_hash).expect("write");
+    writeln!(out, "%% content_hash: {}", one_line(&atom.content_hash)).expect("write");
     if !atom.signature.is_empty() {
-        writeln!(out, "%% signature: {}", atom.signature).expect("write");
+        writeln!(out, "%% signature: {}", one_line(&atom.signature)).expect("write");
     }
 
     writeln!(out, "graph LR").expect("write");
@@ -168,7 +176,8 @@ fn entity_mmd(atom: &CodeAtom, outgoing: &[EntityId], incoming: &[EntityId]) -> 
     writeln!(out, "  classDef module fill:#f3e5f5,stroke:#4a148c").expect("write");
 
     let self_id = mermaid_id_short(atom.id.as_str());
-    writeln!(out, "  {self_id}:::{}[{}]", atom.kind, atom.name).expect("write");
+    let self_label = escape_label(&atom.name);
+    writeln!(out, "  {self_id}:::{}[{}]", atom.kind, self_label).expect("write");
 
     for callee_id in outgoing {
         let callee_name = callee_id
@@ -176,12 +185,9 @@ fn entity_mmd(atom: &CodeAtom, outgoing: &[EntityId], incoming: &[EntityId]) -> 
             .rsplit("::")
             .next()
             .unwrap_or(callee_id.as_str());
+        let label = escape_label(callee_name);
         let cid = mermaid_id_short(callee_id.as_str());
-        writeln!(
-            out,
-            "  {self_id} -- calls --> {cid}:::function[{callee_name}]"
-        )
-        .expect("write");
+        writeln!(out, "  {self_id} -- calls --> {cid}:::function[{label}]").expect("write");
     }
     for caller_id in incoming {
         let caller_name = caller_id
@@ -189,12 +195,9 @@ fn entity_mmd(atom: &CodeAtom, outgoing: &[EntityId], incoming: &[EntityId]) -> 
             .rsplit("::")
             .next()
             .unwrap_or(caller_id.as_str());
+        let label = escape_label(caller_name);
         let cid = mermaid_id_short(caller_id.as_str());
-        writeln!(
-            out,
-            "  {cid}:::function[{caller_name}] -- calls --> {self_id}"
-        )
-        .expect("write");
+        writeln!(out, "  {cid}:::function[{label}] -- calls --> {self_id}").expect("write");
     }
 
     out
@@ -329,25 +332,15 @@ pub fn sanitize_id(id: &str) -> String {
         .collect()
 }
 
-/// Returns an RFC 3339-ish timestamp. Falls back to a fixed string if the
+/// Returns an RFC 3339 UTC timestamp. Falls back to the Unix epoch if the
 /// system clock is unavailable (unusual but possible in sandboxes).
 fn chrono_now() -> String {
-    // Use std::time — no chrono dep. Format manually.
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs());
-    // Produce a minimal ISO-8601 string: YYYY-MM-DDTHH:MM:SSZ
-    let s = secs;
-    let sec = s % 60;
-    let min = (s / 60) % 60;
-    let hour = (s / 3_600) % 24;
-    let days = s / 86_400;
-    // Rough calendar computation (good enough for metadata).
-    let year = 1970 + days / 365;
-    let month = (days % 365) / 30 + 1;
-    let day = (days % 365) % 30 + 1;
-    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{min:02}:{sec:02}Z")
+    use time::OffsetDateTime;
+    use time::format_description::well_known::Rfc3339;
+
+    OffsetDateTime::now_utc()
+        .format(&Rfc3339)
+        .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_owned())
 }
 
 #[cfg(test)]
