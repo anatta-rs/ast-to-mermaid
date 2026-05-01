@@ -16,7 +16,8 @@
 #![deny(unsafe_code)]
 
 use ast_to_mermaid::cli_support::{
-    AnalyzeFlags, BundleFlags, ExitCode, WalkFlags, run_analyze, run_bundle, run_walk,
+    AnalyzeFlags, BundleFlags, ExitCode, IndexFlags, WalkFlags, run_analyze, run_bundle,
+    run_index, run_walk,
 };
 use ast_to_mermaid::render::Level;
 use clap::{Parser, Subcommand};
@@ -48,6 +49,10 @@ enum Command {
     Walk(WalkFlags),
     /// Produce the 4-layer artifact bundle for a project.
     Bundle(BundleFlags),
+    /// Materialize a bundle for a git ref (or the working tree) into the
+    /// `.a2m/cache/refs/<sha>/` cache. Idempotent — cached re-runs are
+    /// no-ops unless `--force` is set.
+    Index(IndexFlags),
 }
 
 fn main() -> std::process::ExitCode {
@@ -60,6 +65,7 @@ fn main() -> std::process::ExitCode {
         Command::Impact(f) => run_analyze(Level::Impact, &f),
         Command::Walk(f) => run_walk(&f),
         Command::Bundle(f) => run_bundle(&f),
+        Command::Index(f) => run_index(&f),
     };
     code.into()
 }

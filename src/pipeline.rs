@@ -7,7 +7,7 @@ use crate::artifacts::{ArtifactSet, emit_artifacts};
 use crate::error::{AstToMermaidError, Result};
 use crate::git_source;
 use crate::graph::Store;
-use crate::parser::{CodeParser, Language};
+use crate::parser::{CodeParser, Language, git_blob_sha1};
 use crate::render::{Level, render};
 use crate::resolve::resolve_cross_module_calls;
 use std::path::{Path, PathBuf};
@@ -307,6 +307,39 @@ fn language_for(path: &Path) -> Option<Language> {
         Some("py") => Some(Language::Python),
         _ => None,
     }
+}
+
+/// Resolve `<root>` to a snapshot id used as the cache bundle key.
+///
+/// - If `git_ref` is `Some`, returns the commit SHA from `git rev-parse`.
+/// - If `git_ref` is `None`, walks the working tree and returns
+///   `wt-<digest>` where `<digest>` is the first 16 hex chars of
+///   `SHA1(<path>:<blob_sha>\0…)` over all source files sorted by path.
+///   Deterministic — a clean working tree always hashes the same.
+///
+/// # Errors
+/// I/O errors from the FS walk, or git errors from `rev-parse`.
+pub fn snapshot_id(root: &Path, git_ref: Option<&str>) -> Result<String> {
+    if let Some(r) = git_ref {
+        return git_source::rev_parse(root, r);
+    }
+    let files = walk_for_languages_with_exclude::<&str>(root, &[])?;
+    let mut pairs: Vec<(String, String)> = Vec::with_capacity(files.len());
+    for (file, _lang) in files {
+        let content = std::fs::read(&file)?;
+        let blob = git_blob_sha1(&content);
+        let display = display_path(root, &file);
+        pairs.push((display, blob));
+    }
+    pairs.sort();
+    let mut hasher = sha1_smol::Sha1::new();
+    for (p, b) in pairs {
+        hasher.update(p.as_bytes());
+        hasher.update(b":");
+        hasher.update(b.as_bytes());
+        hasher.update(b"\0");
+    }
+    Ok(format!("wt-{}", &hasher.digest().to_string()[..16]))
 }
 
 /// Render an absolute path as relative-to-root for tidier IDs.
