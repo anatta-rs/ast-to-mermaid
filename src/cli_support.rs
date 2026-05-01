@@ -423,10 +423,13 @@ pub fn run_diff(flags: &DiffFlags) -> ExitCode {
         }
     };
 
+    // Clone the post-state entities so the renderer can walk their edges
+    // (compute_diff consumes its inputs to build the lookup HashMap).
+    let to_for_render = to_entities.clone();
     let result = compute_diff(ref_a, ref_b, &from_sha, &to_sha, from_entities, to_entities);
 
     match flags.format {
-        DiffFormat::Mermaid => print!("{}", render_mermaid(&result)),
+        DiffFormat::Mermaid => print!("{}", render_mermaid(&result, &to_for_render)),
         DiffFormat::Json => match serde_json::to_string_pretty(&result) {
             Ok(s) => println!("{s}"),
             Err(e) => {

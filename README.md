@@ -85,7 +85,7 @@ Five zoom levels, one tool — `a2m overview` and `a2m function` aren't shown ab
 
 ### Diff: `a2m diff <ref-a>..<ref-b>`
 
-Set-diff between two cached bundles, with each entity coloured by change kind. Auto-runs `a2m index` for any ref that isn't already cached:
+Set-diff between two cached bundles, coloured by change kind, with **edges drawn between changed entities** so you see the blast radius — not just *what* changed but *how the changes wire together*:
 
 ```mermaid
 graph TD
@@ -99,9 +99,13 @@ graph TD
     n2["pipeline.rs::function::analyze"]:::modified
     n3["parser/mod.rs::function::hex_sha256"]:::removed
     n4["parser/util.rs::function::camel_case ↪ to_camel"]:::renamed
+    n1 --> n0
+    n2 --> n0
 ```
 
-`--format json` returns a structured `BundleDiff` with `added` / `removed` / `modified` / `renamed` arrays for downstream tooling. The rename heuristic pairs (removed, added) entries with identical `content_hash`.
+Reading this in two seconds: a new `Cache` struct, a new `run_index` handler that uses it, the existing `analyze` was modified to also use it, the old `hex_sha256` was removed, and a util got renamed. The arrows are only drawn between entities **both** in the changeset — that's what keeps the diagram dense with signal instead of noise.
+
+`--format json` returns a structured `BundleDiff` with `added` / `removed` / `modified` / `renamed` arrays for downstream tooling. The rename heuristic pairs (removed, added) entries with identical `content_hash`. Auto-runs `a2m index` for any ref that isn't already cached.
 
 ## Install
 
@@ -345,7 +349,7 @@ The pattern scales: on rust-analyzer (1 464 files / 570 k LOC) the warm parse-ph
 
 ### `a2m diff 0ee4cae..0ddc266` — the atomic-write commit
 
-Real diff between two commits on the branch that built this README. The atomic-write commit added the `atomic_write` / `atomic_rename` helpers, the `BlobEnvelope` magic + version, and the `write_bundle_atomic` CLI helper, then modified the `Cache::put_atoms` impl and the index plumbing to use them:
+Real diff between two commits on the branch that built this README. The atomic-write commit added the `atomic_write` / `atomic_rename` helpers and the `write_bundle_atomic` CLI helper, then modified `ensure_indexed` and `run_index` to call into them:
 
 ```mermaid
 graph TD
@@ -365,9 +369,13 @@ graph TD
     n8["cli_support.rs"]:::modified
     n9["cli_support.rs::function::ensure_indexed"]:::modified
     n10["cli_support.rs::function::run_index"]:::modified
+    %% blast-radius edges (both endpoints in changeset)
+    n9 --> n5
+    n10 --> n5
+    n5 --> n2
 ```
 
-`+6 -0 ~5 ↪0` — six added, five modified, no removals or renames. Exactly what you'd expect from a non-breaking feature commit.
+The arrows tell the story directly: the two **modified** functions (orange) both gained calls into the new `write_bundle_atomic` helper (green), which in turn calls the new `atomic_rename` helper (green). Without the edges, the same diff is just a colour-coded list — useful but mute. With them, you see why the modifications happened. `+6 -0 ~5 ↪0`.
 
 ### `a2m diff v0.1.0..HEAD` — the entire git-aware journey
 

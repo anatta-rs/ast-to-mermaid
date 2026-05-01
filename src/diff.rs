@@ -35,13 +35,62 @@ pub struct IndexEntity {
     /// May be empty in legacy schema-1 bundles.
     #[serde(default)]
     pub content_hash: String,
+    /// Outgoing edges (callees / contained / used). Used by the diff
+    /// renderer to draw blast-radius arrows between changed entities.
+    #[serde(default, deserialize_with = "deserialize_out_edges")]
+    pub edges_out: Vec<String>,
 }
 
-/// Top-level structure of a bundle's `index.json`.
+/// Pull the `edges.out` array out of the nested `edges` object that
+/// `index.json` actually serializes. We accept both shapes so the diff
+/// loader is forward-compatible if the schema flattens later.
+fn deserialize_out_edges<'de, D>(d: D) -> std::result::Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Vec::<String>::deserialize(d)
+}
+
+/// Top-level structure of a bundle's `index.json`. Mirrors the nested
+/// `entities[].edges.{out,in}` shape that `build_index` emits.
 #[derive(Debug, Clone, Deserialize)]
 struct IndexFile {
     #[serde(default)]
-    entities: Vec<IndexEntity>,
+    entities: Vec<RawEntity>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct RawEntity {
+    id: String,
+    #[serde(default)]
+    kind: String,
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    file: String,
+    #[serde(default)]
+    content_hash: String,
+    #[serde(default)]
+    edges: RawEdges,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct RawEdges {
+    #[serde(default)]
+    out: Vec<String>,
+}
+
+impl From<RawEntity> for IndexEntity {
+    fn from(r: RawEntity) -> Self {
+        Self {
+            id: r.id,
+            kind: r.kind,
+            name: r.name,
+            file: r.file,
+            content_hash: r.content_hash,
+            edges_out: r.edges.out,
+        }
+    }
 }
 
 /// Structural difference between two bundles.
@@ -91,8 +140,8 @@ pub struct RenamedEntity {
     pub content_hash: String,
 }
 
-/// Implement `Serialize` for `IndexEntity` so it round-trips through the
-/// JSON output format the same way the bundle index emits it.
+/// Implement `Serialize` for `IndexEntity` so the JSON `a2m diff` output
+/// matches the on-disk `index.json` shape (edges nested under `edges.out`).
 impl Serialize for IndexEntity {
     fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
     where
@@ -125,7 +174,7 @@ pub fn load_bundle_entities(bundle_dir: &Path) -> Result<Vec<IndexEntity>> {
     let file: IndexFile = serde_json::from_slice(&bytes).map_err(|e| {
         AstToMermaidError::InvalidInput(format!("parse index.json {}: {e}", index_path.display()))
     })?;
-    Ok(file.entities)
+    Ok(file.entities.into_iter().map(IndexEntity::from).collect())
 }
 
 /// Compute the set-diff between two bundles.
@@ -236,13 +285,19 @@ pub fn compute_diff(
 
 /// Render a [`BundleDiff`] as an annotated Mermaid graph.
 ///
-/// Uses `:::added`, `:::removed`, `:::modified`, and `:::renamed` classDefs
-/// to colour each entity by change kind. Renamed entities are rendered as
-/// a single node with both ids in the label, joined by `↪`.
+/// Each entity is coloured by change kind (`:::added` green, `:::removed`
+/// red, `:::modified` orange, `:::renamed` cyan), and **edges are drawn
+/// between changed entities** when both endpoints are in the diff. This
+/// turns a flat list into a blast-radius graph: you can see at a glance
+/// which new/modified function calls into which other change.
+///
+/// `from_entities` carries the post-state edges used to build the graph
+/// (the `to` side's `edges_out`). Pass an empty slice for a node-only
+/// rendering.
 #[must_use]
-pub fn render_mermaid(diff: &BundleDiff) -> String {
+pub fn render_mermaid(diff: &BundleDiff, to_entities: &[IndexEntity]) -> String {
     use std::fmt::Write as _;
-    let mut out = String::with_capacity(1024);
+    let mut out = String::with_capacity(2048);
     writeln!(out, "graph TD").ok();
     writeln!(out, "    %% diff: {} → {}", diff.from, diff.to).ok();
     // Color convention: added=green, removed=red, modified=orange, renamed=cyan.
@@ -253,38 +308,67 @@ pub fn render_mermaid(diff: &BundleDiff) -> String {
     writeln!(out, "    classDef modified fill:#fb8,stroke:#d60,color:#000").ok();
     writeln!(out, "    classDef renamed fill:#9ff,stroke:#0aa,color:#000").ok();
 
-    // Keep a counter so node ids are short and Mermaid-safe.
-    let mut idx = 0usize;
-    let mut emit = |out: &mut String, label: &str, class: &str| {
-        let n = format!("n{idx}");
-        idx += 1;
+    // Two passes: emit nodes (assigning short Mermaid-safe ids), then
+    // emit edges between nodes whose endpoints are both in `id_to_node`.
+    let mut id_to_node: HashMap<String, String> = HashMap::new();
+    let mut next_idx = 0usize;
+    let new_node = |out: &mut String,
+                        id_to_node: &mut HashMap<String, String>,
+                        idx: &mut usize,
+                        entity_id: &str,
+                        label: &str,
+                        class: &str| {
+        let n = format!("n{}", *idx);
+        *idx += 1;
         let safe = label.replace('"', "'");
         writeln!(out, "    {n}[\"{safe}\"]:::{class}").ok();
+        id_to_node.insert(entity_id.to_owned(), n);
     };
 
     if !diff.added.is_empty() {
         writeln!(out, "    %% added ({})", diff.added.len()).ok();
         for e in &diff.added {
-            emit(&mut out, &e.id, "added");
+            new_node(&mut out, &mut id_to_node, &mut next_idx, &e.id, &e.id, "added");
         }
     }
     if !diff.removed.is_empty() {
         writeln!(out, "    %% removed ({})", diff.removed.len()).ok();
         for e in &diff.removed {
-            emit(&mut out, &e.id, "removed");
+            new_node(&mut out, &mut id_to_node, &mut next_idx, &e.id, &e.id, "removed");
         }
     }
     if !diff.modified.is_empty() {
         writeln!(out, "    %% modified ({})", diff.modified.len()).ok();
         for e in &diff.modified {
-            emit(&mut out, &e.id, "modified");
+            new_node(&mut out, &mut id_to_node, &mut next_idx, &e.id, &e.id, "modified");
         }
     }
     if !diff.renamed.is_empty() {
         writeln!(out, "    %% renamed ({})", diff.renamed.len()).ok();
         for r in &diff.renamed {
             let label = format!("{} ↪ {}", r.from_id, r.to_id);
-            emit(&mut out, &label, "renamed");
+            // The post-state id is `to_id`; that's what edges from `to_entities` reference.
+            new_node(&mut out, &mut id_to_node, &mut next_idx, &r.to_id, &label, "renamed");
+        }
+    }
+
+    // Edges: only render those where both endpoints are in the changeset.
+    // Source = post-state `edges_out` (so removed entities never source
+    // edges; their out-neighbours are visible only via post-state arrows
+    // from modified callers, which is the right blast-radius signal).
+    let mut edge_count = 0usize;
+    for e in to_entities {
+        let Some(src_node) = id_to_node.get(&e.id) else {
+            continue;
+        };
+        for callee_id in &e.edges_out {
+            if let Some(dst_node) = id_to_node.get(callee_id) {
+                if edge_count == 0 {
+                    writeln!(out, "    %% blast-radius edges (both endpoints in changeset)").ok();
+                }
+                writeln!(out, "    {src_node} --> {dst_node}").ok();
+                edge_count += 1;
+            }
         }
     }
 
@@ -302,6 +386,18 @@ mod tests {
             name: id.split("::").last().unwrap_or("").to_owned(),
             file: "src/x.rs".to_owned(),
             content_hash: hash.to_owned(),
+            edges_out: Vec::new(),
+        }
+    }
+
+    fn ent_with_calls(id: &str, hash: &str, calls: &[&str]) -> IndexEntity {
+        IndexEntity {
+            id: id.to_owned(),
+            kind: "function".to_owned(),
+            name: id.split("::").last().unwrap_or("").to_owned(),
+            file: "src/x.rs".to_owned(),
+            content_hash: hash.to_owned(),
+            edges_out: calls.iter().map(|s| (*s).to_owned()).collect(),
         }
     }
 
@@ -365,11 +461,57 @@ mod tests {
     fn render_mermaid_emits_classdef_lines() {
         let from = vec![ent("code:a", "h1")];
         let to = vec![ent("code:a", "h1"), ent("code:b", "h2")];
-        let d = compute_diff("main", "feat", "sa", "sb", from, to);
-        let m = render_mermaid(&d);
+        let d = compute_diff("main", "feat", "sa", "sb", from.clone(), to.clone());
+        let m = render_mermaid(&d, &to);
         assert!(m.starts_with("graph TD"));
         assert!(m.contains("classDef added"));
         assert!(m.contains("code:b"));
         assert!(m.contains(":::added"));
+    }
+
+    #[test]
+    fn render_mermaid_draws_edges_between_changed_entities() {
+        // A new fn `new_caller` calls a modified `existing_helper`. Both are
+        // in the diff → expect an arrow from new_caller to existing_helper.
+        let from = vec![
+            ent_with_calls("code:helper", "h_old", &[]),
+            ent_with_calls("code:other", "h2", &["code:helper"]),
+        ];
+        let to = vec![
+            ent_with_calls("code:helper", "h_new", &[]), // modified (hash change)
+            ent_with_calls("code:other", "h2", &["code:helper"]),
+            ent_with_calls("code:new_caller", "h3", &["code:helper"]), // added, calls helper
+        ];
+        let d = compute_diff("a", "b", "sa", "sb", from, to.clone());
+        let m = render_mermaid(&d, &to);
+        // Two changed nodes: new_caller (added) + helper (modified). other is unchanged.
+        assert!(m.contains(":::added"));
+        assert!(m.contains(":::modified"));
+        // The blast-radius edge: new_caller → helper, both colored, so we
+        // expect at least one arrow line in the output.
+        assert!(
+            m.contains("blast-radius edges"),
+            "expected blast-radius header, got:\n{m}"
+        );
+        let arrow_count = m.matches(" --> ").count();
+        assert_eq!(arrow_count, 1, "expected 1 blast-radius edge, got: {arrow_count}\n{m}");
+    }
+
+    #[test]
+    fn render_mermaid_omits_edges_when_endpoint_unchanged() {
+        // `existing_caller` (unchanged) calls `helper` (modified). The caller
+        // is not in the diff → its edge should NOT be drawn.
+        let from = vec![
+            ent_with_calls("code:caller", "h1", &["code:helper"]),
+            ent_with_calls("code:helper", "h_old", &[]),
+        ];
+        let to = vec![
+            ent_with_calls("code:caller", "h1", &["code:helper"]),
+            ent_with_calls("code:helper", "h_new", &[]),
+        ];
+        let d = compute_diff("a", "b", "sa", "sb", from, to.clone());
+        let m = render_mermaid(&d, &to);
+        // helper is modified; caller is unchanged. Only helper renders.
+        assert!(!m.contains(" --> "), "no edge expected, got:\n{m}");
     }
 }
