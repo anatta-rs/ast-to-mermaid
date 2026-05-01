@@ -1,11 +1,15 @@
 [package]
 name = "ast-to-mermaid"
-description = "Mermaid diagram renderer for code ASTs — 5 levels (project/overview/module/function/impact) with cross-language support"
+description = "Tree-sitter-based code-graph builder that emits Mermaid diagrams at five zoom levels (project / overview / module / function / impact) plus a JSON artifact bundle"
 version = "0.1.0"
 edition = "2024"
 authors = ["Anatta <noreply@anatta.dev>"]
 license = "Apache-2.0"
 repository = "https://github.com/anatta-rs/ast-to-mermaid"
+homepage = "https://github.com/anatta-rs/ast-to-mermaid"
+readme = "README.md"
+keywords = ["mermaid", "tree-sitter", "ast", "code-graph", "visualization"]
+categories = ["command-line-utilities", "visualization", "development-tools"]
 
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }
@@ -22,32 +26,8 @@ pretty_assertions = "1"
 tempfile = "3"
 
 [[bin]]
-name = "a2m-project"
-path = "src/bin/a2m-project.rs"
-
-[[bin]]
-name = "a2m-overview"
-path = "src/bin/a2m-overview.rs"
-
-[[bin]]
-name = "a2m-module"
-path = "src/bin/a2m-module.rs"
-
-[[bin]]
-name = "a2m-function"
-path = "src/bin/a2m-function.rs"
-
-[[bin]]
-name = "a2m-impact"
-path = "src/bin/a2m-impact.rs"
-
-[[bin]]
-name = "a2m-walk"
-path = "src/bin/a2m-walk.rs"
-
-[[bin]]
-name = "a2m-bundle"
-path = "src/bin/a2m-bundle.rs"
+name = "a2m"
+path = "src/bin/a2m.rs"
 
 [lints.rust]
 unsafe_code = "deny"

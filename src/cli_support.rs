@@ -1,11 +1,11 @@
-//! Shared CLI infrastructure for the `a2m-*` binary family.
+//! Shared CLI infrastructure for the unified `a2m` binary.
 //!
-//! Each Mermaid level (project / overview / module / function / impact)
-//! ships as its own binary so users can tab-complete a verb that maps
-//! directly to a level. This module carries the bits they all share:
-//! exit codes, arg shape, and the analyze-and-write helper.
+//! The crate ships one binary (`a2m`) with seven subcommands. Per-subcommand
+//! arg structs and dispatch helpers live here so the binary file itself stays
+//! a thin clap parser.
 
-use crate::pipeline::{AnalyzeOptions, analyze};
+use crate::artifacts::write_artifacts;
+use crate::pipeline::{AnalyzeOptions, analyze, bundle, walk_for_languages_with_exclude};
 use crate::render::Level;
 use std::path::PathBuf;
 use std::process;
@@ -31,7 +31,8 @@ impl From<ExitCode> for process::ExitCode {
     }
 }
 
-/// Shared CLI args for every `a2m-*` analyze binary.
+/// Shared CLI args for the analyze-flavoured subcommands
+/// (`project`, `overview`, `module`, `function`, `impact`).
 #[derive(Debug, Clone, clap::Args)]
 pub struct AnalyzeFlags {
     /// Path to a source root (file or directory).
@@ -107,6 +108,102 @@ pub fn run_analyze(level: Level, flags: &AnalyzeFlags) -> ExitCode {
     ExitCode::Success
 }
 
+/// CLI args for the `walk` subcommand.
+#[derive(Debug, Clone, clap::Args)]
+pub struct WalkFlags {
+    /// Path to a source root.
+    pub path: PathBuf,
+
+    /// Extra directory basenames to skip (comma-separated). Always combined
+    /// with the built-in skip set (`target`, `node_modules`, `.git`,
+    /// hidden dirs).
+    #[arg(short = 'x', long, default_value = "")]
+    pub exclude: String,
+}
+
+/// Run the file-walker subcommand: print one line per source file, format
+/// `<lang>\t<path>`, to stdout.
+pub fn run_walk(flags: &WalkFlags) -> ExitCode {
+    let exclude: Vec<String> = flags
+        .exclude
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .collect();
+
+    match walk_for_languages_with_exclude(&flags.path, &exclude) {
+        Ok(files) => {
+            for (path, lang) in files {
+                println!("{}\t{}", lang.name(), path.display());
+            }
+            ExitCode::Success
+        }
+        Err(e) => {
+            eprintln!("walk: {e}");
+            ExitCode::Failure
+        }
+    }
+}
+
+/// CLI args for the `bundle` subcommand.
+#[derive(Debug, Clone, clap::Args)]
+pub struct BundleFlags {
+    /// Path to a source root (file or directory).
+    pub path: PathBuf,
+
+    /// Output directory for the bundle (`overview.mmd`, `index.json`,
+    /// `entities/<id>.mmd`, `entities/<id>.meta.json`).
+    #[arg(short, long)]
+    pub out: PathBuf,
+
+    /// Extra directory basenames to skip (comma-separated). Always combined
+    /// with the built-in skip set.
+    #[arg(short = 'x', long, default_value = "")]
+    pub exclude: String,
+}
+
+/// Run the artifact-bundle subcommand: parse → resolve → emit a directory
+/// of per-entity Mermaid + metadata files plus a top-level `index.json`.
+pub fn run_bundle(flags: &BundleFlags) -> ExitCode {
+    let exclude: Vec<String> = flags
+        .exclude
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .collect();
+
+    let opts = AnalyzeOptions {
+        exclude,
+        ..AnalyzeOptions::default()
+    };
+
+    let (artifacts, report) = match bundle(&flags.path, &opts) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("bundle: {e}");
+            return ExitCode::Failure;
+        }
+    };
+
+    if let Err(e) = write_artifacts(&artifacts, &flags.out) {
+        eprintln!("bundle: write {}: {e}", flags.out.display());
+        return ExitCode::Failure;
+    }
+
+    eprintln!(
+        "bundled {} files, {} atoms, {} edges, {} entities → {}",
+        report.files_parsed,
+        report.atoms_indexed,
+        report.edges_resolved,
+        artifacts.entities.len(),
+        flags.out.display(),
+    );
+
+    ExitCode::Success
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -169,5 +266,51 @@ mod tests {
         };
         let code = run_analyze(Level::Project, &flags);
         assert_eq!(code, ExitCode::Success);
+    }
+
+    #[test]
+    fn walk_on_empty_dir_succeeds() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let flags = WalkFlags {
+            path: tmp.path().to_path_buf(),
+            exclude: String::new(),
+        };
+        assert_eq!(run_walk(&flags), ExitCode::Success);
+    }
+
+    #[test]
+    fn walk_with_missing_path_succeeds_silently() {
+        // walk_for_languages returns Ok(empty) for a missing path; the
+        // subcommand mirrors that to keep shell-pipeline composition simple.
+        let flags = WalkFlags {
+            path: PathBuf::from("/no/such/path/here-cli-test"),
+            exclude: String::new(),
+        };
+        assert_eq!(run_walk(&flags), ExitCode::Success);
+    }
+
+    #[test]
+    fn bundle_on_empty_dir_succeeds_and_writes_index() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let out = tmp.path().join("bundle-out");
+        let flags = BundleFlags {
+            path: tmp.path().to_path_buf(),
+            out: out.clone(),
+            exclude: String::new(),
+        };
+        assert_eq!(run_bundle(&flags), ExitCode::Success);
+        assert!(out.join("index.json").exists());
+        assert!(out.join("overview.mmd").exists());
+    }
+
+    #[test]
+    fn bundle_with_missing_path_returns_failure() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let flags = BundleFlags {
+            path: PathBuf::from("/no/such/path/here-cli-test"),
+            out: tmp.path().join("bundle-out"),
+            exclude: String::new(),
+        };
+        assert_eq!(run_bundle(&flags), ExitCode::Failure);
     }
 }
