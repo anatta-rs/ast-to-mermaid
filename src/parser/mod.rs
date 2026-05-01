@@ -171,14 +171,22 @@ impl CodeParser {
         store.add_atom(module_atom);
         let mut atom_count = 1;
 
-        // ── Item atoms ────────────────────────────────────────────────────────
+        // ── File-scope use imports (Rust only) ────────────────────────────────
         let root = tree.root_node();
+        let imports: HashMap<String, String> = if self.language == Language::Rust {
+            extract_use_imports(root, text)
+        } else {
+            HashMap::new()
+        };
+
+        // ── Item atoms ────────────────────────────────────────────────────────
         let mut cursor = root.walk();
         let mut name_to_id: HashMap<String, EntityId> = HashMap::new();
         let mut items: Vec<(EntityId, Vec<String>)> = Vec::new(); // (id, calls)
 
         for child in root.children(&mut cursor) {
-            let Some((atom, call_names)) = extract_item(&child, text, file_path, self.language)
+            let Some((atom, call_names)) =
+                extract_item(&child, text, file_path, self.language, &imports)
             else {
                 continue;
             };
@@ -197,8 +205,13 @@ impl CodeParser {
         }
 
         // ── Intra-file call edges ─────────────────────────────────────────────
+        // Only resolve bare-name calls intra-file; qualified calls are
+        // intentionally cross-module and handled by [`crate::resolve`].
         for (caller_id, call_names) in items {
             for callee_name in call_names {
+                if callee_name.contains("::") {
+                    continue;
+                }
                 if let Some(callee_id) = name_to_id.get(&callee_name)
                     && *callee_id != caller_id
                 {
@@ -225,6 +238,7 @@ fn extract_item(
     source: &str,
     file_path: &str,
     language: Language,
+    imports: &HashMap<String, String>,
 ) -> Option<(CodeAtom, Vec<String>)> {
     let ts_kind = node.kind();
     if !language.item_node_kinds().contains(&ts_kind) {
@@ -234,7 +248,7 @@ fn extract_item(
     // Python decorators — unwrap inner definition.
     if ts_kind == "decorated_definition" {
         let inner = node.child_by_field_name("definition")?;
-        return extract_item(&inner, source, file_path, language);
+        return extract_item(&inner, source, file_path, language, imports);
     }
 
     let atom_kind = language.map_node_kind(ts_kind)?;
@@ -264,7 +278,7 @@ fn extract_item(
 
     // Call names for functions.
     let call_names = if ts_kind == "function_item" || ts_kind == "function_definition" {
-        extract_calls(node, source)
+        extract_calls(node, source, imports)
     } else {
         Vec::new()
     };
@@ -307,19 +321,41 @@ fn extract_name(node: &Node, source: &str, ts_kind: &str) -> Option<String> {
 
 // ── Call extraction ───────────────────────────────────────────────────────────
 
-fn extract_calls(node: &Node, source: &str) -> Vec<String> {
+fn extract_calls(node: &Node, source: &str, imports: &HashMap<String, String>) -> Vec<String> {
     let mut calls: Vec<String> = Vec::new();
     let mut stack: Vec<Node> = vec![*node];
 
     while let Some(current) = stack.pop() {
         match current.kind() {
             "call_expression" => {
-                if let Some(func) = current.child_by_field_name("function")
-                    && let Ok(name) = func.utf8_text(source.as_bytes())
-                    && let Some(short) = name.rsplit("::").next()
-                    && !short.is_empty()
-                {
-                    calls.push(short.to_owned());
+                if let Some(func) = current.child_by_field_name("function") {
+                    match func.kind() {
+                        "identifier" => {
+                            if let Ok(name) = func.utf8_text(source.as_bytes())
+                                && !name.is_empty()
+                            {
+                                // Bare call: expand via use imports if available.
+                                let normalized = imports
+                                    .get(name)
+                                    .cloned()
+                                    .unwrap_or_else(|| name.to_owned());
+                                calls.push(normalized);
+                            }
+                        }
+                        "scoped_identifier" => {
+                            // Already qualified — keep the full path so the
+                            // resolver can disambiguate by module.
+                            if let Ok(name) = func.utf8_text(source.as_bytes())
+                                && !name.is_empty()
+                            {
+                                calls.push(name.to_owned());
+                            }
+                        }
+                        // Other shapes (field_expression for chained calls,
+                        // generic_function, etc.) are handled by the inner
+                        // call/method-call branches as we recurse.
+                        _ => {}
+                    }
                 }
             }
             "method_call_expression" | "field_expression" => {
@@ -354,6 +390,130 @@ fn extract_calls(node: &Node, source: &str) -> Vec<String> {
     let mut seen: HashSet<String> = HashSet::new();
     calls.retain(|c| seen.insert(c.clone()));
     calls
+}
+
+// ── Use-import extraction (Rust) ──────────────────────────────────────────────
+
+/// Build a file-scope map of `bare_name → fully_qualified_path` from every
+/// `use_declaration` at the file root. The qualified path mirrors the source
+/// (e.g. `use crate::render::render;` ⇒ `render → crate::render::render`).
+///
+/// Group forms (`use crate::foo::{a, b}`), aliases (`use foo as bar`), and
+/// nested paths are all unfolded. Wildcards (`use foo::*`) are ignored.
+fn extract_use_imports(root: Node, source: &str) -> HashMap<String, String> {
+    let mut out: HashMap<String, String> = HashMap::new();
+    let mut cursor = root.walk();
+    for child in root.children(&mut cursor) {
+        if child.kind() != "use_declaration" {
+            continue;
+        }
+        let mut sub = child.walk();
+        for inner in child.children(&mut sub) {
+            // Skip the `use` keyword and trailing `;`.
+            if matches!(inner.kind(), "use" | ";") {
+                continue;
+            }
+            collect_use_paths(inner, source, "", &mut out);
+        }
+    }
+    out
+}
+
+fn collect_use_paths(node: Node, source: &str, prefix: &str, out: &mut HashMap<String, String>) {
+    match node.kind() {
+        "scoped_identifier" => {
+            let text = node.utf8_text(source.as_bytes()).unwrap_or_default();
+            let Some(name) = text.rsplit("::").next().filter(|s| !s.is_empty()) else {
+                return;
+            };
+            let full = if prefix.is_empty() {
+                text.to_owned()
+            } else {
+                format!("{prefix}::{text}")
+            };
+            out.insert(name.to_owned(), full);
+        }
+        "identifier" => {
+            let name = node.utf8_text(source.as_bytes()).unwrap_or_default();
+            if name.is_empty() {
+                return;
+            }
+            let full = if prefix.is_empty() {
+                name.to_owned()
+            } else {
+                format!("{prefix}::{name}")
+            };
+            out.insert(name.to_owned(), full);
+        }
+        "use_as_clause" => {
+            // children: <path> "as" <alias>
+            let mut cursor = node.walk();
+            let mut path_text: Option<String> = None;
+            let mut alias_name: Option<String> = None;
+            for ch in node.children(&mut cursor) {
+                match ch.kind() {
+                    "scoped_identifier" | "identifier" => {
+                        let text = ch
+                            .utf8_text(source.as_bytes())
+                            .unwrap_or_default()
+                            .to_owned();
+                        if path_text.is_none() {
+                            path_text = Some(text);
+                        } else if alias_name.is_none() {
+                            alias_name = Some(text);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if let (Some(path), Some(alias)) = (path_text, alias_name) {
+                let full = if prefix.is_empty() {
+                    path
+                } else {
+                    format!("{prefix}::{path}")
+                };
+                out.insert(alias, full);
+            }
+        }
+        "scoped_use_list" => {
+            // children: <path: scoped_identifier|identifier> "::" <use_list>
+            let mut cursor = node.walk();
+            let mut path_text = String::new();
+            let mut list_node: Option<Node> = None;
+            for ch in node.children(&mut cursor) {
+                match ch.kind() {
+                    "scoped_identifier" | "identifier" | "self" | "crate" | "super"
+                        if list_node.is_none() && path_text.is_empty() =>
+                    {
+                        ch.utf8_text(source.as_bytes())
+                            .unwrap_or_default()
+                            .clone_into(&mut path_text);
+                    }
+                    "use_list" => list_node = Some(ch),
+                    _ => {}
+                }
+            }
+            let new_prefix = if prefix.is_empty() {
+                path_text
+            } else {
+                format!("{prefix}::{path_text}")
+            };
+            if let Some(list) = list_node {
+                let mut c = list.walk();
+                for ch in list.children(&mut c) {
+                    collect_use_paths(ch, source, &new_prefix, out);
+                }
+            }
+        }
+        "use_list" => {
+            let mut c = node.walk();
+            for ch in node.children(&mut c) {
+                collect_use_paths(ch, source, prefix, out);
+            }
+        }
+        // `use_wildcard`, punctuation, etc. — nothing to record.
+        _ => {}
+    }
 }
 
 // ── Doc comment extraction ────────────────────────────────────────────────────
@@ -621,5 +781,106 @@ pub type Alias = u32;\n";
     fn module_name_no_extension() {
         // file with no dot → returns full basename
         assert_eq!(module_name("Makefile"), "Makefile");
+    }
+
+    fn imports_from(src: &str) -> HashMap<String, String> {
+        let mut p = TsParser::new();
+        p.set_language(&tree_sitter_rust::LANGUAGE.into())
+            .expect("rust grammar");
+        let tree = p.parse(src, None).expect("parse");
+        extract_use_imports(tree.root_node(), src)
+    }
+
+    #[test]
+    fn use_imports_simple_path_records_leaf_name() {
+        let map = imports_from("use crate::resolve::resolve_cross_module_calls;\n");
+        assert_eq!(
+            map.get("resolve_cross_module_calls").map(String::as_str),
+            Some("crate::resolve::resolve_cross_module_calls")
+        );
+    }
+
+    #[test]
+    fn use_imports_group_form_unfolds() {
+        let map = imports_from("use crate::render::{Level, render};\n");
+        assert_eq!(
+            map.get("render").map(String::as_str),
+            Some("crate::render::render")
+        );
+        assert_eq!(
+            map.get("Level").map(String::as_str),
+            Some("crate::render::Level")
+        );
+    }
+
+    #[test]
+    fn use_imports_alias_keeps_alias_as_key() {
+        let map = imports_from("use crate::error::Result as Res;\n");
+        assert_eq!(
+            map.get("Res").map(String::as_str),
+            Some("crate::error::Result")
+        );
+        assert!(!map.contains_key("Result"));
+    }
+
+    #[test]
+    fn use_imports_nested_group_unfolds_recursively() {
+        let map = imports_from("use crate::a::{b::c, d};\n");
+        assert_eq!(map.get("c").map(String::as_str), Some("crate::a::b::c"));
+        assert_eq!(map.get("d").map(String::as_str), Some("crate::a::d"));
+    }
+
+    #[test]
+    fn bare_call_expanded_via_use_import() {
+        let store = Store::new();
+        let src = b"\
+use crate::other::helper;\n\
+fn caller() { helper(); }\n";
+        CodeParser::rust()
+            .parse_into(src, "src/lib.rs", &store)
+            .expect("parse");
+        let id = EntityId::new("code:src/lib.rs::function::caller");
+        let atom = store.get_atom(&id).expect("atom");
+        // Bare `helper()` should be normalised to the imported full path.
+        assert!(
+            atom.calls.iter().any(|c| c == "crate::other::helper"),
+            "calls={:?}",
+            atom.calls
+        );
+    }
+
+    #[test]
+    fn qualified_inline_call_keeps_full_path() {
+        let store = Store::new();
+        let src = b"fn caller() { project::render(s); }\n";
+        CodeParser::rust()
+            .parse_into(src, "src/lib.rs", &store)
+            .expect("parse");
+        let id = EntityId::new("code:src/lib.rs::function::caller");
+        let atom = store.get_atom(&id).expect("atom");
+        assert!(
+            atom.calls.iter().any(|c| c == "project::render"),
+            "calls={:?}",
+            atom.calls
+        );
+    }
+
+    #[test]
+    fn intra_file_linker_skips_qualified_calls() {
+        // A locally-defined `render` should NOT be linked from a call written
+        // as `module::render(...)` — that's a cross-module call.
+        let store = Store::new();
+        let src = b"\
+fn render(s: u32) {}\n\
+fn caller() { project::render(0); }\n";
+        CodeParser::rust()
+            .parse_into(src, "src/lib.rs", &store)
+            .expect("parse");
+        let caller_id = EntityId::new("code:src/lib.rs::function::caller");
+        let local_render = EntityId::new("code:src/lib.rs::function::render");
+        assert!(
+            !store.has_call_edge(&caller_id, &local_render),
+            "qualified call should not bind to same-file function"
+        );
     }
 }

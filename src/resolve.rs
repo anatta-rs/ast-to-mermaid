@@ -12,10 +12,16 @@
 //! 3. Load existing `calls` edges so we never emit a duplicate.
 //! 4. For each function whose `calls` field is non-empty:
 //!    - Skip stdlib / iterator method noise (see [`SKIP_CALLS`]).
-//!    - Find candidates by name.
-//!    - Prefer a unique candidate in the same crate (file-path prefix
-//!      before `/src/`); fall back to a unique cross-crate candidate.
-//!    - On ambiguity (multiple candidates) or zero matches: skip.
+//!    - Each call name is either a bare identifier (e.g. `foo`) or a
+//!      qualified path (e.g. `module::foo`, `crate::render::render`). The
+//!      parser normalises bare calls via the file's `use` imports so the
+//!      qualifier is present whenever the source provided one.
+//!    - For qualified calls: narrow candidates to those whose file's module
+//!      name matches the last qualifier segment (e.g. `render::render`
+//!      matches `src/render/mod.rs` or `src/render.rs`).
+//!    - For bare calls: prefer a unique same-crate candidate, then a unique
+//!      cross-crate one.
+//!    - On ambiguity or zero matches: skip.
 //!    - Emit a `calls` edge.
 //!
 //! Returns the number of new edges added.
@@ -150,11 +156,12 @@ pub fn resolve_cross_module_calls(store: &Store) -> usize {
         let caller_crate = crate_root(caller);
 
         for call_name in &caller.calls {
-            if skip_set.contains(call_name.as_str()) {
+            let (path_prefix, fn_name) = split_call_name(call_name);
+            if skip_set.contains(fn_name) {
                 continue;
             }
 
-            let Some(candidates) = name_to_indices.get(call_name.as_str()) else {
+            let Some(candidates) = name_to_indices.get(fn_name) else {
                 continue;
             };
 
@@ -168,19 +175,44 @@ pub fn resolve_cross_module_calls(store: &Store) -> usize {
                 })
                 .collect();
 
-            // Prefer same-crate.
-            let same_crate: Vec<usize> = viable
-                .iter()
-                .copied()
-                .filter(|&idx| crate_root(&functions[idx]) == caller_crate)
-                .collect();
-
-            let target_idx = if same_crate.len() == 1 {
-                Some(same_crate[0])
-            } else if viable.len() == 1 && same_crate.is_empty() {
-                Some(viable[0])
+            let target_idx = if let Some(qual_module) = path_prefix
+                .and_then(|q| q.rsplit("::").next())
+                .filter(|m| !m.is_empty() && *m != "crate")
+            {
+                // Qualified call: narrow by the trailing module segment.
+                let qualified: Vec<usize> = viable
+                    .iter()
+                    .copied()
+                    .filter(|&idx| file_module_name(&functions[idx].file_path) == qual_module)
+                    .collect();
+                match qualified.len() {
+                    1 => Some(qualified[0]),
+                    0 => None, // qualifier was explicit — don't fall back
+                    _ => {
+                        // Multiple modules share the trailing segment; prefer
+                        // same-crate.
+                        let same: Vec<usize> = qualified
+                            .iter()
+                            .copied()
+                            .filter(|&idx| crate_root(&functions[idx]) == caller_crate)
+                            .collect();
+                        if same.len() == 1 { Some(same[0]) } else { None }
+                    }
+                }
             } else {
-                None
+                // Bare call: original same-crate-preferred heuristic.
+                let same_crate: Vec<usize> = viable
+                    .iter()
+                    .copied()
+                    .filter(|&idx| crate_root(&functions[idx]) == caller_crate)
+                    .collect();
+                if same_crate.len() == 1 {
+                    Some(same_crate[0])
+                } else if viable.len() == 1 && same_crate.is_empty() {
+                    Some(viable[0])
+                } else {
+                    None
+                }
             };
 
             if let Some(target_idx) = target_idx {
@@ -194,6 +226,36 @@ pub fn resolve_cross_module_calls(store: &Store) -> usize {
     }
 
     added
+}
+
+/// Split a call name into `(qualifier_path, short_name)`.
+///
+/// `foo` → `(None, "foo")`.
+/// `module::foo` → `(Some("module"), "foo")`.
+/// `crate::render::render` → `(Some("crate::render"), "render")`.
+fn split_call_name(name: &str) -> (Option<&str>, &str) {
+    if let Some(idx) = name.rfind("::") {
+        let (prefix, rest) = name.split_at(idx);
+        (Some(prefix), &rest[2..])
+    } else {
+        (None, name)
+    }
+}
+
+/// Module name that a file represents:
+///   `src/foo.rs`         → `"foo"`
+///   `src/foo/mod.rs`     → `"foo"` (use parent dir, not the literal `"mod"`)
+///   `crate_a/src/lib.rs` → `"lib"`
+fn file_module_name(file_path: &str) -> &str {
+    let basename = file_path.rsplit('/').next().unwrap_or(file_path);
+    let stem = basename.rsplit_once('.').map_or(basename, |(s, _)| s);
+    if stem == "mod" {
+        // Walk up one level to find the directory name.
+        let parent = file_path.rsplit_once('/').map_or("", |(p, _)| p);
+        parent.rsplit('/').next().unwrap_or(parent)
+    } else {
+        stem
+    }
 }
 
 /// Best-effort crate-root extraction from an atom's `file_path`.
@@ -402,5 +464,94 @@ mod tests {
     fn crate_root_returns_full_path_when_no_src() {
         let atom = function_atom("just/a/path.rs", "f", &[]);
         assert_eq!(crate_root(&atom), Some("just/a/path.rs".to_owned()));
+    }
+
+    #[test]
+    fn split_call_name_handles_bare_and_qualified() {
+        assert_eq!(split_call_name("foo"), (None, "foo"));
+        assert_eq!(split_call_name("module::foo"), (Some("module"), "foo"));
+        assert_eq!(
+            split_call_name("crate::render::render"),
+            (Some("crate::render"), "render")
+        );
+    }
+
+    #[test]
+    fn file_module_name_uses_parent_dir_for_mod_files() {
+        assert_eq!(file_module_name("src/render/mod.rs"), "render");
+        assert_eq!(file_module_name("src/foo.rs"), "foo");
+        assert_eq!(file_module_name("crate_a/src/lib.rs"), "lib");
+    }
+
+    #[test]
+    fn qualified_call_disambiguates_between_same_named_functions() {
+        // Two `render` functions in different sibling modules. A call to
+        // `project::render` must resolve to the project module, not the
+        // overview module.
+        let store = Store::new();
+        add_to_store(
+            &store,
+            "crate_a/src/render/mod.rs",
+            &[("dispatch", &["project::render", "overview::render"])],
+        );
+        add_to_store(&store, "crate_a/src/render/project.rs", &[("render", &[])]);
+        add_to_store(&store, "crate_a/src/render/overview.rs", &[("render", &[])]);
+
+        let added = resolve_cross_module_calls(&store);
+        assert_eq!(added, 2, "both qualified calls should resolve");
+
+        let dispatch = EntityId::new("code:crate_a/src/render/mod.rs::function::dispatch");
+        let project = EntityId::new("code:crate_a/src/render/project.rs::function::render");
+        let overview = EntityId::new("code:crate_a/src/render/overview.rs::function::render");
+        assert!(store.has_call_edge(&dispatch, &project));
+        assert!(store.has_call_edge(&dispatch, &overview));
+    }
+
+    #[test]
+    fn qualified_call_via_use_import_finds_target_at_mod_dot_rs() {
+        // `use crate::render::render;` followed by `render(...)` is captured
+        // by the parser as `crate::render::render`. Resolver must match that
+        // against `src/render/mod.rs` (where `mod` resolves to parent dir).
+        let store = Store::new();
+        add_to_store(
+            &store,
+            "crate_a/src/pipeline.rs",
+            &[("analyze", &["crate::render::render"])],
+        );
+        add_to_store(&store, "crate_a/src/render/mod.rs", &[("render", &[])]);
+        // Decoy: another `render` in a sibling file that should NOT match.
+        add_to_store(&store, "crate_a/src/render/project.rs", &[("render", &[])]);
+
+        let added = resolve_cross_module_calls(&store);
+        assert_eq!(added, 1, "exactly one match expected");
+
+        let analyze = EntityId::new("code:crate_a/src/pipeline.rs::function::analyze");
+        let target = EntityId::new("code:crate_a/src/render/mod.rs::function::render");
+        assert!(store.has_call_edge(&analyze, &target));
+    }
+
+    #[test]
+    fn qualified_call_with_no_module_match_does_not_fall_back() {
+        // The qualifier is explicit. If no candidate's module matches, the
+        // resolver must skip — not silently bind to a same-named function in
+        // some unrelated module.
+        let store = Store::new();
+        add_to_store(
+            &store,
+            "crate_a/src/mod_a.rs",
+            &[("caller", &["nonexistent::helper"])],
+        );
+        add_to_store(&store, "crate_a/src/mod_b.rs", &[("helper", &[])]);
+        let added = resolve_cross_module_calls(&store);
+        assert_eq!(added, 0);
+    }
+
+    #[test]
+    fn bare_call_resolution_unchanged() {
+        // Sanity: prior unique-name behaviour still works.
+        let store = Store::new();
+        add_to_store(&store, "crate_a/src/mod_a.rs", &[("caller", &["helper"])]);
+        add_to_store(&store, "crate_a/src/mod_b.rs", &[("helper", &[])]);
+        assert_eq!(resolve_cross_module_calls(&store), 1);
     }
 }
