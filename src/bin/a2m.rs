@@ -1,13 +1,12 @@
 //! `a2m` — turn a source tree into Mermaid diagrams.
 //!
-//! Seven subcommands, one binary:
-//!
 //! ```text
 //! a2m project  ./src                              # crate-level overview
 //! a2m overview ./src                              # module-level overview
 //! a2m module   ./src --target render/mod.rs       # one module, fully linked
 //! a2m function ./src --target analyze             # reverse call chain
 //! a2m impact   ./src --target analyze             # blast radius (3 hops)
+//! a2m sequence ./src --target run_diff            # statement-ordered Mermaid sequenceDiagram
 //! a2m walk     ./src                              # list source files
 //! a2m bundle   ./src --out ./.artifacts           # full 4-layer bundle
 //! ```
@@ -16,8 +15,8 @@
 #![deny(unsafe_code)]
 
 use ast_to_mermaid::cli_support::{
-    AnalyzeFlags, BundleFlags, DiffFlags, ExitCode, GcFlags, IndexFlags, WalkFlags, run_analyze,
-    run_bundle, run_diff, run_gc, run_index, run_walk,
+    AnalyzeFlags, BundleFlags, DiffFlags, ExitCode, GcFlags, IndexFlags, SequenceFlags, WalkFlags,
+    run_analyze, run_bundle, run_diff, run_gc, run_index, run_sequence, run_walk,
 };
 use ast_to_mermaid::render::Level;
 use clap::{Parser, Subcommand};
@@ -51,6 +50,12 @@ enum Command {
     Function(AnalyzeFlags),
     /// Render the impact graph for a target (forward + backward, 3 hops).
     Impact(AnalyzeFlags),
+    /// Render a Mermaid sequenceDiagram for one function, walking its
+    /// body in source order. Calls are classified by syntactic receiver
+    /// (bare ident → self, `obj.m()` → obj, `Type::m()` → Type); `if`/
+    /// `match` lift to `alt`, loops lift to `loop`, `.await` annotates
+    /// the arrow.
+    Sequence(SequenceFlags),
     /// List source files under a path (no parsing).
     Walk(WalkFlags),
     /// Produce the 4-layer artifact bundle for a project.
@@ -75,6 +80,7 @@ fn main() -> std::process::ExitCode {
         Command::Module(f) => run_analyze(Level::Module, &f),
         Command::Function(f) => run_analyze(Level::Function, &f),
         Command::Impact(f) => run_analyze(Level::Impact, &f),
+        Command::Sequence(f) => run_sequence(&f),
         Command::Walk(f) => run_walk(&f),
         Command::Bundle(f) => run_bundle(&f),
         Command::Index(f) => run_index(&f),

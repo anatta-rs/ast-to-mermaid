@@ -11,6 +11,7 @@ use crate::pipeline::{
     AnalyzeOptions, analyze, bundle, snapshot_id, walk_for_languages_with_exclude,
 };
 use crate::render::{Level, mermaid_to_dot};
+use crate::sequence;
 use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::Arc;
@@ -725,6 +726,141 @@ pub fn run_bundle(flags: &BundleFlags) -> ExitCode {
     ExitCode::Success
 }
 
+/// CLI args for the `sequence` subcommand.
+#[derive(Debug, Clone, clap::Args)]
+pub struct SequenceFlags {
+    /// Path to a source root (file or directory).
+    pub path: PathBuf,
+
+    /// Required: function to render. Plain `name` for a free function,
+    /// `Type::method` to disambiguate by impl owner.
+    #[arg(short, long)]
+    pub target: String,
+
+    /// Extra directory basenames to skip during the walk
+    /// (comma-separated). Combined with the built-in skip set.
+    #[arg(short = 'x', long, default_value = "")]
+    pub exclude: String,
+
+    /// Write output to this file instead of stdout.
+    #[arg(short, long)]
+    pub out: Option<PathBuf>,
+
+    /// Read source from a git ref instead of the working tree.
+    #[arg(long, value_name = "GIT-REF")]
+    pub r#ref: Option<String>,
+}
+
+/// Run the `sequence` subcommand: scan source files for the target
+/// function, re-parse its body in order, render Mermaid `sequenceDiagram`.
+pub fn run_sequence(flags: &SequenceFlags) -> ExitCode {
+    if flags.target.trim().is_empty() {
+        eprintln!("sequence: --target must be non-empty");
+        return ExitCode::UsageError;
+    }
+    let exclude: Vec<String> = flags
+        .exclude
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .collect();
+
+    let candidates = match collect_rust_sources(&flags.path, &exclude, flags.r#ref.as_deref()) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("sequence: {e}");
+            return ExitCode::Failure;
+        }
+    };
+    if candidates.is_empty() {
+        eprintln!(
+            "sequence: no Rust files found under {}",
+            flags.path.display()
+        );
+        return ExitCode::Failure;
+    }
+
+    let mut diagram = None;
+    for (file_rel, content) in &candidates {
+        if let Ok(d) = sequence::extract(content, file_rel, &flags.target) {
+            diagram = Some((file_rel.clone(), d));
+            break;
+        }
+    }
+    let Some((file_rel, diagram)) = diagram else {
+        eprintln!(
+            "sequence: function `{}` not found under {}",
+            flags.target,
+            flags.path.display()
+        );
+        return ExitCode::Failure;
+    };
+    let rendered = sequence::render(&diagram);
+
+    let suffix = if let Some(path) = flags.out.as_deref() {
+        if let Err(e) = std::fs::write(path, &rendered) {
+            eprintln!("write {}: {e}", path.display());
+            return ExitCode::Failure;
+        }
+        format!(" → {}", path.display())
+    } else {
+        print!("{rendered}");
+        String::new()
+    };
+    eprintln!(
+        "sequence {} from {} ({} participants, {} steps){}",
+        flags.target,
+        file_rel,
+        diagram.participants.len(),
+        diagram.steps.len(),
+        suffix,
+    );
+    ExitCode::Success
+}
+
+/// Collect `(display_path, content)` pairs for every Rust source file under
+/// `root`, honouring `exclude`. With `git_ref`, reads from `git ls-tree`
+/// instead of the working tree.
+fn collect_rust_sources(
+    root: &Path,
+    exclude: &[String],
+    git_ref: Option<&str>,
+) -> Result<Vec<(String, Vec<u8>)>, crate::error::AstToMermaidError> {
+    if let Some(git_ref) = git_ref {
+        let toplevel = crate::git_source::show_toplevel(root)?;
+        let entries = crate::git_source::ls_tree(&toplevel, git_ref)?;
+        let mut out = Vec::new();
+        for entry in entries {
+            if !Path::new(&entry.path)
+                .extension()
+                .is_some_and(|e| e.eq_ignore_ascii_case("rs"))
+            {
+                continue;
+            }
+            let content = crate::git_source::cat_file(&toplevel, &entry.blob_sha)?;
+            out.push((entry.path, content));
+        }
+        Ok(out)
+    } else {
+        let files = walk_for_languages_with_exclude(root, exclude)?;
+        let mut out = Vec::new();
+        for (path, lang) in files {
+            if lang != crate::parser::Language::Rust {
+                continue;
+            }
+            let content = std::fs::read(&path)?;
+            let display = path
+                .strip_prefix(root)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .into_owned();
+            out.push((display, content));
+        }
+        Ok(out)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1304,5 +1440,92 @@ mod tests {
             format: AnalyzeFormat::default(),
         };
         assert_eq!(run_analyze(Level::Project, &flags), ExitCode::Failure);
+    }
+
+    // --- run_sequence ------------------------------------------------------
+
+    fn write_rust(dir: &Path, rel: &str, contents: &str) {
+        let path = dir.join(rel);
+        if let Some(p) = path.parent() {
+            std::fs::create_dir_all(p).unwrap();
+        }
+        std::fs::write(&path, contents).unwrap();
+    }
+
+    #[test]
+    fn sequence_empty_target_is_usage_error() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let flags = SequenceFlags {
+            path: tmp.path().to_path_buf(),
+            target: "   ".into(),
+            exclude: String::new(),
+            out: None,
+            r#ref: None,
+        };
+        assert_eq!(run_sequence(&flags), ExitCode::UsageError);
+    }
+
+    #[test]
+    fn sequence_no_rust_files_returns_failure() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let flags = SequenceFlags {
+            path: tmp.path().to_path_buf(),
+            target: "anything".into(),
+            exclude: String::new(),
+            out: None,
+            r#ref: None,
+        };
+        assert_eq!(run_sequence(&flags), ExitCode::Failure);
+    }
+
+    #[test]
+    fn sequence_unknown_function_returns_failure() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        write_rust(tmp.path(), "lib.rs", "fn other(){}\n");
+        let flags = SequenceFlags {
+            path: tmp.path().to_path_buf(),
+            target: "missing".into(),
+            exclude: String::new(),
+            out: None,
+            r#ref: None,
+        };
+        assert_eq!(run_sequence(&flags), ExitCode::Failure);
+    }
+
+    #[test]
+    fn sequence_writes_mermaid_to_file() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        write_rust(
+            tmp.path(),
+            "lib.rs",
+            "fn run(cache: &Cache) { cache.open(); foo(); }\n",
+        );
+        let out = tmp.path().join("seq.mmd");
+        let flags = SequenceFlags {
+            path: tmp.path().to_path_buf(),
+            target: "run".into(),
+            exclude: String::new(),
+            out: Some(out.clone()),
+            r#ref: None,
+        };
+        assert_eq!(run_sequence(&flags), ExitCode::Success);
+        let body = std::fs::read_to_string(&out).expect("read");
+        assert!(body.starts_with("sequenceDiagram"), "got:\n{body}");
+        assert!(body.contains("self->>cache: open"), "got:\n{body}");
+        assert!(body.contains("self->>self: foo"), "got:\n{body}");
+    }
+
+    #[test]
+    fn sequence_from_git_ref_succeeds() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        init_rust_repo(tmp.path(), "lib.rs", "fn run() { foo(); }\n");
+        let flags = SequenceFlags {
+            path: tmp.path().to_path_buf(),
+            target: "run".into(),
+            exclude: String::new(),
+            out: None,
+            r#ref: Some("HEAD".into()),
+        };
+        assert_eq!(run_sequence(&flags), ExitCode::Success);
     }
 }
