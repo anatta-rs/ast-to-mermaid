@@ -329,6 +329,67 @@ mod tests {
     }
 
     #[test]
+    fn assert_macros_and_enum_constructors_are_skipped() {
+        // `Some`/`Ok` parse as call_expression and `assert_eq!` as
+        // macro_invocation; both should be filtered out. Real calls in
+        // **expression** position (Some's args ARE parsed as expressions)
+        // are still surfaced. Calls inside macro arg-token-trees are NOT
+        // recoverable in tree-sitter-rust — those tokens are unparsed.
+        let d = extract_ok(
+            "fn run() {\n  let _ = Some(real());\n  assert_eq!(left, right);\n  assert!(cond);\n}\n",
+            "run",
+        );
+        let labels: Vec<&str> = d
+            .steps
+            .iter()
+            .filter_map(|s| match s {
+                Step::Call { label, .. } => Some(label.as_str()),
+                _ => None,
+            })
+            .collect();
+        for noisy in ["Some", "Ok", "Err", "None", "assert!", "assert_eq!"] {
+            assert!(!labels.contains(&noisy), "{noisy} leaked into {labels:?}");
+        }
+        // The `real()` inside `Some(...)` is in expression position, so
+        // it surfaces. (Calls inside `assert_eq!` arg-tokens do not.)
+        assert_eq!(labels.iter().filter(|l| **l == "real").count(), 1, "{labels:?}");
+    }
+
+    #[test]
+    fn macro_chain_receiver_is_macro_name_not_token_tree() {
+        // `writeln!(buf, "...").expect()` — receiver of `.expect` is the
+        // macro return value; pin the participant to `writeln`, not the
+        // whole macro source.
+        let d = extract_ok(
+            "fn run() { writeln!(buf, \"x\").expect(\"io\"); }\n",
+            "run",
+        );
+        let to_targets: Vec<&str> = d
+            .steps
+            .iter()
+            .filter_map(|s| match s {
+                Step::Call { to, .. } => Some(to.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(to_targets.contains(&"writeln"), "got: {to_targets:?}");
+        assert!(
+            !to_targets.iter().any(|t| t.len() > 32),
+            "no participant should embed the whole macro: {to_targets:?}",
+        );
+    }
+
+    #[test]
+    fn list_functions_returns_qualified_names() {
+        let src = "fn free(){}\nstruct S;\nimpl S { fn m(&self){} }\n\
+                   trait T { fn def(&self){} }\nimpl T for S { fn def(&self){} }\n";
+        let names = list_functions(src.as_bytes()).expect("list");
+        assert!(names.contains(&"free".to_owned()), "{names:?}");
+        assert!(names.contains(&"S::m".to_owned()), "{names:?}");
+        assert!(names.contains(&"S::def".to_owned()), "{names:?}");
+    }
+
+    #[test]
     fn impl_method_target_resolves() {
         let src = "impl Foo { fn build(&self) { go(); } }\n";
         let d = extract_ok(src, "Foo::build");

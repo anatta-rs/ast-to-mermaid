@@ -132,18 +132,26 @@ impl State {
     /// `mod::bar!(...)`). Macros have no receiver, so they always target
     /// the implicit `self` lifeline; the bang is preserved on the label
     /// so the rendered diagram stays distinguishable from real fn calls.
+    ///
+    /// Test-control and panic macros (`assert!`, `assert_eq!`,
+    /// `debug_assert*!`, `panic!`, `unreachable!`, `todo!`,
+    /// `unimplemented!`, `matches!`) are skipped — they're noise on a
+    /// sequence diagram. We still descend into their token tree so any
+    /// nested real call survives.
     fn handle_macro(&mut self, node: &Node, source: &str) {
         let macro_node = node.child_by_field_name("macro");
         let label = macro_node
             .and_then(|n| node_text(&n, source))
             .unwrap_or("?")
             .to_owned();
-        self.steps.push(Step::Call {
-            from: SELF_ID.to_owned(),
-            to: SELF_ID.to_owned(),
-            label: format!("{label}!"),
-            is_await: false,
-        });
+        if !is_skipped_macro(&label) {
+            self.steps.push(Step::Call {
+                from: SELF_ID.to_owned(),
+                to: SELF_ID.to_owned(),
+                label: format!("{label}!"),
+                is_await: false,
+            });
+        }
         // Descend so nested calls inside macro tokens (e.g. `vec![foo()]`)
         // still surface.
         let mut cursor = node.walk();
@@ -156,18 +164,28 @@ impl State {
 
     /// Emit a [`Step::Call`] for a `call_expression` and then descend into
     /// its arguments so nested calls are still surfaced.
+    ///
+    /// Bare-name calls to enum-variant constructors (`Some`, `None`,
+    /// `Ok`, `Err`) are skipped — they parse as `call_expression` but
+    /// represent type construction, not flow.
     fn handle_call(&mut self, node: &Node, source: &str, is_await: bool) {
         if let Some(callee) = node.child_by_field_name("function") {
             let (to_id, to_label, method) = self.classify_callee(&callee, source);
-            self.register(&to_id, &to_label);
-            self.steps.push(Step::Call {
-                from: SELF_ID.to_owned(),
-                to: to_id,
-                label: method,
-                is_await,
-            });
+            let is_bare_constructor = callee.kind() == "identifier"
+                && to_id == SELF_ID
+                && is_skipped_constructor(&method);
+            if !is_bare_constructor {
+                self.register(&to_id, &to_label);
+                self.steps.push(Step::Call {
+                    from: SELF_ID.to_owned(),
+                    to: to_id,
+                    label: method,
+                    is_await,
+                });
+            }
         }
-        // Descend into arguments to capture nested calls.
+        // Descend into arguments to capture nested calls — even on
+        // skipped constructors (e.g. `Some(real_call())`).
         if let Some(args) = node.child_by_field_name("arguments") {
             let mut cursor = args.walk();
             for child in args.children(&mut cursor) {
@@ -212,11 +230,8 @@ impl State {
                 if receiver_root == "self" {
                     (SELF_ID.to_owned(), self.self_label(), method)
                 } else {
-                    (
-                        sanitize_id(receiver_root),
-                        receiver_root.to_owned(),
-                        method,
-                    )
+                    let display = cap_label(receiver_root);
+                    (sanitize_id(&display), display, method)
                 }
             }
             // Generic / parens / macros — best-effort: use the snippet.
@@ -324,11 +339,12 @@ fn node_text<'a>(node: &Node, source: &'a str) -> Option<&'a str> {
     node.utf8_text(source.as_bytes()).ok()
 }
 
-/// Walk the receiver chain of `obj.method` / `f().g().h` and return the
-/// leftmost identifier. Descends through both `field_expression` (chained
-/// access) and `call_expression` (chained calls) so `Cache::open(x).ok()
-/// .map(f)` resolves to `Cache`. For `scoped_identifier` (`Type::method`)
-/// the head segment wins.
+/// Walk the receiver chain of `obj.method` / `f().g().h` / `mac!().m()`
+/// and return the leftmost identifier. Descends through `field_expression`
+/// (chained access), `call_expression` (chained calls), and
+/// `macro_invocation` so chains like `writeln!(...).expect(...)` resolve
+/// to the macro name instead of swallowing the whole macro body. For
+/// `scoped_identifier` (`Type::method`) the head segment wins.
 fn field_receiver_root<'a>(node: &Node, source: &'a str) -> Option<&'a str> {
     let mut current = *node;
     loop {
@@ -336,16 +352,40 @@ fn field_receiver_root<'a>(node: &Node, source: &'a str) -> Option<&'a str> {
             "field_expression" => {
                 current = current.child_by_field_name("value")?;
             }
-            "call_expression" => {
+            // `f()` and `f::<T>()` (whose function is a `generic_function`)
+            // both descend through the `function` field.
+            "call_expression" | "generic_function" => {
                 current = current.child_by_field_name("function")?;
+            }
+            // `(expr).method()` — pierce the parens.
+            "parenthesized_expression" => {
+                let mut cursor = current.walk();
+                let inner = current
+                    .children(&mut cursor)
+                    .find(|c| !matches!(c.kind(), "(" | ")"));
+                current = inner?;
+            }
+            // `expr?.method()` — `?` propagates the inner value.
+            "try_expression" => {
+                let mut cursor = current.walk();
+                let inner = current.children(&mut cursor).find(|c| c.kind() != "?");
+                current = inner?;
+            }
+            "macro_invocation" => {
+                // `writeln!(buf, "...").expect()` — the receiver of the
+                // chained `.expect` is the macro return value; pin it to
+                // the macro name (with `!`) instead of the whole token tree.
+                let macro_name = current
+                    .child_by_field_name("macro")
+                    .and_then(|n| node_text(&n, source))?;
+                return Some(macro_name);
             }
             "scoped_identifier" => {
                 let text = node_text(&current, source)?;
                 return text.split("::").next();
             }
-            // identifier, self, try-expression, parenthesised, or anything
-            // else — give up and use the whole snippet (renderer / sanitize
-            // will normalise it).
+            // identifier, self, or anything else — give up and use the
+            // raw text. The caller caps overlong snippets.
             _ => return node_text(&current, source),
         }
     }
@@ -363,6 +403,46 @@ fn short_text(node: &Node, field: &str, source: &str) -> String {
     } else {
         one_line
     }
+}
+
+/// Truncate a participant label so a giant fallback snippet (e.g. a
+/// chained-call expression we couldn't classify) doesn't blow the
+/// diagram up. Whitespace is collapsed too — labels are one-line.
+fn cap_label(s: &str) -> String {
+    const MAX: usize = 24;
+    let one_line: String = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    if one_line.chars().count() <= MAX {
+        one_line
+    } else {
+        let head: String = one_line.chars().take(MAX).collect();
+        format!("{head}…")
+    }
+}
+
+/// Macros that are pure test/panic plumbing — emitting them as steps
+/// drowns the diagram in noise. Nested calls inside their token tree
+/// still surface (the visitor descends regardless).
+fn is_skipped_macro(name: &str) -> bool {
+    matches!(
+        name,
+        "assert"
+            | "assert_eq"
+            | "assert_ne"
+            | "debug_assert"
+            | "debug_assert_eq"
+            | "debug_assert_ne"
+            | "panic"
+            | "unreachable"
+            | "todo"
+            | "unimplemented"
+            | "matches"
+    )
+}
+
+/// Bare-name "calls" that are actually enum-variant constructors. Listed
+/// because they parse as `call_expression` but carry no flow meaning.
+fn is_skipped_constructor(name: &str) -> bool {
+    matches!(name, "Some" | "None" | "Ok" | "Err")
 }
 
 /// Render an arbitrary string as a Mermaid-safe participant id.

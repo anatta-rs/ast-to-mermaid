@@ -875,6 +875,12 @@ fn run_sequence_all(candidates: &[(String, Vec<u8>)], out: Option<&Path>) -> Exi
                 skipped += 1;
                 continue;
             };
+            // Empty bodies (getters, single-line returns, doc-only fns)
+            // produce a Mermaid header with no steps — useless on disk.
+            if diagram.steps.is_empty() {
+                skipped += 1;
+                continue;
+            }
             let filename = sequence_filename(file_rel, &name);
             let target_path = out_dir.join(&filename);
             let rendered = sequence::render(&diagram);
@@ -886,7 +892,7 @@ fn run_sequence_all(candidates: &[(String, Vec<u8>)], out: Option<&Path>) -> Exi
         }
     }
     eprintln!(
-        "sequence --all: {written} diagrams written to {} ({skipped} skipped)",
+        "sequence --all: {written} diagrams written to {} ({skipped} skipped: empty / parse fail)",
         out_dir.display(),
     );
     ExitCode::Success
@@ -1631,7 +1637,10 @@ mod tests {
     }
 
     #[test]
-    fn sequence_all_writes_one_file_per_function() {
+    fn sequence_all_writes_one_file_per_nonempty_function() {
+        // `fn b(){}` has no calls — its diagram would be a header-only
+        // stub, so --all skips it. `a` and `S::m` both call something
+        // and so produce real files.
         let tmp = tempfile::tempdir().expect("tmp");
         write_rust(
             tmp.path(),
@@ -1649,8 +1658,12 @@ mod tests {
             .filter_map(|e| e.file_name().into_string().ok())
             .collect();
         assert!(entries.iter().any(|n| n.ends_with("__a.mmd")), "got: {entries:?}");
-        assert!(entries.iter().any(|n| n.ends_with("__b.mmd")), "got: {entries:?}");
         assert!(entries.iter().any(|n| n.contains("S__m")), "got: {entries:?}");
+        // Empty function `b` must NOT produce a file.
+        assert!(
+            !entries.iter().any(|n| n.ends_with("__b.mmd")),
+            "empty b leaked: {entries:?}",
+        );
     }
 
     #[test]
