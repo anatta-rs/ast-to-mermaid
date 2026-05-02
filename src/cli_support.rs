@@ -732,17 +732,25 @@ pub struct SequenceFlags {
     /// Path to a source root (file or directory).
     pub path: PathBuf,
 
-    /// Required: function to render. Plain `name` for a free function,
-    /// `Type::method` to disambiguate by impl owner.
-    #[arg(short, long)]
-    pub target: String,
+    /// Function to render. Plain `name` for a free function,
+    /// `Type::method` to disambiguate by impl owner. Required unless
+    /// `--all` is set.
+    #[arg(short, long, conflicts_with = "all")]
+    pub target: Option<String>,
+
+    /// Render every function in the source tree. One `.mmd` file is
+    /// written per function; requires `--out <DIR>`.
+    #[arg(long, conflicts_with = "target")]
+    pub all: bool,
 
     /// Extra directory basenames to skip during the walk
     /// (comma-separated). Combined with the built-in skip set.
     #[arg(short = 'x', long, default_value = "")]
     pub exclude: String,
 
-    /// Write output to this file instead of stdout.
+    /// In single-target mode: file to write Mermaid output to (default
+    /// stdout). In `--all` mode: directory that receives one `.mmd` per
+    /// function.
     #[arg(short, long)]
     pub out: Option<PathBuf>,
 
@@ -751,11 +759,20 @@ pub struct SequenceFlags {
     pub r#ref: Option<String>,
 }
 
-/// Run the `sequence` subcommand: scan source files for the target
-/// function, re-parse its body in order, render Mermaid `sequenceDiagram`.
+/// Run the `sequence` subcommand. Two modes:
+///
+/// - Single-target (`--target <name>`): locate one function, render its
+///   body to stdout or `--out <FILE>`.
+/// - All (`--all`, requires `--out <DIR>`): every Rust function in the
+///   source tree is rendered into its own `<DIR>/<file>__<name>.mmd`.
 pub fn run_sequence(flags: &SequenceFlags) -> ExitCode {
-    if flags.target.trim().is_empty() {
-        eprintln!("sequence: --target must be non-empty");
+    if !flags.all
+        && flags
+            .target
+            .as_deref()
+            .is_none_or(|t| t.trim().is_empty())
+    {
+        eprintln!("sequence: pass --target <NAME> or --all");
         return ExitCode::UsageError;
     }
     let exclude: Vec<String> = flags
@@ -781,24 +798,40 @@ pub fn run_sequence(flags: &SequenceFlags) -> ExitCode {
         return ExitCode::Failure;
     }
 
+    if flags.all {
+        return run_sequence_all(&candidates, flags.out.as_deref());
+    }
+    run_sequence_single(
+        &candidates,
+        flags.target.as_deref().unwrap_or(""),
+        flags.out.as_deref(),
+        &flags.path,
+    )
+}
+
+fn run_sequence_single(
+    candidates: &[(String, Vec<u8>)],
+    target: &str,
+    out: Option<&Path>,
+    path: &Path,
+) -> ExitCode {
     let mut diagram = None;
-    for (file_rel, content) in &candidates {
-        if let Ok(d) = sequence::extract(content, file_rel, &flags.target) {
+    for (file_rel, content) in candidates {
+        if let Ok(d) = sequence::extract(content, file_rel, target) {
             diagram = Some((file_rel.clone(), d));
             break;
         }
     }
     let Some((file_rel, diagram)) = diagram else {
         eprintln!(
-            "sequence: function `{}` not found under {}",
-            flags.target,
-            flags.path.display()
+            "sequence: function `{target}` not found under {}",
+            path.display()
         );
         return ExitCode::Failure;
     };
     let rendered = sequence::render(&diagram);
 
-    let suffix = if let Some(path) = flags.out.as_deref() {
+    let suffix = if let Some(path) = out {
         if let Err(e) = std::fs::write(path, &rendered) {
             eprintln!("write {}: {e}", path.display());
             return ExitCode::Failure;
@@ -809,14 +842,83 @@ pub fn run_sequence(flags: &SequenceFlags) -> ExitCode {
         String::new()
     };
     eprintln!(
-        "sequence {} from {} ({} participants, {} steps){}",
-        flags.target,
-        file_rel,
+        "sequence {target} from {file_rel} ({} participants, {} steps){suffix}",
         diagram.participants.len(),
         diagram.steps.len(),
-        suffix,
     );
     ExitCode::Success
+}
+
+fn run_sequence_all(candidates: &[(String, Vec<u8>)], out: Option<&Path>) -> ExitCode {
+    let Some(out_dir) = out else {
+        eprintln!("sequence: --all requires --out <DIR>");
+        return ExitCode::UsageError;
+    };
+    if let Err(e) = std::fs::create_dir_all(out_dir) {
+        eprintln!("sequence: create {}: {e}", out_dir.display());
+        return ExitCode::Failure;
+    }
+
+    let mut written = 0usize;
+    let mut skipped = 0usize;
+    for (file_rel, content) in candidates {
+        let names = match sequence::list_functions(content) {
+            Ok(n) => n,
+            Err(e) => {
+                eprintln!("sequence: parse {file_rel}: {e}");
+                skipped += 1;
+                continue;
+            }
+        };
+        for name in names {
+            let Ok(diagram) = sequence::extract(content, file_rel, &name) else {
+                skipped += 1;
+                continue;
+            };
+            let filename = sequence_filename(file_rel, &name);
+            let target_path = out_dir.join(&filename);
+            let rendered = sequence::render(&diagram);
+            if let Err(e) = std::fs::write(&target_path, rendered) {
+                eprintln!("sequence: write {}: {e}", target_path.display());
+                return ExitCode::Failure;
+            }
+            written += 1;
+        }
+    }
+    eprintln!(
+        "sequence --all: {written} diagrams written to {} ({skipped} skipped)",
+        out_dir.display(),
+    );
+    ExitCode::Success
+}
+
+/// Build a collision-resistant filename from `(file_rel, qualified_name)`:
+/// `cli_support__run_diff.mmd`, `cache__Cache__open.mmd`, etc.
+fn sequence_filename(file_rel: &str, qualified_name: &str) -> String {
+    let stem = Path::new(file_rel)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("file");
+    let parent = Path::new(file_rel)
+        .parent()
+        .and_then(|p| p.to_str())
+        .unwrap_or("");
+    let prefix = if parent.is_empty() {
+        stem.to_owned()
+    } else {
+        format!("{}_{stem}", parent.replace(['/', '\\'], "_"))
+    };
+    let safe_name: String = qualified_name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    format!("{prefix}__{safe_name}.mmd")
 }
 
 /// Collect `(display_path, content)` pairs for every Rust source file under
@@ -1452,29 +1554,35 @@ mod tests {
         std::fs::write(&path, contents).unwrap();
     }
 
-    #[test]
-    fn sequence_empty_target_is_usage_error() {
-        let tmp = tempfile::tempdir().expect("tmp");
-        let flags = SequenceFlags {
-            path: tmp.path().to_path_buf(),
-            target: "   ".into(),
+    fn flags_for(path: PathBuf, target: Option<&str>) -> SequenceFlags {
+        SequenceFlags {
+            path,
+            target: target.map(str::to_owned),
+            all: false,
             exclude: String::new(),
             out: None,
             r#ref: None,
-        };
+        }
+    }
+
+    #[test]
+    fn sequence_no_target_no_all_is_usage_error() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let flags = flags_for(tmp.path().to_path_buf(), None);
+        assert_eq!(run_sequence(&flags), ExitCode::UsageError);
+    }
+
+    #[test]
+    fn sequence_empty_target_is_usage_error() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let flags = flags_for(tmp.path().to_path_buf(), Some("   "));
         assert_eq!(run_sequence(&flags), ExitCode::UsageError);
     }
 
     #[test]
     fn sequence_no_rust_files_returns_failure() {
         let tmp = tempfile::tempdir().expect("tmp");
-        let flags = SequenceFlags {
-            path: tmp.path().to_path_buf(),
-            target: "anything".into(),
-            exclude: String::new(),
-            out: None,
-            r#ref: None,
-        };
+        let flags = flags_for(tmp.path().to_path_buf(), Some("anything"));
         assert_eq!(run_sequence(&flags), ExitCode::Failure);
     }
 
@@ -1482,13 +1590,7 @@ mod tests {
     fn sequence_unknown_function_returns_failure() {
         let tmp = tempfile::tempdir().expect("tmp");
         write_rust(tmp.path(), "lib.rs", "fn other(){}\n");
-        let flags = SequenceFlags {
-            path: tmp.path().to_path_buf(),
-            target: "missing".into(),
-            exclude: String::new(),
-            out: None,
-            r#ref: None,
-        };
+        let flags = flags_for(tmp.path().to_path_buf(), Some("missing"));
         assert_eq!(run_sequence(&flags), ExitCode::Failure);
     }
 
@@ -1501,13 +1603,8 @@ mod tests {
             "fn run(cache: &Cache) { cache.open(); foo(); }\n",
         );
         let out = tmp.path().join("seq.mmd");
-        let flags = SequenceFlags {
-            path: tmp.path().to_path_buf(),
-            target: "run".into(),
-            exclude: String::new(),
-            out: Some(out.clone()),
-            r#ref: None,
-        };
+        let mut flags = flags_for(tmp.path().to_path_buf(), Some("run"));
+        flags.out = Some(out.clone());
         assert_eq!(run_sequence(&flags), ExitCode::Success);
         let body = std::fs::read_to_string(&out).expect("read");
         assert!(body.starts_with("sequenceDiagram"), "got:\n{body}");
@@ -1519,13 +1616,52 @@ mod tests {
     fn sequence_from_git_ref_succeeds() {
         let tmp = tempfile::tempdir().expect("tmp");
         init_rust_repo(tmp.path(), "lib.rs", "fn run() { foo(); }\n");
-        let flags = SequenceFlags {
-            path: tmp.path().to_path_buf(),
-            target: "run".into(),
-            exclude: String::new(),
-            out: None,
-            r#ref: Some("HEAD".into()),
-        };
+        let mut flags = flags_for(tmp.path().to_path_buf(), Some("run"));
+        flags.r#ref = Some("HEAD".into());
         assert_eq!(run_sequence(&flags), ExitCode::Success);
+    }
+
+    #[test]
+    fn sequence_all_requires_out_dir() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        write_rust(tmp.path(), "lib.rs", "fn a(){}\n");
+        let mut flags = flags_for(tmp.path().to_path_buf(), None);
+        flags.all = true;
+        assert_eq!(run_sequence(&flags), ExitCode::UsageError);
+    }
+
+    #[test]
+    fn sequence_all_writes_one_file_per_function() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        write_rust(
+            tmp.path(),
+            "lib.rs",
+            "fn a(){ b(); }\nfn b(){}\nstruct S;\nimpl S { fn m(&self){ a(); } }\n",
+        );
+        let out = tmp.path().join("diagrams");
+        let mut flags = flags_for(tmp.path().to_path_buf(), None);
+        flags.all = true;
+        flags.out = Some(out.clone());
+        assert_eq!(run_sequence(&flags), ExitCode::Success);
+        let entries: Vec<String> = std::fs::read_dir(&out)
+            .expect("read out_dir")
+            .filter_map(std::result::Result::ok)
+            .filter_map(|e| e.file_name().into_string().ok())
+            .collect();
+        assert!(entries.iter().any(|n| n.ends_with("__a.mmd")), "got: {entries:?}");
+        assert!(entries.iter().any(|n| n.ends_with("__b.mmd")), "got: {entries:?}");
+        assert!(entries.iter().any(|n| n.contains("S__m")), "got: {entries:?}");
+    }
+
+    #[test]
+    fn sequence_filename_qualifies_methods() {
+        let f = sequence_filename("src/cache.rs", "Cache::open");
+        assert!(f.contains("cache"), "got: {f}");
+        assert!(f.contains("Cache__open"), "got: {f}");
+        assert!(
+            Path::new(&f)
+                .extension()
+                .is_some_and(|e| e.eq_ignore_ascii_case("mmd"))
+        );
     }
 }

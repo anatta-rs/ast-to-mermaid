@@ -145,6 +145,55 @@ pub fn extract(content: &[u8], file_path: &str, target_fn: &str) -> Result<Seque
     })
 }
 
+/// List every function defined in `content`, returning their qualified
+/// names: `name` for free functions, `Owner::name` for methods inside an
+/// `impl` block. Order is depth-first source order.
+///
+/// # Errors
+///
+/// Same shapes as [`extract`] for UTF-8 / parse failures.
+pub fn list_functions(content: &[u8]) -> Result<Vec<String>> {
+    let text = std::str::from_utf8(content)
+        .map_err(|e| AstToMermaidError::InvalidInput(format!("invalid utf-8: {e}")))?;
+    let mut parser = TsParser::new();
+    parser
+        .set_language(&tree_sitter_rust::LANGUAGE.into())
+        .map_err(|e| AstToMermaidError::InvalidInput(format!("set_language: {e}")))?;
+    let tree = parser
+        .parse(content, None)
+        .ok_or_else(|| AstToMermaidError::InvalidInput("tree-sitter parse failed".into()))?;
+
+    let mut out: Vec<String> = Vec::new();
+    let mut stack: Vec<(Node, Option<String>)> = vec![(tree.root_node(), None)];
+    // Depth-first, but preserve source order: push children in reverse so
+    // they pop left-to-right.
+    while let Some((node, container)) = stack.pop() {
+        if node.kind() == "function_item"
+            && let Some(name_node) = node.child_by_field_name("name")
+            && let Ok(name) = name_node.utf8_text(text.as_bytes())
+        {
+            let qualified = container
+                .as_deref()
+                .map_or_else(|| name.to_owned(), |c| format!("{c}::{name}"));
+            out.push(qualified);
+        }
+        let next_container = if node.kind() == "impl_item" {
+            node.child_by_field_name("type")
+                .and_then(|n| n.utf8_text(text.as_bytes()).ok())
+                .map(str::to_owned)
+                .or(container)
+        } else {
+            container.clone()
+        };
+        let mut cursor = node.walk();
+        let children: Vec<Node> = node.children(&mut cursor).collect();
+        for child in children.into_iter().rev() {
+            stack.push((child, next_container.clone()));
+        }
+    }
+    Ok(out)
+}
+
 /// Locate `target_fn` in the file. Returns `(function_item node, optional
 /// container_name)` where container is the impl-owner type (e.g. `Foo` for
 /// methods of `impl Foo`) or `None` for free functions.
