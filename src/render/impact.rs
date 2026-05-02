@@ -98,6 +98,8 @@ mod tests {
             signature: String::new(),
             content_hash: "h".to_owned(),
             calls: Vec::new(),
+            method_calls: Vec::new(),
+            parent: None,
         }
     }
 

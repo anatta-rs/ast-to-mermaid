@@ -593,12 +593,16 @@ mod tests {
     fn analyze_simple_two_crate_workspace_renders_project() {
         let tmp = tempdir().expect("tmp");
         let root = tmp.path();
+        // Cross-crate `module::helper(...)` (qualified inline) — the
+        // resolver matches via the file-module-name fallback. Bare
+        // unrewritten calls no longer cross-crate-resolve, so we use
+        // an explicit qualifier.
         write(
             root,
             "crates/crate_a/src/lib.rs",
-            "pub fn caller() { helper(); }\n",
+            "pub fn caller() { helper::helper(); }\n",
         );
-        write(root, "crates/crate_b/src/lib.rs", "pub fn helper() {}\n");
+        write(root, "crates/crate_b/src/helper.rs", "pub fn helper() {}\n");
 
         let report = analyze(
             root,

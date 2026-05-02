@@ -339,6 +339,8 @@ mod tests {
             signature: String::new(),
             content_hash: "deadbeef".to_owned(),
             calls: Vec::new(),
+            method_calls: Vec::new(),
+            parent: None,
         }
     }
 

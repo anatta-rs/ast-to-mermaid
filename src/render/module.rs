@@ -217,6 +217,8 @@ mod tests {
             signature: String::new(),
             content_hash: "h".to_owned(),
             calls: Vec::new(),
+            method_calls: Vec::new(),
+            parent: None,
         }
     }
 
@@ -232,6 +234,8 @@ mod tests {
             signature: String::new(),
             content_hash: "h".to_owned(),
             calls: Vec::new(),
+            method_calls: Vec::new(),
+            parent: None,
         }
     }
 
@@ -366,6 +370,8 @@ mod tests {
             signature: String::new(),
             content_hash: "h".to_owned(),
             calls: Vec::new(),
+            method_calls: Vec::new(),
+            parent: None,
         };
         let m2 = CodeAtom {
             id: EntityId::new("code:src/foo.rs::function::Foo::update"),
@@ -378,6 +384,8 @@ mod tests {
             signature: String::new(),
             content_hash: "h".to_owned(),
             calls: Vec::new(),
+            method_calls: Vec::new(),
+            parent: None,
         };
         store.add_edge(Edge::new(
             m.id.clone(),
@@ -430,6 +438,8 @@ mod tests {
             signature: String::new(),
             content_hash: "h".to_owned(),
             calls: Vec::new(),
+            method_calls: Vec::new(),
+            parent: None,
         };
         store.add_edge(Edge::new(
             m.id.clone(),

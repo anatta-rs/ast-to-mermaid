@@ -139,6 +139,8 @@ mod tests {
             signature: String::new(),
             content_hash: "h".to_owned(),
             calls: Vec::new(),
+            method_calls: Vec::new(),
+            parent: None,
         }
     }
 
@@ -154,6 +156,8 @@ mod tests {
             signature: String::new(),
             content_hash: "h".to_owned(),
             calls: Vec::new(),
+            method_calls: Vec::new(),
+            parent: None,
         }
     }
 
@@ -310,6 +314,8 @@ mod tests {
             signature: String::new(),
             content_hash: "h".to_owned(),
             calls: Vec::new(),
+            method_calls: Vec::new(),
+            parent: None,
         };
         store.add_atom(a);
         let out = render(&store);

@@ -224,6 +224,8 @@ impl CodeParser {
             signature: String::new(),
             content_hash: module_hash,
             calls: Vec::new(),
+            method_calls: Vec::new(),
+            parent: None,
         });
 
         // ── File-scope use imports (Rust only) ────────────────────────────────
@@ -254,7 +256,6 @@ impl CodeParser {
                 };
                 let item_id = atom.id.clone();
                 let item_name = atom.name.clone();
-                let item_kind = atom.kind.clone();
                 name_to_id.insert(item_name.clone(), item_id.clone());
 
                 edges.push(Edge::new(
@@ -265,13 +266,29 @@ impl CodeParser {
                 items.push((item_id.clone(), call_names));
                 atoms.push(atom);
 
-                // For Rust `impl` blocks, lift every method as a function atom.
-                if item_kind == "impl" {
-                    let methods = extract_impl_methods(
+                // For Rust `impl` blocks and Python `class` definitions,
+                // lift every method to a first-class function atom.
+                let method_descent = match (self.language, item_node.kind()) {
+                    (Language::Rust, "impl_item") => Some((
+                        item_name.as_str(),
+                        impl_owner_type(&item_name),
+                        &queries::RUST.impl_methods,
+                    )),
+                    (Language::Python, "class_definition") => Some((
+                        item_name.as_str(),
+                        item_name.as_str(),
+                        &queries::PYTHON.class_methods,
+                    )),
+                    _ => None,
+                };
+                if let Some((container_name, parent_type, method_query)) = method_descent {
+                    let methods = extract_methods(
                         &item_node,
-                        &ImplCtx {
-                            impl_atom_id: &item_id,
-                            impl_owner_name: &item_name,
+                        &MethodCtx {
+                            container_atom_id: &item_id,
+                            container_name,
+                            parent_type,
+                            method_query,
                             source: text,
                             file_path,
                             language: self.language,
@@ -368,10 +385,10 @@ fn extract_item(
     };
 
     // Call names for functions.
-    let call_names = if ts_kind == "function_item" || ts_kind == "function_definition" {
+    let extracted = if ts_kind == "function_item" || ts_kind == "function_definition" {
         extract_calls(node, source, language, imports)
     } else {
-        Vec::new()
+        ExtractedCalls::default()
     };
 
     let item_id = EntityId::new(format!("code:{file_path}::{atom_kind}::{item_name}"));
@@ -386,69 +403,95 @@ fn extract_item(
         doc,
         signature,
         content_hash,
-        calls: call_names.clone(),
+        calls: extracted.calls.clone(),
+        method_calls: extracted.method_calls.clone(),
+        parent: None,
     };
 
-    Some((atom, call_names))
+    Some((atom, extracted.calls))
 }
 
-// ── Impl method descent ───────────────────────────────────────────────────────
+// ── Method descent (Rust impl + Python class) ────────────────────────────────
 
-/// Context bundle for [`extract_impl_methods`] — the fields are the same
+/// Context bundle for [`extract_methods`] — the fields are the same
 /// per-file values [`CodeParser::parse_into`] threads through extraction.
 #[derive(Clone, Copy)]
-struct ImplCtx<'a> {
-    impl_atom_id: &'a EntityId,
-    impl_owner_name: &'a str,
+struct MethodCtx<'a> {
+    /// Atom whose body we descend into (Rust `impl_item` or Python class).
+    container_atom_id: &'a EntityId,
+    /// Display name of the container (e.g. `"Foo"`, `"Display for Foo"`,
+    /// or a Python class name). Used to build child method ids and as the
+    /// prefix for intra-container `<owner>::method` calls.
+    container_name: &'a str,
+    /// Receiver type name to record on each method atom's `parent` field.
+    /// For Rust trait impls this is just the type (`Foo`, not `Display for
+    /// Foo`); for Python classes it is the class name.
+    parent_type: &'a str,
+    /// Compiled tree-sitter query that captures method nodes (`@method`)
+    /// inside the container body.
+    method_query: &'a tree_sitter::Query,
     source: &'a str,
     file_path: &'a str,
     language: Language,
     imports: &'a HashMap<String, String>,
 }
 
-/// Walk the body of an `impl_item` and emit every `function_item` inside it
-/// as a first-class function atom.
+/// Walk the body of a method container (Rust `impl_item` or Python
+/// `class_definition`) and emit every method as a first-class function atom.
 ///
 /// Each method atom:
-/// - id   = `code:{file}::function::{impl_owner}::{method_name}` (the impl
-///   owner disambiguates methods that share names across impls)
+/// - id   = `code:{file}::function::{container_name}::{method_name}` (the
+///   container disambiguates methods sharing names across containers)
 /// - kind = `"function"` (so the resolver and renderers treat them like
 ///   free functions)
-/// - name = bare method name (so cross-module name resolution still works)
+/// - name = bare method name (display label)
+/// - parent = `Some(parent_type)` — the receiver type. Drives the
+///   resolver's qualified-only matching for cross-module method calls.
 ///
 /// Edges emitted:
-/// - `Contains`: impl atom → method atom
+/// - `Contains`: container atom → method atom
 /// - `Calls`: bare-name calls inside one method that match the bare name of
-///   another method *in the same impl* are linked directly (the global
+///   another method *in the same container* are linked directly (the global
 ///   resolver can't see this scope, so we do it here).
 ///
 /// Returns the `(method_id, call_names)` tuples so the caller can feed them
 /// into the file-wide cross-module resolver pass.
-fn extract_impl_methods(
-    impl_node: &Node,
-    ctx: &ImplCtx,
+#[allow(clippy::too_many_lines)]
+fn extract_methods(
+    container_node: &Node,
+    ctx: &MethodCtx,
     out_atoms: &mut Vec<CodeAtom>,
     out_edges: &mut Vec<Edge>,
 ) -> Vec<(EntityId, Vec<String>)> {
-    let ImplCtx {
-        impl_atom_id,
-        impl_owner_name,
+    let MethodCtx {
+        container_atom_id,
+        container_name,
+        parent_type,
+        method_query,
         source,
         file_path,
         language,
         imports,
     } = *ctx;
 
-    // Pass 1: extract every method, build the impl-local name lookup.
-    // The `impl_methods` query matches method `function_item` children of
-    // the impl's `declaration_list` body.
+    // Pass 1: extract every method, build the container-local name lookup.
     let mut method_id_by_name: HashMap<String, EntityId> = HashMap::new();
-    let mut pending: Vec<(EntityId, CodeAtom, Vec<String>)> = Vec::new();
+    let mut pending: Vec<(EntityId, CodeAtom, ExtractedCalls)> = Vec::new();
     let mut cursor = QueryCursor::new();
-    let mut matches = cursor.matches(&queries::RUST.impl_methods, *impl_node, source.as_bytes());
+    let mut matches = cursor.matches(method_query, *container_node, source.as_bytes());
     while let Some(m) = matches.next() {
         for capture in m.captures {
-            let inner = capture.node;
+            // Python class bodies can hold `decorated_definition` wrappers;
+            // unwrap to the inner `function_definition` so the `name` field
+            // and span come from the actual def, not the decorator chain.
+            let inner = if capture.node.kind() == "decorated_definition" {
+                let Some(def) = capture.node.child_by_field_name("definition") else {
+                    continue;
+                };
+                def
+            } else {
+                capture.node
+            };
             let Some(method_name) = inner
                 .child_by_field_name("name")
                 .and_then(|n| n.utf8_text(source.as_bytes()).ok())
@@ -473,10 +516,10 @@ fn extract_impl_methods(
             } else {
                 rust_doc_comment(source, inner.start_position().row)
             };
-            let call_names = extract_calls(&inner, source, language, imports);
+            let extracted = extract_calls(&inner, source, language, imports);
 
             let id = EntityId::new(format!(
-                "code:{file_path}::function::{impl_owner_name}::{method_name}"
+                "code:{file_path}::function::{container_name}::{method_name}"
             ));
             let atom = CodeAtom {
                 id: id.clone(),
@@ -488,31 +531,42 @@ fn extract_impl_methods(
                 doc,
                 signature,
                 content_hash,
-                calls: call_names.clone(),
+                calls: extracted.calls.clone(),
+                method_calls: extracted.method_calls.clone(),
+                parent: Some(parent_type.to_owned()),
             };
             method_id_by_name.insert(method_name, id.clone());
-            pending.push((id, atom, call_names));
+            pending.push((id, atom, extracted));
         }
     }
 
-    // Pass 2: emit atoms + Contains edges + intra-impl Calls edges.
-    let owner_prefix = format!("{impl_owner_name}::");
+    // Pass 2: emit atoms + Contains edges + intra-container Calls edges.
+    let owner_prefix = format!("{container_name}::");
+    let parent_prefix = format!("{parent_type}::");
     let mut out: Vec<(EntityId, Vec<String>)> = Vec::with_capacity(pending.len());
-    for (method_id, atom, call_names) in pending {
+    for (method_id, atom, extracted) in pending {
         out_edges.push(Edge::new(
-            impl_atom_id.clone(),
+            container_atom_id.clone(),
             method_id.clone(),
             EdgeKind::Contains,
         ));
-        for call_name in &call_names {
-            // Normalise: bare `foo`, `Self::foo`, and `<owner>::foo` all
-            // refer to a sibling method of the same impl.
+        // Intra-container linking sees BOTH `calls` (qualified / free-form)
+        // AND `method_calls` (`self.method()`-shaped). The receiver type
+        // *is* known here — it's this container — so we do want to bind
+        // a sibling method when the bare name matches.
+        for call_name in extracted.calls.iter().chain(extracted.method_calls.iter()) {
+            // Normalise: bare `foo`, `Self::foo`, `<container>::foo`, and
+            // `<parent_type>::foo` all refer to a sibling method of the
+            // same container. The two prefixes differ for Rust trait impls
+            // (`"Display for Foo"` vs `"Foo"`); for Python they coincide.
             let local_target = if let Some(rest) = call_name.strip_prefix("Self::") {
                 Some(rest)
             } else if !call_name.contains("::") {
                 Some(call_name.as_str())
+            } else if let Some(rest) = call_name.strip_prefix(&owner_prefix) {
+                Some(rest)
             } else {
-                call_name.strip_prefix(&owner_prefix)
+                call_name.strip_prefix(&parent_prefix)
             };
             let Some(target_name) = local_target else {
                 continue;
@@ -528,7 +582,10 @@ fn extract_impl_methods(
             }
         }
         out_atoms.push(atom);
-        out.push((method_id, call_names));
+        // Hand the resolver-eligible calls back to the caller so they
+        // feed into the cross-module pass — `method_calls` are
+        // intentionally dropped at this boundary.
+        out.push((method_id, extracted.calls));
     }
 
     out
@@ -554,10 +611,29 @@ fn extract_name(node: &Node, source: &str, ts_kind: &str) -> Option<String> {
 
 // ── Call extraction ───────────────────────────────────────────────────────────
 
+/// Bundle of call-site captures coming out of [`extract_calls`].
+///
+/// `calls` are resolver-eligible: free-fn calls (bare identifier, possibly
+/// expanded via `use` imports) and qualified `module::foo` /
+/// `Owner::method` paths.
+///
+/// `method_calls` are receiver-style captures (`obj.method()`) — the
+/// receiver type is unknown, so they only carry weight for intra-
+/// container linking (`self.method()`). The cross-module resolver
+/// ignores them; that is what stops `client.build()` from ghost-binding
+/// to a free fn `build` defined in some unrelated module.
+#[derive(Debug, Default, Clone)]
+struct ExtractedCalls {
+    calls: Vec<String>,
+    method_calls: Vec<String>,
+}
+
 /// Extract every call site within `node`'s subtree. Bare-name Rust calls
 /// (e.g. `foo()` after `use crate::other::foo`) are normalised to their
 /// fully-qualified path via `imports`; qualified inline calls
-/// (`module::foo`, `crate::path::foo`) are kept verbatim.
+/// (`module::foo`, `crate::path::foo`) are kept verbatim. Receiver-style
+/// calls (`obj.method()`) are routed into `method_calls` instead of
+/// `calls` so the cross-module resolver never matches them by name.
 ///
 /// Driven by `queries/{lang}/calls.scm` — see the .scm files for the exact
 /// patterns and a note on why method calls match `field_expression`
@@ -567,8 +643,8 @@ fn extract_calls(
     source: &str,
     language: Language,
     imports: &HashMap<String, String>,
-) -> Vec<String> {
-    let mut calls: Vec<String> = Vec::new();
+) -> ExtractedCalls {
+    let mut out = ExtractedCalls::default();
     let mut cursor = QueryCursor::new();
     let bytes = source.as_bytes();
 
@@ -592,7 +668,7 @@ fn extract_calls(
                         match cap.node.kind() {
                             "identifier" => {
                                 // Bare call: expand via use imports if available.
-                                calls.push(
+                                out.calls.push(
                                     imports
                                         .get(text)
                                         .cloned()
@@ -601,15 +677,17 @@ fn extract_calls(
                             }
                             "scoped_identifier" => {
                                 // Qualified — keep verbatim so the resolver
-                                // can disambiguate by module.
-                                calls.push(text.to_owned());
+                                // can disambiguate by module / type.
+                                out.calls.push(text.to_owned());
                             }
                             _ => {}
                         }
                     } else if Some(cap.index) == cn_call_field {
-                        // `obj.method` → `method`. Many of these (`unwrap`,
-                        // `iter`, …) are filtered later by SKIP_CALLS.
-                        calls.push(text.to_owned());
+                        // `obj.method` → `method`. Receiver type is
+                        // unknown, so this never feeds the resolver — it
+                        // only powers intra-container `self.method()`
+                        // linking.
+                        out.method_calls.push(text.to_owned());
                     }
                 }
             }
@@ -622,12 +700,19 @@ fn extract_calls(
                     let Ok(text) = cap.node.utf8_text(bytes) else {
                         continue;
                     };
-                    // `foo()` and `obj.method()` both come through here.
-                    // Strip any receiver — keep only the trailing name.
-                    if let Some(short) = text.rsplit('.').next()
-                        && !short.is_empty()
-                    {
-                        calls.push(short.to_owned());
+                    // `foo()` is captured as `identifier`; `obj.method()`
+                    // captures the whole `attribute` node ("obj.method").
+                    // Sort them: identifiers go to `calls`, attributes to
+                    // `method_calls` (after stripping the receiver chain).
+                    match cap.node.kind() {
+                        "identifier" => out.calls.push(text.to_owned()),
+                        _ => {
+                            if let Some(short) = text.rsplit('.').next()
+                                && !short.is_empty()
+                            {
+                                out.method_calls.push(short.to_owned());
+                            }
+                        }
                     }
                 }
             }
@@ -635,8 +720,10 @@ fn extract_calls(
     }
 
     let mut seen: HashSet<String> = HashSet::new();
-    calls.retain(|c| seen.insert(c.clone()));
-    calls
+    out.calls.retain(|c| seen.insert(c.clone()));
+    seen.clear();
+    out.method_calls.retain(|c| seen.insert(c.clone()));
+    out
 }
 
 /// Look up a capture's index in a compiled query by its `@name`.
@@ -881,6 +968,24 @@ fn hex_sha256(bytes: &[u8]) -> String {
 pub fn module_name(path: &str) -> &str {
     let basename = path.rsplit('/').next().unwrap_or(path);
     basename.rsplit_once('.').map_or(basename, |(stem, _)| stem)
+}
+
+/// Reduce an `impl` block's owner string to just the implementing type.
+///
+/// `extract_name` produces `"Foo"` for inherent impls and `"Trait for Foo"`
+/// for trait impls (possibly with generics or `path::Trait`). The resolver
+/// only cares about the receiver type, so we strip the `Trait for ` prefix
+/// and any generics tail.
+///
+/// `Foo`                            → `Foo`
+/// `Display for Foo`                → `Foo`
+/// `fmt::Debug for Foo`             → `Foo`
+/// `Iterator<Item = u32> for Foo<T>`→ `Foo<T>`  (generics on the *type* are
+///                                              kept verbatim — the resolver
+///                                              also uses the type's bare
+///                                              name only when matching)
+fn impl_owner_type(owner: &str) -> &str {
+    owner.split_once(" for ").map_or(owner, |(_, t)| t).trim()
 }
 
 #[cfg(test)]
