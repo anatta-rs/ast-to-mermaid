@@ -864,4 +864,445 @@ mod tests {
         };
         assert_eq!(run_bundle(&flags), ExitCode::Failure);
     }
+
+    // --- helpers -----------------------------------------------------------
+
+    /// Spawn `git` against `cwd`, scrubbing inherited `GIT_*` env vars so the
+    /// tempdir's tiny repo isn't hijacked by an outer `git commit` /
+    /// `git push` running our test suite (same rationale as the helper in
+    /// `git_source` tests — see that comment for the gory details).
+    fn git(cwd: &Path, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(cwd)
+            .args(args)
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_INDEX_FILE")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_OBJECT_DIRECTORY")
+            .output()
+            .unwrap_or_else(|e| panic!("git {args:?}: {e}"));
+        if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            panic!("git {args:?} failed: {stderr}");
+        }
+    }
+
+    /// Initialize a tiny single-file Rust repo with one commit on `main`.
+    /// Returns the path (== `dir`) for chaining convenience.
+    fn init_rust_repo(dir: &Path, file_rel: &str, content: &str) {
+        git(dir, &["init", "-q", "-b", "main"]);
+        git(dir, &["config", "user.email", "t@t"]);
+        git(dir, &["config", "user.name", "t"]);
+        git(dir, &["config", "commit.gpgsign", "false"]);
+        let path = dir.join(file_rel);
+        if let Some(p) = path.parent() {
+            std::fs::create_dir_all(p).unwrap();
+        }
+        std::fs::write(&path, content).unwrap();
+        git(dir, &["add", file_rel]);
+        git(dir, &["commit", "-q", "-m", "init"]);
+    }
+
+    // --- parse_size --------------------------------------------------------
+
+    #[test]
+    fn parse_size_plain_bytes() {
+        assert_eq!(parse_size("42").unwrap(), 42);
+    }
+
+    #[test]
+    fn parse_size_suffixes_kilo_mega_giga() {
+        assert_eq!(parse_size("2K").unwrap(), 2 * 1024);
+        assert_eq!(parse_size("3m").unwrap(), 3 * 1024 * 1024);
+        assert_eq!(parse_size("1G").unwrap(), 1024 * 1024 * 1024);
+        // Mixed-case suffixes accepted.
+        assert_eq!(parse_size("4k").unwrap(), 4 * 1024);
+    }
+
+    #[test]
+    fn parse_size_empty_errors() {
+        let err = parse_size("   ").unwrap_err();
+        assert!(err.contains("empty"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_size_non_numeric_errors() {
+        let err = parse_size("abc").unwrap_err();
+        assert!(err.contains("expected"), "got: {err}");
+    }
+
+    // --- parse_duration ----------------------------------------------------
+
+    #[test]
+    fn parse_duration_units() {
+        assert_eq!(parse_duration("30s").unwrap(), Duration::from_secs(30));
+        assert_eq!(parse_duration("2m").unwrap(), Duration::from_secs(120));
+        assert_eq!(parse_duration("1h").unwrap(), Duration::from_secs(3600));
+        assert_eq!(parse_duration("1d").unwrap(), Duration::from_secs(86400));
+        assert_eq!(parse_duration("1w").unwrap(), Duration::from_secs(604_800));
+        // No suffix => seconds.
+        assert_eq!(parse_duration("7").unwrap(), Duration::from_secs(7));
+    }
+
+    #[test]
+    fn parse_duration_empty_errors() {
+        assert!(parse_duration("").unwrap_err().contains("empty"));
+    }
+
+    #[test]
+    fn parse_duration_non_numeric_errors() {
+        let err = parse_duration("xs").unwrap_err();
+        assert!(err.contains("expected"), "got: {err}");
+    }
+
+    // --- CacheArgs::resolve ------------------------------------------------
+
+    #[test]
+    fn cache_args_resolve_no_cache_returns_tempdir_handle() {
+        let args = CacheArgs {
+            cache_dir: None,
+            no_cache: true,
+        };
+        let (root, handle) = args.resolve(Path::new("/tmp")).expect("resolve no_cache");
+        assert!(handle.is_some(), "no_cache must keep a tempdir alive");
+        assert!(root.exists(), "tempdir root must exist while handle held");
+    }
+
+    #[test]
+    fn cache_args_resolve_explicit_cache_dir_wins() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let explicit = tmp.path().join("explicit-cache");
+        let args = CacheArgs {
+            cache_dir: Some(explicit.clone()),
+            no_cache: false,
+        };
+        let (root, handle) = args.resolve(Path::new("/tmp")).expect("resolve");
+        assert_eq!(root, explicit);
+        assert!(handle.is_none(), "explicit cache_dir is persistent");
+    }
+
+    #[test]
+    fn cache_args_resolve_default_outside_git_falls_back_to_path() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let args = CacheArgs::default();
+        let (root, handle) = args.resolve(tmp.path()).expect("resolve");
+        // Outside a git repo, default_root is built from `path` itself.
+        assert_eq!(root, Cache::default_root(tmp.path()));
+        assert!(handle.is_none());
+    }
+
+    // --- run_walk_ref ------------------------------------------------------
+
+    #[test]
+    fn walk_with_ref_lists_supported_languages_only() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        init_rust_repo(tmp.path(), "src/lib.rs", "fn x() {}\n");
+        // Add a non-source file in a follow-up commit so it appears in HEAD.
+        std::fs::write(tmp.path().join("README.md"), "doc").unwrap();
+        git(tmp.path(), &["add", "README.md"]);
+        git(tmp.path(), &["commit", "-q", "-m", "doc"]);
+
+        let flags = WalkFlags {
+            path: tmp.path().to_path_buf(),
+            exclude: String::new(),
+            r#ref: Some("HEAD".into()),
+        };
+        assert_eq!(run_walk(&flags), ExitCode::Success);
+    }
+
+    #[test]
+    fn walk_with_ref_outside_git_repo_fails() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let flags = WalkFlags {
+            path: tmp.path().to_path_buf(),
+            exclude: String::new(),
+            r#ref: Some("HEAD".into()),
+        };
+        assert_eq!(run_walk(&flags), ExitCode::Failure);
+    }
+
+    #[test]
+    fn walk_with_unknown_ref_fails() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        init_rust_repo(tmp.path(), "src/lib.rs", "fn x() {}\n");
+        let flags = WalkFlags {
+            path: tmp.path().to_path_buf(),
+            exclude: String::new(),
+            r#ref: Some("definitely-not-a-ref".into()),
+        };
+        assert_eq!(run_walk(&flags), ExitCode::Failure);
+    }
+
+    #[test]
+    fn walk_honours_exclude_list() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        std::fs::create_dir_all(tmp.path().join("vendor")).unwrap();
+        std::fs::write(tmp.path().join("vendor/skip.rs"), "fn s(){}").unwrap();
+        std::fs::write(tmp.path().join("keep.rs"), "fn k(){}").unwrap();
+        let flags = WalkFlags {
+            path: tmp.path().to_path_buf(),
+            exclude: "vendor".into(),
+            r#ref: None,
+        };
+        assert_eq!(run_walk(&flags), ExitCode::Success);
+    }
+
+    // --- run_index ---------------------------------------------------------
+
+    #[test]
+    fn index_succeeds_then_is_idempotent() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        init_rust_repo(tmp.path(), "src/lib.rs", "fn a(){}\nfn b(){a()}\n");
+        let cache_dir = tmp.path().join("cache");
+
+        let flags = IndexFlags {
+            path: tmp.path().to_path_buf(),
+            r#ref: Some("HEAD".into()),
+            force: false,
+            cache: CacheArgs {
+                cache_dir: Some(cache_dir.clone()),
+                no_cache: false,
+            },
+        };
+        assert_eq!(run_index(&flags), ExitCode::Success);
+
+        // Second run hits the `cached` short-circuit branch.
+        assert_eq!(run_index(&flags), ExitCode::Success);
+
+        // With --force, we re-materialize even when the bundle exists.
+        let forced = IndexFlags {
+            force: true,
+            ..flags.clone()
+        };
+        assert_eq!(run_index(&forced), ExitCode::Success);
+    }
+
+    #[test]
+    fn index_with_unknown_ref_fails() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        init_rust_repo(tmp.path(), "src/lib.rs", "fn x(){}\n");
+        let flags = IndexFlags {
+            path: tmp.path().to_path_buf(),
+            r#ref: Some("nope".into()),
+            force: false,
+            cache: CacheArgs {
+                cache_dir: Some(tmp.path().join("cache")),
+                no_cache: false,
+            },
+        };
+        assert_eq!(run_index(&flags), ExitCode::Failure);
+    }
+
+    #[test]
+    fn index_no_cache_skips_persistence() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        init_rust_repo(tmp.path(), "src/lib.rs", "fn x(){}\n");
+        let flags = IndexFlags {
+            path: tmp.path().to_path_buf(),
+            r#ref: Some("HEAD".into()),
+            force: false,
+            cache: CacheArgs {
+                cache_dir: None,
+                no_cache: true,
+            },
+        };
+        assert_eq!(run_index(&flags), ExitCode::Success);
+    }
+
+    // --- run_diff ----------------------------------------------------------
+
+    #[test]
+    fn diff_range_without_double_dot_is_usage_error() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let flags = DiffFlags {
+            range: "abc".into(),
+            path: tmp.path().to_path_buf(),
+            format: DiffFormat::Mermaid,
+            cache: CacheArgs::default(),
+        };
+        assert_eq!(run_diff(&flags), ExitCode::UsageError);
+    }
+
+    #[test]
+    fn diff_range_with_empty_side_is_usage_error() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let flags = DiffFlags {
+            range: "..main".into(),
+            path: tmp.path().to_path_buf(),
+            format: DiffFormat::Mermaid,
+            cache: CacheArgs::default(),
+        };
+        assert_eq!(run_diff(&flags), ExitCode::UsageError);
+    }
+
+    #[test]
+    fn diff_with_unknown_first_ref_fails() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        init_rust_repo(tmp.path(), "src/lib.rs", "fn x(){}\n");
+        let flags = DiffFlags {
+            range: "nope..HEAD".into(),
+            path: tmp.path().to_path_buf(),
+            format: DiffFormat::Mermaid,
+            cache: CacheArgs {
+                cache_dir: Some(tmp.path().join("cache")),
+                no_cache: false,
+            },
+        };
+        assert_eq!(run_diff(&flags), ExitCode::Failure);
+    }
+
+    #[test]
+    fn diff_two_commits_succeeds_in_both_formats() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        init_rust_repo(tmp.path(), "src/lib.rs", "fn a(){}\n");
+        // Second commit modifies the file → non-trivial diff.
+        std::fs::write(tmp.path().join("src/lib.rs"), "fn a(){}\nfn b(){}\n").unwrap();
+        git(tmp.path(), &["add", "src/lib.rs"]);
+        git(tmp.path(), &["commit", "-q", "-m", "add b"]);
+
+        let cache_dir = tmp.path().join("cache");
+        let mermaid = DiffFlags {
+            range: "HEAD~1..HEAD".into(),
+            path: tmp.path().to_path_buf(),
+            format: DiffFormat::Mermaid,
+            cache: CacheArgs {
+                cache_dir: Some(cache_dir.clone()),
+                no_cache: false,
+            },
+        };
+        assert_eq!(run_diff(&mermaid), ExitCode::Success);
+
+        // Re-run with JSON to exercise the second arm (and the
+        // ensure_indexed cache-hit short-circuit).
+        let json = DiffFlags {
+            format: DiffFormat::Json,
+            ..mermaid.clone()
+        };
+        assert_eq!(run_diff(&json), ExitCode::Success);
+    }
+
+    // --- run_gc ------------------------------------------------------------
+
+    #[test]
+    fn gc_succeeds_on_empty_cache() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let flags = GcFlags {
+            path: tmp.path().to_path_buf(),
+            max_size: "1G".into(),
+            older_than: None,
+            dry_run: false,
+            cache: CacheArgs {
+                cache_dir: Some(tmp.path().join("cache")),
+                no_cache: false,
+            },
+        };
+        assert_eq!(run_gc(&flags), ExitCode::Success);
+    }
+
+    #[test]
+    fn gc_dry_run_with_age_filter_succeeds() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let flags = GcFlags {
+            path: tmp.path().to_path_buf(),
+            max_size: "10M".into(),
+            older_than: Some("30d".into()),
+            dry_run: true,
+            cache: CacheArgs {
+                cache_dir: Some(tmp.path().join("cache")),
+                no_cache: false,
+            },
+        };
+        assert_eq!(run_gc(&flags), ExitCode::Success);
+    }
+
+    #[test]
+    fn gc_bad_max_size_is_usage_error() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let flags = GcFlags {
+            path: tmp.path().to_path_buf(),
+            max_size: "huge".into(),
+            older_than: None,
+            dry_run: false,
+            cache: CacheArgs::default(),
+        };
+        assert_eq!(run_gc(&flags), ExitCode::UsageError);
+    }
+
+    #[test]
+    fn gc_bad_older_than_is_usage_error() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let flags = GcFlags {
+            path: tmp.path().to_path_buf(),
+            max_size: "1G".into(),
+            older_than: Some("forever".into()),
+            dry_run: false,
+            cache: CacheArgs::default(),
+        };
+        assert_eq!(run_gc(&flags), ExitCode::UsageError);
+    }
+
+    // --- run_bundle / run_analyze with --ref ------------------------------
+
+    #[test]
+    fn bundle_from_git_ref_succeeds() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        init_rust_repo(tmp.path(), "src/lib.rs", "fn a(){}\n");
+        let out = tmp.path().join("bundle-out");
+        let flags = BundleFlags {
+            path: tmp.path().to_path_buf(),
+            out: out.clone(),
+            exclude: String::new(),
+            r#ref: Some("HEAD".into()),
+        };
+        assert_eq!(run_bundle(&flags), ExitCode::Success);
+        assert!(out.join("index.json").exists());
+    }
+
+    #[test]
+    fn analyze_from_git_ref_succeeds() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        init_rust_repo(tmp.path(), "src/lib.rs", "fn a(){}\n");
+        let flags = AnalyzeFlags {
+            path: tmp.path().to_path_buf(),
+            target: None,
+            exclude: String::new(),
+            out: None,
+            r#ref: Some("HEAD".into()),
+            format: AnalyzeFormat::default(),
+        };
+        assert_eq!(run_analyze(Level::Project, &flags), ExitCode::Success);
+    }
+
+    #[test]
+    fn analyze_dot_format_to_stdout_succeeds() {
+        // Distinct from the existing dot-to-file test — exercises the
+        // stdout branch of run_analyze under --format=dot.
+        let tmp = tempfile::tempdir().expect("tmp");
+        let flags = AnalyzeFlags {
+            path: tmp.path().to_path_buf(),
+            target: None,
+            exclude: String::new(),
+            out: None,
+            r#ref: None,
+            format: AnalyzeFormat::Dot,
+        };
+        assert_eq!(run_analyze(Level::Project, &flags), ExitCode::Success);
+    }
+
+    #[test]
+    fn analyze_write_to_unwritable_path_returns_failure() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        // Writing to a directory-as-file fails the std::fs::write call.
+        let bogus_out = tmp.path().to_path_buf();
+        let flags = AnalyzeFlags {
+            path: tmp.path().to_path_buf(),
+            target: None,
+            exclude: String::new(),
+            out: Some(bogus_out),
+            r#ref: None,
+            format: AnalyzeFormat::default(),
+        };
+        assert_eq!(run_analyze(Level::Project, &flags), ExitCode::Failure);
+    }
 }
