@@ -140,64 +140,47 @@ That's a feature commit. A bug fix would have one orange node, a single edge to 
 
 ### Order of operations: `a2m sequence ./src --target <fn>`
 
-The other five views are unordered call graphs — they tell you *who calls whom*, not *in what order*. `a2m sequence` walks one function body in source order and emits a Mermaid `sequenceDiagram`: lifelines per receiver, arrows per call, control flow lifted into `alt` / `loop` blocks. Real output for `Cache::gc` from this repo:
+The other five views are unordered call graphs — they tell you *who calls whom*, not *in what order*. `a2m sequence` walks one function body in source order and emits a Mermaid `sequenceDiagram`: lifelines per receiver, arrows per call, control flow lifted into `alt` / `loop` blocks. Take `dir_size_recursive` from this repo's cache module — 12 lines of Rust, a tree walk:
+
+```rust
+fn dir_size_recursive(dir: &Path) -> Result<u64> {
+    let mut total = 0;
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let meta = entry.metadata()?;
+        if meta.is_dir() {
+            total += dir_size_recursive(&entry.path())?;
+        } else {
+            total += meta.len();
+        }
+    }
+    Ok(total)
+}
+```
+
+`a2m sequence ./src --target dir_size_recursive` →
 
 ```mermaid
 sequenceDiagram
     autonumber
-    %% pub fn gc(&self, opts: &GcOptions) -> Result<GcReport>
-    participant self as Cache
-    participant Vec as Vec
-    participant std as std
-    participant entries as entries
-    participant to_remove as to_remove
-    participant sorted as sorted
-    participant kept_size as kept_size
-    self->>Vec: new
-    self->>self: collect_gc_entries
-    self->>self: join
-    self->>self: collect_gc_entries
-    self->>self: join
-    self->>std: now
-    self->>entries: sum
-    self->>entries: len
-    self->>Vec: new
-    alt if let Some(older_than) = opts.olde…
-        loop for &entries
-            alt if let Ok(age) = now.duration_since…
-                self->>to_remove: push
-            end
-        end
-    end
-    self->>entries: collect
-    self->>sorted: sort_by_key
-    self->>sorted: sum
-    alt if let Some(cap) = opts.max_size_by…
-        loop for &sorted
-            self->>kept_size: saturating_sub
-            self->>to_remove: push
-        end
-    end
-    self->>to_remove: sum
-    self->>to_remove: len
-    alt if !opts.dry_run
-        loop for &to_remove
-            alt if e.path.is_dir()
-                self->>std: remove_dir_all
-            else
-                self->>std: remove_file
-            end
+    %% fn dir_size_recursive(dir: &Path) -> Result<u64>
+    participant self as self
+    participant entry as entry
+    participant meta as meta
+    loop for std::fs::read_dir(dir)?
+        self->>entry: metadata
+        alt if meta.is_dir()
+            self->>self: dir_size_recursive
+            self->>entry: path
+        else
+            self->>meta: len
         end
     end
 ```
 
-What a reader gets from this in five seconds without opening the file:
+The whole algorithm in one glance: a `for` over directory entries, branching on `is_dir()` — the recursive call (the `self`-loop on step 3) versus the leaf-file path (`meta.len()`). The recursion is *visually* a self-arrow on the `self` lifeline; the `else` branch on a different lifeline (`meta`) makes the dir/file split obvious without reading the source.
 
-- **Two-pass eviction.** The first `if let Some(older_than)` walks `entries` and pushes age-evicted ones; then `sort_by_key` reorders, the second `if let Some(cap)` does size-capped eviction. Two policies, one queue.
-- **`!opts.dry_run` gate is the *only* place that touches the filesystem** — every step before is pure computation. Easy to audit which arms call `remove_*` and which don't.
-- **`is_dir() → remove_dir_all` else `remove_file`** is right there in the diagram, no need to grep.
-
-Receiver classification is syntactic — `obj.method()` → `obj`, `Type::method()` → `Type`, bare ident → `self`. `.await` annotates the arrow. Test/panic plumbing (`assert!`, `Some`/`Ok` constructors, etc.) is filtered out as noise. Pass `--all --out <DIR>` to dump one `.mmd` per non-empty function across the tree.
+Receiver classification is syntactic: `obj.method()` → `obj`, `Type::method()` → `Type`, bare ident → `self`. `.await` annotates the arrow. Test/panic plumbing (`assert!`, `Some`/`Ok` constructors, etc.) is filtered out as noise. Pass `--all --out <DIR>` to dump one `.mmd` per non-empty function across the tree.
 
 ## Install
 
