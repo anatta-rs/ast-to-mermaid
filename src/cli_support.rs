@@ -130,6 +130,7 @@ pub fn run_analyze(level: Level, flags: &AnalyzeFlags) -> ExitCode {
         exclude,
         git_ref: flags.r#ref.clone(),
         cache,
+        ..AnalyzeOptions::default()
     };
 
     let report = match analyze(&flags.path, &opts) {
@@ -296,6 +297,11 @@ pub struct IndexFlags {
     #[arg(long)]
     pub force: bool,
 
+    /// Also emit `sequences/<id>.mmd` for every Rust function whose body
+    /// has at least one step. Off by default; roughly doubles wall-time.
+    #[arg(long)]
+    pub with_sequences: bool,
+
     /// Shared cache flags (`--cache-dir`, `--no-cache`).
     #[command(flatten)]
     pub cache: CacheArgs,
@@ -342,6 +348,7 @@ pub fn run_index(flags: &IndexFlags) -> ExitCode {
     let opts = AnalyzeOptions {
         git_ref: flags.r#ref.clone(),
         cache: Cache::open(&cache_root).ok().map(Arc::new),
+        with_sequences: flags.with_sequences,
         ..AnalyzeOptions::default()
     };
     let (artifacts, report) = match bundle(&flags.path, &opts) {
@@ -666,7 +673,8 @@ pub struct BundleFlags {
     pub path: PathBuf,
 
     /// Output directory for the bundle (`overview.mmd`, `index.json`,
-    /// `entities/<id>.mmd`, `entities/<id>.meta.json`).
+    /// `entities/<id>.mmd`, `entities/<id>.meta.json`, and optionally
+    /// `sequences/<id>.mmd` when `--with-sequences` is set).
     #[arg(short, long)]
     pub out: PathBuf,
 
@@ -679,6 +687,11 @@ pub struct BundleFlags {
     /// instead of the working tree.
     #[arg(long, value_name = "GIT-REF")]
     pub r#ref: Option<String>,
+
+    /// Also emit `sequences/<id>.mmd` for every Rust function whose body
+    /// has at least one step. Off by default; roughly doubles wall-time.
+    #[arg(long)]
+    pub with_sequences: bool,
 }
 
 /// Run the artifact-bundle subcommand: parse → resolve → emit a directory
@@ -698,6 +711,7 @@ pub fn run_bundle(flags: &BundleFlags) -> ExitCode {
         exclude,
         git_ref: flags.r#ref.clone(),
         cache,
+        with_sequences: flags.with_sequences,
         ..AnalyzeOptions::default()
     };
 
@@ -1086,6 +1100,7 @@ mod tests {
             out: out.clone(),
             exclude: String::new(),
             r#ref: None,
+            with_sequences: false,
         };
         assert_eq!(run_bundle(&flags), ExitCode::Success);
         assert!(out.join("index.json").exists());
@@ -1100,8 +1115,49 @@ mod tests {
             out: tmp.path().join("bundle-out"),
             exclude: String::new(),
             r#ref: None,
+            with_sequences: false,
         };
         assert_eq!(run_bundle(&flags), ExitCode::Failure);
+    }
+
+    #[test]
+    fn bundle_with_sequences_flag_writes_sequences_dir() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        write_rust(
+            tmp.path(),
+            "src/lib.rs",
+            "pub fn caller() { helper(); }\npub fn helper() {}\n",
+        );
+        let out = tmp.path().join("bundle-out");
+        let flags = BundleFlags {
+            path: tmp.path().to_path_buf(),
+            out: out.clone(),
+            exclude: String::new(),
+            r#ref: None,
+            with_sequences: true,
+        };
+        assert_eq!(run_bundle(&flags), ExitCode::Success);
+        assert!(out.join("sequences").is_dir());
+    }
+
+    #[test]
+    fn bundle_without_sequences_flag_skips_sequences_dir() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        write_rust(
+            tmp.path(),
+            "src/lib.rs",
+            "pub fn caller() { helper(); }\npub fn helper() {}\n",
+        );
+        let out = tmp.path().join("bundle-out");
+        let flags = BundleFlags {
+            path: tmp.path().to_path_buf(),
+            out: out.clone(),
+            exclude: String::new(),
+            r#ref: None,
+            with_sequences: false,
+        };
+        assert_eq!(run_bundle(&flags), ExitCode::Success);
+        assert!(!out.join("sequences").exists());
     }
 
     // --- helpers -----------------------------------------------------------
@@ -1299,6 +1355,7 @@ mod tests {
             path: tmp.path().to_path_buf(),
             r#ref: Some("HEAD".into()),
             force: false,
+            with_sequences: false,
             cache: CacheArgs {
                 cache_dir: Some(cache_dir.clone()),
                 no_cache: false,
@@ -1325,6 +1382,7 @@ mod tests {
             path: tmp.path().to_path_buf(),
             r#ref: Some("nope".into()),
             force: false,
+            with_sequences: false,
             cache: CacheArgs {
                 cache_dir: Some(tmp.path().join("cache")),
                 no_cache: false,
@@ -1341,6 +1399,7 @@ mod tests {
             path: tmp.path().to_path_buf(),
             r#ref: Some("HEAD".into()),
             force: false,
+            with_sequences: false,
             cache: CacheArgs {
                 cache_dir: None,
                 no_cache: true,
@@ -1493,6 +1552,7 @@ mod tests {
             out: out.clone(),
             exclude: String::new(),
             r#ref: Some("HEAD".into()),
+            with_sequences: false,
         };
         assert_eq!(run_bundle(&flags), ExitCode::Success);
         assert!(out.join("index.json").exists());
