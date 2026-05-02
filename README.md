@@ -106,35 +106,59 @@ Five zoom levels, one tool — `a2m overview` and `a2m function` aren't shown ab
 
 ### Diff: `a2m diff <ref-a>..<ref-b>`
 
-Set-diff between two cached bundles, coloured by change kind, with **edges drawn between changed entities** so you see the blast radius — not just *what* changed but *how the changes wire together*. Real output from `a2m diff a435346~..a435346` on this very repo (the commit that swapped the FNV-1a content hash for a real git blob SHA-1):
+Set-diff between two cached bundles, coloured by change kind, with **edges drawn between changed entities** so you see the blast radius — not just *what* changed but *how the changes wire together*. Real output from `a2m diff 36f1585~..36f1585` on this very repo (the commit that taught the resolver to disambiguate cross-module calls via `use` imports + qualified paths):
 
 ```mermaid
 graph TD
-    %% diff: a435346~ → a435346
+    %% diff: 36f1585~ → 36f1585
     classDef added fill:#9f9,stroke:#0a0,color:#000
     classDef removed fill:#f99,stroke:#a00,color:#000
     classDef modified fill:#fb8,stroke:#d60,color:#000
     classDef renamed fill:#9ff,stroke:#0aa,color:#000
-    n0["parser/mod.rs::function::git_blob_sha1"]:::added
-    n1["parser/mod.rs::function::hex_sha256"]:::removed
-    n2["artifacts/mod.rs"]:::modified
-    n3["artifacts/mod.rs::function::build_index"]:::modified
-    n4["model.rs"]:::modified
-    n5["model.rs::struct::CodeAtom"]:::modified
-    n6["parser/mod.rs"]:::modified
-    n7["parser/mod.rs::function::extract_item"]:::modified
-    n8["parser/mod.rs::impl::CodeParser"]:::modified
+    %% added (11)
+    n0["parser/mod.rs::function::collect_use_paths"]:::added
+    n1["parser/mod.rs::function::extract_use_imports"]:::added
+    n2["resolve.rs::function::file_module_name"]:::added
+    n3["resolve.rs::function::split_call_name"]:::added
+    n4["tests/cross_module_resolution.rs"]:::added
+    n5["tests/…::bare_call_to_unique_name_still_resolves"]:::added
+    n6["tests/…::build_store"]:::added
+    n7["tests/…::qualified_inline_calls_dispatch_to_correct_sibling_module"]:::added
+    n8["tests/…::use_import_resolves_to_mod_dot_rs_when_name_is_ambiguous"]:::added
+    n9["extern:fs::read"]:::added
+    n10["extern:tempfile::tempdir"]:::added
+    %% modified (7)
+    n11["parser/mod.rs"]:::modified
+    n12["parser/mod.rs::function::CodeParser::parse_into"]:::modified
+    n13["parser/mod.rs::function::extract_calls"]:::modified
+    n14["parser/mod.rs::function::extract_item"]:::modified
+    n15["parser/mod.rs::impl::CodeParser"]:::modified
+    n16["resolve.rs"]:::modified
+    n17["resolve.rs::function::resolve_cross_module_calls"]:::modified
     %% blast-radius edges (both endpoints in changeset)
-    n7 --> n0
+    n12 --> n1
+    n12 --> n14
+    n14 --> n13
+    n1 --> n0
+    n17 --> n3
+    n17 --> n2
+    n5 --> n6
+    n5 --> n10
+    n6 --> n9
+    n6 --> n17
+    n7 --> n6
+    n7 --> n10
+    n8 --> n6
+    n8 --> n10
 ```
 
-`+1 -1 ~7 ↪0`. Read in two seconds:
+`+11 -0 ~7 ↪0`. Two visual clusters wired together — exactly the shape of a "extract helpers + add test file" refactor:
 
-- One function (red) got removed, one (green) added — the swap.
-- The single arrow `extract_item → git_blob_sha1` says **why** `extract_item` is in the modified set: it's the only caller, it was patched to point at the new function.
-- The other six orange nodes (`CodeAtom`, `build_index`, parent modules) got pulled in because the doc on `content_hash` and the JSON shape both changed.
+- **Top half** is the production refactor: `parse_into` (modified) now calls `extract_use_imports` (new) which calls `collect_use_paths` (new). `resolve_cross_module_calls` (modified) gained two new helpers (`split_call_name`, `file_module_name`). Eight orange nodes, four green leaves.
+- **Bottom half** is the test layer: `cross_module_resolution.rs` is a brand-new test file. Three of its tests share a `build_store` helper, which calls into `resolve_cross_module_calls` — that single edge is the bridge between the two clusters and tells you **the new test file actually exercises the new resolver code**, not some unrelated path.
+- **Two extern atoms** appeared (`fs::read`, `tempfile::tempdir`) because the new test file pulls in two stdlib + dev-dep symbols not previously referenced anywhere.
 
-That's a feature commit. A bug fix would have one orange node, a single edge to a removed-and-added pair. A refactor would be all orange with no green/red. The shape of the diagram tells you the shape of the change.
+The shape of the graph is the shape of the change. A pure bug fix would have one orange node and one edge to a green/red pair. A clean refactor would be all orange, no green/red. A feature drop with tests looks exactly like this — a tight production cluster bridged to a test cluster by one or two edges.
 
 `--format json` returns a structured `BundleDiff` for downstream tooling. The rename heuristic pairs (removed, added) entries with identical `content_hash`. Auto-runs `a2m index` for any ref that isn't already cached.
 
