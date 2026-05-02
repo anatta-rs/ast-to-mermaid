@@ -61,6 +61,12 @@ fn write_step(out: &mut String, step: &Step, depth: usize) {
             );
         }
         Step::Loop { label, body } => {
+            // Mermaid renders `loop X\nend` (empty body) as a tiny stub
+            // that overlaps neighbour blocks. Drop empties — the
+            // condition is captured by the source code already.
+            if !has_visible_steps(body) {
+                return;
+            }
             let _ = writeln!(out, "{indent}loop {}", escape_label(label));
             for s in body {
                 write_step(out, s, depth + 1);
@@ -68,11 +74,20 @@ fn write_step(out: &mut String, step: &Step, depth: usize) {
             let _ = writeln!(out, "{indent}end");
         }
         Step::Alt { cond, then, else_ } => {
+            let then_visible = has_visible_steps(then);
+            let else_visible = else_
+                .as_deref()
+                .is_some_and(has_visible_steps);
+            if !then_visible && !else_visible {
+                return;
+            }
             let _ = writeln!(out, "{indent}alt {}", escape_label(cond));
             for s in then {
                 write_step(out, s, depth + 1);
             }
-            if let Some(else_steps) = else_ {
+            if let Some(else_steps) = else_
+                && else_visible
+            {
                 let _ = writeln!(out, "{indent}else");
                 for s in else_steps {
                     write_step(out, s, depth + 1);
@@ -83,12 +98,32 @@ fn write_step(out: &mut String, step: &Step, depth: usize) {
     }
 }
 
+/// `true` if the step list contains at least one visible step (i.e. a
+/// `Call`/`Note` or a non-empty nested control block). Used to skip
+/// empty `loop` / `alt` wrappers that would otherwise render as a
+/// useless header + closing `end`.
+fn has_visible_steps(steps: &[Step]) -> bool {
+    steps.iter().any(|s| match s {
+        Step::Call { .. } | Step::Note { .. } => true,
+        Step::Loop { body, .. } => has_visible_steps(body),
+        Step::Alt { then, else_, .. } => {
+            has_visible_steps(then)
+                || else_.as_deref().is_some_and(has_visible_steps)
+        }
+    })
+}
+
 /// Mermaid sequenceDiagram message labels split on the *first* `:` after
-/// the arrow — subsequent colons render fine, so leave them alone. Just
-/// normalise newlines so a multi-line label can't break the document, and
-/// escape `#` (used for HTML entities by Mermaid).
+/// the arrow — subsequent colons render fine. The renderer also treats
+/// `<…>` as inline HTML, so an `alt` cond like `if x <= 0` gets parsed
+/// as a malformed tag and lays out vertically. Escape these aggressively.
+/// `#` is reserved for Mermaid HTML entities. Newlines would split the
+/// label across lines and break the doc.
 fn escape_label(s: &str) -> String {
-    s.replace(['\n', '\r'], " ").replace('#', "_")
+    s.replace(['\n', '\r'], " ")
+        .replace('#', "_")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
 fn strip_newlines(s: &str) -> String {
@@ -212,5 +247,71 @@ mod tests {
         };
         let s = render(&d);
         assert!(s.contains("Cache::open"), "got:\n{s}");
+    }
+
+    #[test]
+    fn label_escapes_angle_brackets() {
+        // `<` and `>` are HTML-special in Mermaid — leaving them raw
+        // (e.g. `if x <= 0`) breaks layout into vertical char-per-line.
+        let mut d = diag();
+        d.steps = vec![Step::Alt {
+            cond: "if kept_size <= cap".into(),
+            then: vec![Step::Call {
+                from: SELF_ID.into(),
+                to: "cache".into(),
+                label: "x".into(),
+                is_await: false,
+            }],
+            else_: None,
+        }];
+        let s = render(&d);
+        assert!(!s.contains("<= cap"), "raw `<` leaked:\n{s}");
+        assert!(s.contains("&lt;= cap"), "expected escape:\n{s}");
+    }
+
+    #[test]
+    fn empty_loop_block_is_dropped() {
+        let mut d = diag();
+        d.steps = vec![Step::Loop {
+            label: "for x in xs".into(),
+            body: vec![],
+        }];
+        let s = render(&d);
+        assert!(!s.contains("loop for x in xs"), "empty loop leaked:\n{s}");
+        assert!(!s.contains("\n    end\n"), "stray end:\n{s}");
+    }
+
+    #[test]
+    fn alt_with_only_empty_branches_is_dropped() {
+        let mut d = diag();
+        d.steps = vec![Step::Alt {
+            cond: "if cond".into(),
+            then: vec![],
+            else_: Some(vec![]),
+        }];
+        let s = render(&d);
+        assert!(!s.contains("alt if cond"), "empty alt leaked:\n{s}");
+    }
+
+    #[test]
+    fn alt_with_empty_else_skips_else_clause() {
+        // `if cond { yes(); } else { /* break */ }` — then has a call,
+        // else is empty after filtering. We should render the alt with
+        // only the `then` branch; no dangling `else` separator.
+        let mut d = diag();
+        d.steps = vec![Step::Alt {
+            cond: "if cond".into(),
+            then: vec![Step::Call {
+                from: SELF_ID.into(),
+                to: "cache".into(),
+                label: "yes".into(),
+                is_await: false,
+            }],
+            else_: Some(vec![]),
+        }];
+        let s = render(&d);
+        assert!(s.contains("alt if cond"), "{s}");
+        assert!(s.contains("self->>cache: yes"), "{s}");
+        assert!(!s.contains("    else\n"), "empty else leaked:\n{s}");
     }
 }

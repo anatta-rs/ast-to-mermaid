@@ -162,9 +162,9 @@ sequenceDiagram
     self->>entries: sum
     self->>entries: len
     self->>Vec: new
-    alt if let Some(older_than) = opts.older_than
+    alt if let Some(older_than) = opts.olde…
         loop for &entries
-            alt if let Ok(age) = now.duration_since(e.mtime…
+            alt if let Ok(age) = now.duration_since…
                 self->>to_remove: push
             end
         end
@@ -172,10 +172,8 @@ sequenceDiagram
     self->>entries: collect
     self->>sorted: sort_by_key
     self->>sorted: sum
-    alt if let Some(cap) = opts.max_size_bytes
+    alt if let Some(cap) = opts.max_size_by…
         loop for &sorted
-            alt if kept_size <= cap
-            end
             self->>kept_size: saturating_sub
             self->>to_remove: push
         end

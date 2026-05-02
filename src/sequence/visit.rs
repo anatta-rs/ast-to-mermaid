@@ -391,17 +391,21 @@ fn field_receiver_root<'a>(node: &Node, source: &'a str) -> Option<&'a str> {
     }
 }
 
-/// Short, single-line text of a child field — truncated for diagram labels.
+/// Short, single-line text of a child field — truncated for diagram
+/// labels. Mermaid auto-sizes the alt/loop header to the label, so an
+/// over-long condition pushes neighbouring participants off-screen.
 fn short_text(node: &Node, field: &str, source: &str) -> String {
+    const MAX: usize = 32;
     let Some(child) = node.child_by_field_name(field) else {
         return String::new();
     };
     let raw = node_text(&child, source).unwrap_or("").trim();
     let one_line: String = raw.split_whitespace().collect::<Vec<_>>().join(" ");
-    if one_line.len() > 40 {
-        format!("{}…", &one_line[..40])
-    } else {
+    if one_line.chars().count() <= MAX {
         one_line
+    } else {
+        let head: String = one_line.chars().take(MAX).collect();
+        format!("{head}…")
     }
 }
 
