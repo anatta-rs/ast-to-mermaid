@@ -1,6 +1,6 @@
 # ast-to-mermaid
 
-Tree-sitter-based code-graph builder that emits [Mermaid](https://mermaid.js.org/) diagrams at five zoom levels, plus a JSON artifact bundle suitable for downstream graph stores. **Git-aware**: render the graph at any ref, materialize per-commit bundles, diff structural changes between branches.
+Tree-sitter-based code-graph builder that emits [Mermaid](https://mermaid.js.org/) diagrams at five zoom levels (project / overview / module / function / impact), plus a per-function `sequenceDiagram` view and a JSON artifact bundle suitable for downstream graph stores. **Git-aware**: render the graph at any ref, materialize per-commit bundles, diff structural changes between branches.
 
 Self-contained Rust crate. **No database, no graph backend, no async runtime, no in-house framework coupling** — just tree-sitter, serde, clap, plus the usual error/log helpers. Drop a path in, get a Mermaid string (or a directory of `.mmd` + `.meta.json` artifacts) out.
 
@@ -138,13 +138,76 @@ That's a feature commit. A bug fix would have one orange node, a single edge to 
 
 `--format json` returns a structured `BundleDiff` for downstream tooling. The rename heuristic pairs (removed, added) entries with identical `content_hash`. Auto-runs `a2m index` for any ref that isn't already cached.
 
+### Order of operations: `a2m sequence ./src --target <fn>`
+
+The other five views are unordered call graphs — they tell you *who calls whom*, not *in what order*. `a2m sequence` walks one function body in source order and emits a Mermaid `sequenceDiagram`: lifelines per receiver, arrows per call, control flow lifted into `alt` / `loop` blocks. Real output for `Cache::gc` from this repo:
+
+```mermaid
+sequenceDiagram
+    autonumber
+    %% pub fn gc(&self, opts: &GcOptions) -> Result<GcReport>
+    participant self as Cache
+    participant Vec as Vec
+    participant std as std
+    participant entries as entries
+    participant to_remove as to_remove
+    participant sorted as sorted
+    participant kept_size as kept_size
+    self->>Vec: new
+    self->>self: collect_gc_entries
+    self->>self: join
+    self->>self: collect_gc_entries
+    self->>self: join
+    self->>std: now
+    self->>entries: sum
+    self->>entries: len
+    self->>Vec: new
+    alt if let Some(older_than) = opts.older_than
+        loop for &entries
+            alt if let Ok(age) = now.duration_since(e.mtime…
+                self->>to_remove: push
+            end
+        end
+    end
+    self->>entries: collect
+    self->>sorted: sort_by_key
+    self->>sorted: sum
+    alt if let Some(cap) = opts.max_size_bytes
+        loop for &sorted
+            alt if kept_size <= cap
+            end
+            self->>kept_size: saturating_sub
+            self->>to_remove: push
+        end
+    end
+    self->>to_remove: sum
+    self->>to_remove: len
+    alt if !opts.dry_run
+        loop for &to_remove
+            alt if e.path.is_dir()
+                self->>std: remove_dir_all
+            else
+                self->>std: remove_file
+            end
+        end
+    end
+```
+
+What a reader gets from this in five seconds without opening the file:
+
+- **Two-pass eviction.** The first `if let Some(older_than)` walks `entries` and pushes age-evicted ones; then `sort_by_key` reorders, the second `if let Some(cap)` does size-capped eviction. Two policies, one queue.
+- **`!opts.dry_run` gate is the *only* place that touches the filesystem** — every step before is pure computation. Easy to audit which arms call `remove_*` and which don't.
+- **`is_dir() → remove_dir_all` else `remove_file`** is right there in the diagram, no need to grep.
+
+Receiver classification is syntactic — `obj.method()` → `obj`, `Type::method()` → `Type`, bare ident → `self`. `.await` annotates the arrow. Test/panic plumbing (`assert!`, `Some`/`Ok` constructors, etc.) is filtered out as noise. Pass `--all --out <DIR>` to dump one `.mmd` per non-empty function across the tree.
+
 ## Install
 
 ```bash
 cargo install ast-to-mermaid
 ```
 
-That ships one binary, `a2m`, with ten subcommands. Building from source works the same way:
+That ships one binary, `a2m`, with eleven subcommands. Building from source works the same way:
 
 ```bash
 cargo build --release
@@ -172,6 +235,11 @@ a2m function ./my-repo --target parse_config
 # Methods on a type — `Type::method` shorthand handles generics for you
 a2m function ./my-repo --target HnswBuilder::build
 
+# One function's body as a Mermaid sequenceDiagram (statement order)
+a2m sequence ./my-repo --target run_diff
+# Or every non-empty function in the tree, one .mmd per fn
+a2m sequence ./my-repo --all --out ./diagrams
+
 # Forward + backward impact (3 hops by default)
 a2m impact ./my-repo --target execute
 
@@ -197,7 +265,7 @@ a2m project ./my-repo --exclude vendor,generated
 a2m project ./my-repo --trace=info
 ```
 
-## The ten subcommands
+## The eleven subcommands
 
 | Subcommand | Output | Needs `--target` |
 |---|---|---|
@@ -206,13 +274,14 @@ a2m project ./my-repo --trace=info
 | `a2m module` | One module's items + their callers/callees, both intra- and cross-module | yes — module path or stem |
 | `a2m function` | A single function with its callers, walked back N hops | yes — function name |
 | `a2m impact` | Forward + backward call chain from a function (default 3 hops) | yes — function name |
+| `a2m sequence` | One function body as a Mermaid `sequenceDiagram` (statement order, lifelines per receiver) | yes — function name, or `--all` |
 | `a2m walk` | List source files under a path (no parsing) — handy for shell pipelines | no |
 | `a2m bundle` | Full 4-layer artifact bundle (see below) | no — needs `--out` |
 | `a2m index` | Materialize a bundle for a git ref into the cache (`./.a2m/cache/refs/<sha>/`) | no — defaults to working tree |
 | `a2m diff` | Set-diff between two cached bundles, colour-coded Mermaid or JSON | yes — `<ref-a>..<ref-b>` |
 | `a2m gc` | Evict old / oversized cache entries by mtime + soft size cap | no |
 
-The first seven accept `--ref <git-ref>` to read from any ref instead of the working tree. The last three accept `--cache-dir <path>` to relocate the cache and `--no-cache` to bypass it (ephemeral tempdir).
+The first eight accept `--ref <git-ref>` to read from any ref instead of the working tree. The last three accept `--cache-dir <path>` to relocate the cache and `--no-cache` to bypass it (ephemeral tempdir).
 
 The five analyze-flavoured subcommands (`project`, `overview`, `module`, `function`, `impact`) also accept `--format <mermaid|dot>` — see [When the graph is too big for Mermaid](#when-the-graph-is-too-big-for-mermaid).
 
