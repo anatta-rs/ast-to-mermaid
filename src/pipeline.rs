@@ -3,7 +3,7 @@
 //! No external graph backend. No `async` I/O — all store operations are
 //! synchronous in-memory.
 
-use crate::artifacts::{ArtifactSet, emit_artifacts};
+use crate::artifacts::{ArtifactSet, emit_artifacts, emit_artifacts_with_sequences};
 use crate::cache::Cache;
 use crate::error::{AstToMermaidError, Result};
 use crate::git_source;
@@ -37,6 +37,10 @@ pub struct AnalyzeOptions {
     /// replays cached `ParseUnit`s on hit (skipping tree-sitter entirely).
     /// On miss, the fresh `ParseUnit` is written back to the cache.
     pub cache: Option<Arc<Cache>>,
+    /// Opt-in: when `true`, [`bundle`] also emits `sequences/<id>.mmd` for
+    /// every Rust function whose body has at least one step. Off by
+    /// default — the extra extraction roughly doubles bundle wall-time.
+    pub with_sequences: bool,
 }
 
 impl Default for AnalyzeOptions {
@@ -47,6 +51,7 @@ impl Default for AnalyzeOptions {
             exclude: Vec::new(),
             git_ref: None,
             cache: None,
+            with_sequences: false,
         }
     }
 }
@@ -62,6 +67,7 @@ impl std::fmt::Debug for AnalyzeOptions {
                 "cache",
                 &self.cache.as_ref().map(|c| c.root().display().to_string()),
             )
+            .field("with_sequences", &self.with_sequences)
             .finish()
     }
 }
@@ -312,7 +318,18 @@ pub fn bundle(root: &Path, opts: &AnalyzeOptions) -> Result<(ArtifactSet, Analyz
         Some(ref_name) => format!("{}@{ref_name}", root.display()),
         None => root.to_string_lossy().into_owned(),
     };
-    let artifacts = emit_artifacts(&store, &source_root);
+    let artifacts = if opts.with_sequences {
+        // Re-use the bytes already in memory — only Rust files can produce
+        // sequence diagrams, so we filter the rest out cheaply.
+        let sources: Vec<(String, Vec<u8>)> = inputs
+            .iter()
+            .filter(|i| matches!(i.language, Language::Rust))
+            .map(|i| (i.display_path.clone(), i.content.clone()))
+            .collect();
+        emit_artifacts_with_sequences(&store, &source_root, &sources)
+    } else {
+        emit_artifacts(&store, &source_root)
+    };
 
     let report = AnalyzeReport {
         // The "rendered" mermaid for a bundle is the project view —
@@ -612,6 +629,7 @@ mod tests {
                 exclude: Vec::new(),
                 git_ref: None,
                 cache: None,
+                with_sequences: false,
             },
         )
         .expect("analyze");
@@ -770,5 +788,122 @@ mod tests {
         let c = r.clone();
         assert_eq!(r, c);
         assert!(format!("{r:?}").contains("AnalyzeReport"));
+    }
+
+    #[test]
+    fn bundle_with_sequences_emits_only_for_non_empty_bodies() {
+        // Two free fns: one calls another (non-empty body), one is empty.
+        // The empty one must be skipped; the non-empty one must appear in
+        // both `artifacts.sequences` and as `sequence_path` in index.json.
+        let tmp = tempdir().expect("tmp");
+        write(
+            tmp.path(),
+            "src/lib.rs",
+            "pub fn caller() { helper(); }\n\
+             pub fn empty() {}\n\
+             pub fn helper() {}\n",
+        );
+
+        let opts = AnalyzeOptions {
+            with_sequences: true,
+            ..AnalyzeOptions::default()
+        };
+        let (artifacts, _report) = bundle(tmp.path(), &opts).expect("bundle");
+
+        // `caller` has one CALL step → must appear. `empty` and `helper`
+        // have no calls → no diagram, skipped.
+        let seq_ids: Vec<&str> = artifacts
+            .sequences
+            .iter()
+            .map(|s| s.entity_id.as_str())
+            .collect();
+        assert!(
+            seq_ids.contains(&"code:src/lib.rs::function::caller"),
+            "expected caller in sequences, got: {seq_ids:?}"
+        );
+        assert!(
+            !seq_ids.contains(&"code:src/lib.rs::function::empty"),
+            "empty-body fn must not produce a sequence"
+        );
+
+        // index.json must mirror that: caller has sequence_path, empty doesn't.
+        let entities = artifacts.index_json["entities"]
+            .as_array()
+            .expect("entities array");
+        let caller = entities
+            .iter()
+            .find(|e| e["id"] == "code:src/lib.rs::function::caller")
+            .expect("caller entry");
+        assert_eq!(
+            caller["sequence_path"]
+                .as_str()
+                .expect("sequence_path string"),
+            "sequences/code_src_lib.rs__function__caller.mmd"
+        );
+        let empty = entities
+            .iter()
+            .find(|e| e["id"] == "code:src/lib.rs::function::empty")
+            .expect("empty entry");
+        assert!(
+            empty.get("sequence_path").is_none(),
+            "empty fn must not have sequence_path"
+        );
+    }
+
+    #[test]
+    fn bundle_without_with_sequences_emits_no_sequence_layer() {
+        let tmp = tempdir().expect("tmp");
+        write(
+            tmp.path(),
+            "src/lib.rs",
+            "pub fn caller() { helper(); }\npub fn helper() {}\n",
+        );
+
+        let (artifacts, _report) = bundle(tmp.path(), &AnalyzeOptions::default()).expect("bundle");
+
+        assert!(artifacts.sequences.is_empty());
+        let entities = artifacts.index_json["entities"]
+            .as_array()
+            .expect("entities array");
+        for e in entities {
+            assert!(
+                e.get("sequence_path").is_none(),
+                "no entity should carry sequence_path when the flag is off: {e}"
+            );
+        }
+    }
+
+    #[test]
+    fn bundle_with_sequences_writes_sequences_dir_on_disk() {
+        use crate::artifacts::write_artifacts;
+        let tmp = tempdir().expect("tmp");
+        write(
+            tmp.path(),
+            "src/lib.rs",
+            "pub fn caller() { helper(); }\npub fn helper() {}\n",
+        );
+        let opts = AnalyzeOptions {
+            with_sequences: true,
+            ..AnalyzeOptions::default()
+        };
+        let (artifacts, _report) = bundle(tmp.path(), &opts).expect("bundle");
+
+        let out = tmp.path().join("bundle-out");
+        write_artifacts(&artifacts, &out).expect("write");
+
+        let seq_dir = out.join("sequences");
+        assert!(seq_dir.is_dir(), "sequences/ dir must exist");
+        let written: Vec<_> = std::fs::read_dir(&seq_dir)
+            .expect("readdir")
+            .filter_map(std::result::Result::ok)
+            .map(|e| e.file_name().into_string().unwrap_or_default())
+            .collect();
+        assert!(
+            written.iter().any(|n| n.contains("caller")
+                && Path::new(n)
+                    .extension()
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("mmd"))),
+            "expected a caller .mmd, got: {written:?}"
+        );
     }
 }

@@ -281,7 +281,7 @@ a2m project ./my-repo --trace=info
 | `a2m impact` | Forward + backward call chain from a function (default 3 hops) | yes — function name |
 | `a2m sequence` | One function body as a Mermaid `sequenceDiagram` (statement order, lifelines per receiver) | yes — function name, or `--all` |
 | `a2m walk` | List source files under a path (no parsing) — handy for shell pipelines | no |
-| `a2m bundle` | Full 4-layer artifact bundle (see below) | no — needs `--out` |
+| `a2m bundle` | Full 4-layer artifact bundle (`+ sequences/` with `--with-sequences`, see below) | no — needs `--out` |
 | `a2m index` | Materialize a bundle for a git ref into the cache (`./.a2m/cache/refs/<sha>/`) | no — defaults to working tree |
 | `a2m diff` | Set-diff between two cached bundles, colour-coded Mermaid or JSON | yes — `<ref-a>..<ref-b>` |
 | `a2m gc` | Evict old / oversized cache entries by mtime + soft size cap | no |
@@ -333,6 +333,25 @@ a2m bundle ./src --out ./.artifacts
 Each `.meta.json` carries the entity's id, kind, file/line range, signature, doc, SHA-256 content hash, and the full edge surface — `callers`, `callees`, plus `implements` / `implemented_by` for impl/trait pairs. Calls into crates outside the analysed tree (e.g. `serde_json::to_string`, `divan::main`) become synthetic `extern:` atoms in the bundle so external dependencies are visible at the boundary instead of disappearing silently.
 
 The bundle is plain JSON + Mermaid — load it into any graph store (Neo4j, DuckDB, in-memory) without re-parsing.
+
+### Optional: per-function sequence diagrams
+
+Pass `--with-sequences` and the bundle gains a fifth layer — one Mermaid `sequenceDiagram` per Rust function whose body has at least one call:
+
+```bash
+a2m bundle ./src --out ./.artifacts --with-sequences
+```
+
+```
+.artifacts/
+├── overview.mmd
+├── index.json                    # function entries gain `sequence_path: "sequences/<id>.mmd"`
+├── entities/...
+└── sequences/
+    └── code_src_pipeline.rs__function__analyze.mmd  # statement-order body view, lifelines per receiver
+```
+
+Off by default — extracting sequences re-parses every Rust file with the tree-sitter visitor and roughly doubles bundle wall-time. Functions with empty bodies (getters, `unimplemented!()`, doc-only stubs) are skipped, so the layer stays sparse on real codebases.
 
 `content_hash` is the **git blob SHA-1** of the entity's source slice — the same value `git hash-object` produces. Cache keys, dedup across branches, and the `a2m diff` rename heuristic all rely on this identity.
 

@@ -1,10 +1,13 @@
-//! Rich 4-layer artifact emission.
+//! Rich 5-layer artifact emission.
 //!
 //! [`emit_artifacts`] walks a populated [`Store`] and produces:
 //! - `overview.mmd` — top-level project Mermaid, GitHub-renderable.
 //! - Per-entity `<id>.mmd` — Mermaid with `%% key: value` comments + `classDef`.
 //! - Per-entity `<id>.meta.json` — full machine-readable sidecar JSON.
 //! - `index.json` — global catalog: all entities + artifact paths + edges.
+//! - Per-function `sequences/<id>.mmd` — opt-in `sequenceDiagram` of the
+//!   function body (built only when the caller passes sequence sources via
+//!   [`emit_artifacts_with_sequences`]; absent by default).
 //!
 //! # Usage
 //!
@@ -19,8 +22,9 @@
 use crate::graph::Store;
 use crate::model::{AtomKind, CodeAtom, EdgeKind, EntityId};
 use crate::render::{Level, render};
+use crate::sequence;
 use serde_json::{Value, json};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// A per-entity artifact bundle.
 pub struct EntityArtifact {
@@ -34,6 +38,18 @@ pub struct EntityArtifact {
     pub meta: Value,
 }
 
+/// One per-function `sequenceDiagram` artifact.
+///
+/// `entity_id` matches a function [`CodeAtom`] in the store; `mmd` is the
+/// rendered Mermaid `sequenceDiagram` source. Only emitted for functions
+/// whose body produced at least one step — empty bodies are skipped.
+pub struct SequenceArtifact {
+    /// Entity id of the function this sequence belongs to.
+    pub entity_id: EntityId,
+    /// Rendered Mermaid `sequenceDiagram` text.
+    pub mmd: String,
+}
+
 /// The full artifact set produced by [`emit_artifacts`].
 pub struct ArtifactSet {
     /// Global top-level Mermaid (project view).
@@ -42,13 +58,33 @@ pub struct ArtifactSet {
     pub entities: Vec<EntityArtifact>,
     /// Global catalog JSON.
     pub index_json: Value,
+    /// Per-function `sequenceDiagram` artifacts. Empty unless the caller
+    /// went through [`emit_artifacts_with_sequences`].
+    pub sequences: Vec<SequenceArtifact>,
 }
 
-/// Emit the 4-layer artifact set for all atoms in `store`.
+/// Emit the artifact set for all atoms in `store`. No sequences.
 ///
 /// `source_root` is embedded in `index.json` as metadata only.
 #[must_use]
 pub fn emit_artifacts(store: &Store, source_root: &str) -> ArtifactSet {
+    emit_artifacts_with_sequences(store, source_root, &[])
+}
+
+/// Like [`emit_artifacts`], but also extracts a `sequenceDiagram` for every
+/// function whose body has at least one step.
+///
+/// `sequence_sources` is a slice of `(file_display_path, content_bytes)`
+/// pairs covering the Rust files in the project — typically threaded
+/// through from [`crate::pipeline::bundle`] so the file contents are not
+/// re-read from disk. Only functions whose `file_path` matches one of
+/// those entries are eligible.
+#[must_use]
+pub fn emit_artifacts_with_sequences(
+    store: &Store,
+    source_root: &str,
+    sequence_sources: &[(String, Vec<u8>)],
+) -> ArtifactSet {
     let overview_mmd = render(Level::Project, store, None).unwrap_or_default();
 
     let atoms = store.all_atoms();
@@ -85,14 +121,71 @@ pub fn emit_artifacts(store: &Store, source_root: &str) -> ArtifactSet {
     // Sort entities deterministically by id.
     entities.sort_by(|a, b| a.id.as_str().cmp(b.id.as_str()));
 
+    let sequences = build_sequences(&entities, sequence_sources);
+    let sequence_ids: HashSet<&str> = sequences.iter().map(|s| s.entity_id.as_str()).collect();
+
     let now = chrono_now();
-    let index_json = build_index(&entities, source_root, &now);
+    let index_json = build_index(&entities, source_root, &now, &sequence_ids);
 
     ArtifactSet {
         overview_mmd,
         entities,
         index_json,
+        sequences,
     }
+}
+
+/// Extract `sequenceDiagram` artifacts for every function entity whose
+/// `file_path` resolves in `sequence_sources` and whose body has at
+/// least one step.
+fn build_sequences(
+    entities: &[EntityArtifact],
+    sequence_sources: &[(String, Vec<u8>)],
+) -> Vec<SequenceArtifact> {
+    if sequence_sources.is_empty() {
+        return Vec::new();
+    }
+    let by_path: HashMap<&str, &[u8]> = sequence_sources
+        .iter()
+        .map(|(p, c)| (p.as_str(), c.as_slice()))
+        .collect();
+
+    let mut out = Vec::new();
+    for entity in entities {
+        if entity.kind.as_str() != "function" {
+            continue;
+        }
+        let Some(file) = entity.meta.get("file").and_then(Value::as_str) else {
+            continue;
+        };
+        // `file` looks like `src/foo.rs:10-42` — split on the trailing
+        // `:line-line` we appended in `entity_meta`.
+        let file_path = file.rsplit_once(':').map_or(file, |(p, _)| p);
+        let Some(content) = by_path.get(file_path).copied() else {
+            continue;
+        };
+        let Some(qualified) = qualified_fn_name(entity.id.as_str()) else {
+            continue;
+        };
+        let Ok(diagram) = sequence::extract(content, file_path, &qualified) else {
+            continue;
+        };
+        if diagram.steps.is_empty() {
+            continue;
+        }
+        out.push(SequenceArtifact {
+            entity_id: entity.id.clone(),
+            mmd: sequence::render(&diagram),
+        });
+    }
+    out
+}
+
+/// Recover the `name` / `Type::method` form expected by
+/// [`sequence::extract`] from a function-atom id like
+/// `code:src/foo.rs::function::Foo::bar` → `Foo::bar`.
+fn qualified_fn_name(id: &str) -> Option<String> {
+    id.split_once("::function::").map(|(_, q)| q.to_owned())
 }
 
 /// Write the artifact set to `out_dir`.
@@ -102,6 +195,8 @@ pub fn emit_artifacts(store: &Store, source_root: &str) -> ArtifactSet {
 /// - `<out_dir>/index.json`
 /// - `<out_dir>/entities/<sanitized-id>.mmd`
 /// - `<out_dir>/entities/<sanitized-id>.meta.json`
+/// - `<out_dir>/sequences/<sanitized-id>.mmd` (one per `SequenceArtifact`,
+///   only when [`ArtifactSet::sequences`] is non-empty)
 ///
 /// # Errors
 ///
@@ -128,6 +223,15 @@ pub fn write_artifacts(
             entities_dir.join(format!("{base}.meta.json")),
             serde_json::to_string_pretty(&entity.meta).unwrap_or_default(),
         )?;
+    }
+
+    if !artifacts.sequences.is_empty() {
+        let sequences_dir = out_dir.join("sequences");
+        fs::create_dir_all(&sequences_dir)?;
+        for seq in &artifacts.sequences {
+            let base = sanitize_id(seq.entity_id.as_str());
+            fs::write(sequences_dir.join(format!("{base}.mmd")), &seq.mmd)?;
+        }
     }
 
     Ok(())
@@ -291,7 +395,12 @@ fn entity_meta(
 
 // ── Index JSON ────────────────────────────────────────────────────────────────
 
-fn build_index(entities: &[EntityArtifact], source_root: &str, generated_at: &str) -> Value {
+fn build_index(
+    entities: &[EntityArtifact],
+    source_root: &str,
+    generated_at: &str,
+    sequence_ids: &HashSet<&str>,
+) -> Value {
     let entity_list: Vec<Value> = entities
         .iter()
         .map(|e| {
@@ -309,7 +418,7 @@ fn build_index(entities: &[EntityArtifact], source_root: &str, generated_at: &st
                 .and_then(|v| v.as_array())
                 .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
                 .unwrap_or_default();
-            json!({
+            let mut entry = json!({
                 "id": e.id.as_str(),
                 "kind": e.kind.as_str(),
                 "name": e.meta.get("name").and_then(|v| v.as_str()).unwrap_or(""),
@@ -321,7 +430,16 @@ fn build_index(entities: &[EntityArtifact], source_root: &str, generated_at: &st
                     "out": out_edges,
                     "in": in_edges,
                 },
-            })
+            });
+            if sequence_ids.contains(e.id.as_str())
+                && let Value::Object(map) = &mut entry
+            {
+                map.insert(
+                    "sequence_path".to_owned(),
+                    Value::String(format!("sequences/{base}.mmd")),
+                );
+            }
+            entry
         })
         .collect();
 
