@@ -6,12 +6,15 @@
 //!
 //! Self-contained — no external graph backend, no async runtime, no database.
 //!
-//! Five rendering levels:
+//! Five symbol-graph rendering levels:
 //! - [`Level::Project`] — one node per crate, cross-crate calls.
 //! - [`Level::Overview`] — one node per module, cross-module calls.
 //! - [`Level::Module`] — subgraph for one module + external callers/callees.
 //! - [`Level::Function`] — central function + direct callers/callees.
 //! - [`Level::Impact`] — reverse call chain (N hops, default 3).
+//!
+//! Plus an orthogonal [`sequence`] view — Mermaid `sequenceDiagram`
+//! extracted from one function's body in source order.
 
 #![warn(missing_docs)]
 #![deny(unsafe_code)]
@@ -28,6 +31,7 @@ pub mod parser;
 pub mod pipeline;
 pub mod render;
 pub mod resolve;
+pub mod sequence;
 
 pub use error::{AstToMermaidError, Result};
 pub use graph::Store;

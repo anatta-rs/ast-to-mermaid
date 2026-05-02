@@ -1,6 +1,6 @@
 # ast-to-mermaid
 
-Tree-sitter-based code-graph builder that emits [Mermaid](https://mermaid.js.org/) diagrams at five zoom levels, plus a JSON artifact bundle suitable for downstream graph stores. **Git-aware**: render the graph at any ref, materialize per-commit bundles, diff structural changes between branches.
+Tree-sitter-based code-graph builder that emits [Mermaid](https://mermaid.js.org/) diagrams at five zoom levels (project / overview / module / function / impact), plus a per-function `sequenceDiagram` view and a JSON artifact bundle suitable for downstream graph stores. **Git-aware**: render the graph at any ref, materialize per-commit bundles, diff structural changes between branches.
 
 Self-contained Rust crate. **No database, no graph backend, no async runtime, no in-house framework coupling** — just tree-sitter, serde, clap, plus the usual error/log helpers. Drop a path in, get a Mermaid string (or a directory of `.mmd` + `.meta.json` artifacts) out.
 
@@ -106,37 +106,105 @@ Five zoom levels, one tool — `a2m overview` and `a2m function` aren't shown ab
 
 ### Diff: `a2m diff <ref-a>..<ref-b>`
 
-Set-diff between two cached bundles, coloured by change kind, with **edges drawn between changed entities** so you see the blast radius — not just *what* changed but *how the changes wire together*. Real output from `a2m diff a435346~..a435346` on this very repo (the commit that swapped the FNV-1a content hash for a real git blob SHA-1):
+Set-diff between two cached bundles, coloured by change kind, with **edges drawn between changed entities** so you see the blast radius — not just *what* changed but *how the changes wire together*. Real output from `a2m diff 36f1585~..36f1585` on this very repo (the commit that taught the resolver to disambiguate cross-module calls via `use` imports + qualified paths):
 
 ```mermaid
 graph TD
-    %% diff: a435346~ → a435346
+    %% diff: 36f1585~ → 36f1585
     classDef added fill:#9f9,stroke:#0a0,color:#000
     classDef removed fill:#f99,stroke:#a00,color:#000
     classDef modified fill:#fb8,stroke:#d60,color:#000
     classDef renamed fill:#9ff,stroke:#0aa,color:#000
-    n0["parser/mod.rs::function::git_blob_sha1"]:::added
-    n1["parser/mod.rs::function::hex_sha256"]:::removed
-    n2["artifacts/mod.rs"]:::modified
-    n3["artifacts/mod.rs::function::build_index"]:::modified
-    n4["model.rs"]:::modified
-    n5["model.rs::struct::CodeAtom"]:::modified
-    n6["parser/mod.rs"]:::modified
-    n7["parser/mod.rs::function::extract_item"]:::modified
-    n8["parser/mod.rs::impl::CodeParser"]:::modified
+    %% added (11)
+    n0["parser/mod.rs::function::collect_use_paths"]:::added
+    n1["parser/mod.rs::function::extract_use_imports"]:::added
+    n2["resolve.rs::function::file_module_name"]:::added
+    n3["resolve.rs::function::split_call_name"]:::added
+    n4["tests/cross_module_resolution.rs"]:::added
+    n5["tests/…::bare_call_to_unique_name_still_resolves"]:::added
+    n6["tests/…::build_store"]:::added
+    n7["tests/…::qualified_inline_calls_dispatch_to_correct_sibling_module"]:::added
+    n8["tests/…::use_import_resolves_to_mod_dot_rs_when_name_is_ambiguous"]:::added
+    n9["extern:fs::read"]:::added
+    n10["extern:tempfile::tempdir"]:::added
+    %% modified (7)
+    n11["parser/mod.rs"]:::modified
+    n12["parser/mod.rs::function::CodeParser::parse_into"]:::modified
+    n13["parser/mod.rs::function::extract_calls"]:::modified
+    n14["parser/mod.rs::function::extract_item"]:::modified
+    n15["parser/mod.rs::impl::CodeParser"]:::modified
+    n16["resolve.rs"]:::modified
+    n17["resolve.rs::function::resolve_cross_module_calls"]:::modified
     %% blast-radius edges (both endpoints in changeset)
-    n7 --> n0
+    n12 --> n1
+    n12 --> n14
+    n14 --> n13
+    n1 --> n0
+    n17 --> n3
+    n17 --> n2
+    n5 --> n6
+    n5 --> n10
+    n6 --> n9
+    n6 --> n17
+    n7 --> n6
+    n7 --> n10
+    n8 --> n6
+    n8 --> n10
 ```
 
-`+1 -1 ~7 ↪0`. Read in two seconds:
+`+11 -0 ~7 ↪0`. Two visual clusters wired together — exactly the shape of a "extract helpers + add test file" refactor:
 
-- One function (red) got removed, one (green) added — the swap.
-- The single arrow `extract_item → git_blob_sha1` says **why** `extract_item` is in the modified set: it's the only caller, it was patched to point at the new function.
-- The other six orange nodes (`CodeAtom`, `build_index`, parent modules) got pulled in because the doc on `content_hash` and the JSON shape both changed.
+- **Top half** is the production refactor: `parse_into` (modified) now calls `extract_use_imports` (new) which calls `collect_use_paths` (new). `resolve_cross_module_calls` (modified) gained two new helpers (`split_call_name`, `file_module_name`). Eight orange nodes, four green leaves.
+- **Bottom half** is the test layer: `cross_module_resolution.rs` is a brand-new test file. Three of its tests share a `build_store` helper, which calls into `resolve_cross_module_calls` — that single edge is the bridge between the two clusters and tells you **the new test file actually exercises the new resolver code**, not some unrelated path.
+- **Two extern atoms** appeared (`fs::read`, `tempfile::tempdir`) because the new test file pulls in two stdlib + dev-dep symbols not previously referenced anywhere.
 
-That's a feature commit. A bug fix would have one orange node, a single edge to a removed-and-added pair. A refactor would be all orange with no green/red. The shape of the diagram tells you the shape of the change.
+The shape of the graph is the shape of the change. A pure bug fix would have one orange node and one edge to a green/red pair. A clean refactor would be all orange, no green/red. A feature drop with tests looks exactly like this — a tight production cluster bridged to a test cluster by one or two edges.
 
 `--format json` returns a structured `BundleDiff` for downstream tooling. The rename heuristic pairs (removed, added) entries with identical `content_hash`. Auto-runs `a2m index` for any ref that isn't already cached.
+
+### Order of operations: `a2m sequence ./src --target <fn>`
+
+The other five views are unordered call graphs — they tell you *who calls whom*, not *in what order*. `a2m sequence` walks one function body in source order and emits a Mermaid `sequenceDiagram`: lifelines per receiver, arrows per call, control flow lifted into `alt` / `loop` blocks. Take `dir_size_recursive` from this repo's cache module — 12 lines of Rust, a tree walk:
+
+```rust
+fn dir_size_recursive(dir: &Path) -> Result<u64> {
+    let mut total = 0;
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let meta = entry.metadata()?;
+        if meta.is_dir() {
+            total += dir_size_recursive(&entry.path())?;
+        } else {
+            total += meta.len();
+        }
+    }
+    Ok(total)
+}
+```
+
+`a2m sequence ./src --target dir_size_recursive` →
+
+```mermaid
+sequenceDiagram
+    autonumber
+    %% fn dir_size_recursive(dir: &Path) -> Result<u64>
+    participant self as self
+    participant entry as entry
+    participant meta as meta
+    loop for std::fs::read_dir(dir)?
+        self->>entry: metadata
+        alt if meta.is_dir()
+            self->>self: dir_size_recursive
+            self->>entry: path
+        else
+            self->>meta: len
+        end
+    end
+```
+
+The whole algorithm in one glance: a `for` over directory entries, branching on `is_dir()` — the recursive call (the `self`-loop on step 3) versus the leaf-file path (`meta.len()`). The recursion is *visually* a self-arrow on the `self` lifeline; the `else` branch on a different lifeline (`meta`) makes the dir/file split obvious without reading the source.
+
+Receiver classification is syntactic: `obj.method()` → `obj`, `Type::method()` → `Type`, bare ident → `self`. `.await` annotates the arrow. Test/panic plumbing (`assert!`, `Some`/`Ok` constructors, etc.) is filtered out as noise. Pass `--all --out <DIR>` to dump one `.mmd` per non-empty function across the tree.
 
 ## Install
 
@@ -144,7 +212,7 @@ That's a feature commit. A bug fix would have one orange node, a single edge to 
 cargo install ast-to-mermaid
 ```
 
-That ships one binary, `a2m`, with ten subcommands. Building from source works the same way:
+That ships one binary, `a2m`, with eleven subcommands. Building from source works the same way:
 
 ```bash
 cargo build --release
@@ -172,6 +240,11 @@ a2m function ./my-repo --target parse_config
 # Methods on a type — `Type::method` shorthand handles generics for you
 a2m function ./my-repo --target HnswBuilder::build
 
+# One function's body as a Mermaid sequenceDiagram (statement order)
+a2m sequence ./my-repo --target run_diff
+# Or every non-empty function in the tree, one .mmd per fn
+a2m sequence ./my-repo --all --out ./diagrams
+
 # Forward + backward impact (3 hops by default)
 a2m impact ./my-repo --target execute
 
@@ -197,7 +270,7 @@ a2m project ./my-repo --exclude vendor,generated
 a2m project ./my-repo --trace=info
 ```
 
-## The ten subcommands
+## The eleven subcommands
 
 | Subcommand | Output | Needs `--target` |
 |---|---|---|
@@ -206,13 +279,14 @@ a2m project ./my-repo --trace=info
 | `a2m module` | One module's items + their callers/callees, both intra- and cross-module | yes — module path or stem |
 | `a2m function` | A single function with its callers, walked back N hops | yes — function name |
 | `a2m impact` | Forward + backward call chain from a function (default 3 hops) | yes — function name |
+| `a2m sequence` | One function body as a Mermaid `sequenceDiagram` (statement order, lifelines per receiver) | yes — function name, or `--all` |
 | `a2m walk` | List source files under a path (no parsing) — handy for shell pipelines | no |
 | `a2m bundle` | Full 4-layer artifact bundle (see below) | no — needs `--out` |
 | `a2m index` | Materialize a bundle for a git ref into the cache (`./.a2m/cache/refs/<sha>/`) | no — defaults to working tree |
 | `a2m diff` | Set-diff between two cached bundles, colour-coded Mermaid or JSON | yes — `<ref-a>..<ref-b>` |
 | `a2m gc` | Evict old / oversized cache entries by mtime + soft size cap | no |
 
-The first seven accept `--ref <git-ref>` to read from any ref instead of the working tree. The last three accept `--cache-dir <path>` to relocate the cache and `--no-cache` to bypass it (ephemeral tempdir).
+The first eight accept `--ref <git-ref>` to read from any ref instead of the working tree. The last three accept `--cache-dir <path>` to relocate the cache and `--no-cache` to bypass it (ephemeral tempdir).
 
 The five analyze-flavoured subcommands (`project`, `overview`, `module`, `function`, `impact`) also accept `--format <mermaid|dot>` — see [When the graph is too big for Mermaid](#when-the-graph-is-too-big-for-mermaid).
 
