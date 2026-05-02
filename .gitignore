@@ -7,3 +7,15 @@ lcov.info
 Cargo.lock
 .cargo/config.toml
 e2etest/
+
+# Anatta / Claude tooling — internal, this repo is public
+.artifacts/
+.claude/
+.mcp.json
+VERSION
+docs/todo/
+.githooks/anatta-sync.sh
+.githooks/post-checkout
+.githooks/post-commit
+.githooks/post-merge
+.githooks/post-rewrite
