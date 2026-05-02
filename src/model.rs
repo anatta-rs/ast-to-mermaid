@@ -127,8 +127,26 @@ pub struct CodeAtom {
     /// Git blob SHA-1 hex hash of the atom's source text (`SHA1("blob N\0" + content)`).
     /// Same value as `git hash-object` on the enclosing source slice.
     pub content_hash: String,
-    /// Names of functions this atom calls (for cross-module resolution).
+    /// Names of functions this atom calls in resolver-eligible form:
+    /// bare identifiers (free-fn calls, possibly expanded via `use`
+    /// imports) and qualified `module::foo` / `Owner::method` paths.
     pub calls: Vec<String>,
+    /// Names captured from receiver-style call sites — `obj.method()` in
+    /// Rust (`field_expression`) or `obj.method()` in Python (`attribute`
+    /// access). These carry no usable receiver type, so the resolver
+    /// never matches them across modules; they are kept only for
+    /// intra-container direct linking (e.g. `self.method()` inside an
+    /// impl/class). Splitting them out is what prevents a stray
+    /// `client.build()` from ghost-binding to an unrelated free fn
+    /// named `build` somewhere else in the graph.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub method_calls: Vec<String>,
+    /// Type owner for methods (Rust impl owner type, Python class). `None`
+    /// for free functions and non-method items. The resolver uses this to
+    /// keep bare-name calls (`obj.method()`) from binding to lifted methods
+    /// of unrelated types — only qualified `Owner::method` calls do.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<String>,
 }
 
 // ── Edges ────────────────────────────────────────────────────────────────────

@@ -44,7 +44,37 @@ struct BlobEnvelope {
 }
 
 /// Cache schema version. Bump when the on-disk layout changes incompatibly.
-const SCHEMA_VERSION: u32 = 1;
+///
+/// V2: `CodeAtom` gained a `parent: Option<String>` field. Old cache
+/// entries deserialize methods with `parent = None`, which would defeat
+/// the qualified-method-only resolver — bumping forces a cold reparse so
+/// every method is re-emitted with its real owner type.
+///
+/// V3: `CodeAtom` gained a `method_calls: Vec<String>` field; the
+/// parser now routes receiver-style captures (`obj.method()`) there
+/// instead of `calls`. Without a fresh reparse, a v2 unit's `calls`
+/// list still includes those captures and the resolver would happily
+/// ghost-bind them to free fns of the same name.
+///
+/// V4: resolver-only change — cross-language matches (`.py` ↔ `.rs`)
+/// are now rejected. Cache layout unchanged but bumping forces a
+/// re-resolve so old `Calls` edges between Python and Rust files are
+/// not silently kept.
+///
+/// V5: resolver-only change — bare-name calls no longer fall back to
+/// a unique cross-crate candidate (closure-parameter shadowing was
+/// producing ghosts), and `Self::`/`crate::`/`self::`/`super::` no
+/// longer fall through to bare-name resolution after the qualified
+/// path fails. Bump forces stale ghost edges to be dropped on next
+/// resolve.
+///
+/// V6: resolver-only change — bare-name calls that have *already*
+/// been resolved by the parser's intra-file linker no longer get a
+/// second cross-file edge added by the resolver. Closes the "twin
+/// files share a private helper name" cycle (`l2_sq` in voronoi tree
+/// pairs, `build_request_url` in dork's google/duckduckgo backends,
+/// `find_atom` shared across the ingester parse-test files, etc.).
+const SCHEMA_VERSION: u32 = 6;
 
 /// Grammar version. Bump when `tree-sitter-rust` or `tree-sitter-python`
 /// is updated in `Cargo.toml`. Forces a cold reparse on next run.
@@ -381,6 +411,8 @@ mod tests {
             signature: String::new(),
             content_hash: "abcdef".to_owned(),
             calls: vec![],
+            method_calls: vec![],
+            parent: None,
         }
     }
 

@@ -379,6 +379,8 @@ mod tests {
             signature: format!("pub fn {name}()"),
             content_hash: "hash123".to_owned(),
             calls: Vec::new(),
+            method_calls: Vec::new(),
+            parent: None,
         }
     }
 
@@ -394,6 +396,8 @@ mod tests {
             signature: String::new(),
             content_hash: "mhash".to_owned(),
             calls: Vec::new(),
+            method_calls: Vec::new(),
+            parent: None,
         }
     }
 

@@ -27,6 +27,8 @@ pub(super) struct PythonQueries {
     /// Top-level items (`function_definition`, `class_definition`,
     /// `decorated_definition`).
     pub items: Query,
+    /// Methods inside `class` blocks.
+    pub class_methods: Query,
     /// Call sites inside a function body.
     pub calls: Query,
 }
@@ -50,6 +52,8 @@ pub(super) static PYTHON: LazyLock<PythonQueries> = LazyLock::new(|| {
     PythonQueries {
         items: Query::new(&lang, include_str!("queries/python/items.scm"))
             .expect("queries/python/items.scm must compile"),
+        class_methods: Query::new(&lang, include_str!("queries/python/class_methods.scm"))
+            .expect("queries/python/class_methods.scm must compile"),
         calls: Query::new(&lang, include_str!("queries/python/calls.scm"))
             .expect("queries/python/calls.scm must compile"),
     }
@@ -71,6 +75,7 @@ mod tests {
     #[test]
     fn python_queries_compile() {
         let _ = &PYTHON.items;
+        let _ = &PYTHON.class_methods;
         let _ = &PYTHON.calls;
     }
 }
