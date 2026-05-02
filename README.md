@@ -178,6 +178,11 @@ a2m impact ./my-repo --target execute
 # Write to a file instead of stdout
 a2m project ./my-repo --out graph.mmd
 
+# Emit Graphviz DOT instead of Mermaid — for graphs too big for browser
+# renderers (GitHub caps at 500 edges, mermaid.live freezes around the
+# same point). Pipe straight to dot/sfdp/twopi/circo:
+a2m project ./my-repo --format dot | dot -Tsvg > graph.svg
+
 # Materialize a full bundle for a ref into the cache (idempotent, re-runs
 # print the cached path and exit instantly)
 a2m index ./my-repo --ref main
@@ -208,6 +213,29 @@ a2m project ./my-repo --trace=info
 | `a2m gc` | Evict old / oversized cache entries by mtime + soft size cap | no |
 
 The first seven accept `--ref <git-ref>` to read from any ref instead of the working tree. The last three accept `--cache-dir <path>` to relocate the cache and `--no-cache` to bypass it (ephemeral tempdir).
+
+The five analyze-flavoured subcommands (`project`, `overview`, `module`, `function`, `impact`) also accept `--format <mermaid|dot>` — see [When the graph is too big for Mermaid](#when-the-graph-is-too-big-for-mermaid).
+
+## When the graph is too big for Mermaid
+
+Mermaid renders client-side via dagre. Browsers — and GitHub's markdown renderer — cap the input around **500 edges / 50 KB**. Past that, the diagram is structurally correct but unviewable: GitHub shows `Edge limit exceeded`, mermaid.live freezes, the SVG canvas comes back empty.
+
+Graphviz handles 10k+ nodes fine. The `--format dot` flag emits DOT instead of Mermaid so you can pipe straight into the layout engine of your choice:
+
+```bash
+# Hierarchical (default — best for reading dependency chains)
+a2m project ./my-repo --format dot | dot -Tsvg > graph.svg
+
+# Force-directed (best for spotting clusters in a big graph)
+a2m project ./my-repo --format dot | sfdp -Tsvg > graph.svg
+
+# Radial (one central hub fans out)
+a2m project ./my-repo --format dot | twopi -Tsvg > graph.svg
+```
+
+Install graphviz first (`brew install graphviz` / `apt install graphviz` / `choco install graphviz`).
+
+What carries over: nodes, ids, edges, edge labels, `subgraph` boundaries (as DOT clusters). What doesn't: Mermaid-specific node shapes (hexagon for traits, cylinder for consts, …) collapse to DOT's default rectangle. The connectivity is preserved; the typographic hint is lost. That's the trade for *"the graph would otherwise be unviewable"*.
 
 ## The artifact bundle
 

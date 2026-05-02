@@ -13,6 +13,7 @@
 //! - [`Level::Impact`] (target = function name or id) — reverse call chain
 //!   walked back N hops (default 3) — answers "who breaks if I change this?".
 
+pub mod dot;
 mod function;
 mod impact;
 pub mod lookup;
@@ -26,6 +27,7 @@ use crate::graph::Store;
 use std::fmt;
 use std::str::FromStr;
 
+pub use dot::mermaid_to_dot;
 pub use impact::DEFAULT_HOPS;
 
 /// Which view to render.

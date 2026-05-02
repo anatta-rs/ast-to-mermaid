@@ -10,7 +10,7 @@ use crate::diff::{compute_diff, load_bundle_entities, render_mermaid};
 use crate::pipeline::{
     AnalyzeOptions, analyze, bundle, snapshot_id, walk_for_languages_with_exclude,
 };
-use crate::render::Level;
+use crate::render::{Level, mermaid_to_dot};
 use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::Arc;
@@ -47,6 +47,19 @@ impl From<ExitCode> for process::ExitCode {
     }
 }
 
+/// Output format for the analyze-flavoured subcommands. `Mermaid` is the
+/// default and what the renderers natively emit; `Dot` post-processes that
+/// into Graphviz DOT for graphs too large for browser-based mermaid
+/// rendering (GitHub caps at 500 edges).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+pub enum AnalyzeFormat {
+    /// Mermaid (default — renders in GitHub markdown, mermaid.live, etc.).
+    #[default]
+    Mermaid,
+    /// Graphviz DOT — pipe to `dot -Tsvg` for huge graphs (10k+ nodes).
+    Dot,
+}
+
 /// Shared CLI args for the analyze-flavoured subcommands
 /// (`project`, `overview`, `module`, `function`, `impact`).
 #[derive(Debug, Clone, clap::Args)]
@@ -65,7 +78,7 @@ pub struct AnalyzeFlags {
     #[arg(short = 'x', long, default_value = "")]
     pub exclude: String,
 
-    /// Write Mermaid output to this file instead of stdout.
+    /// Write output to this file instead of stdout.
     #[arg(short, long)]
     pub out: Option<PathBuf>,
 
@@ -74,6 +87,13 @@ pub struct AnalyzeFlags {
     /// subdirectory hint within that ref's tree.
     #[arg(long, value_name = "GIT-REF")]
     pub r#ref: Option<String>,
+
+    /// Output format. `mermaid` (default) renders natively in GitHub
+    /// markdown / mermaid.live up to ~500 edges. `dot` emits Graphviz DOT
+    /// for graphs too large for those renderers — pipe to
+    /// `dot -Tsvg > graph.svg`.
+    #[arg(long, value_enum, default_value_t = AnalyzeFormat::Mermaid)]
+    pub format: AnalyzeFormat,
 }
 
 /// Run the analyze pipeline for `level`, writing the resulting Mermaid to
@@ -119,14 +139,19 @@ pub fn run_analyze(level: Level, flags: &AnalyzeFlags) -> ExitCode {
         }
     };
 
+    let rendered = match flags.format {
+        AnalyzeFormat::Mermaid => report.mermaid.clone(),
+        AnalyzeFormat::Dot => mermaid_to_dot(&report.mermaid),
+    };
+
     let suffix = if let Some(path) = flags.out.as_deref() {
-        if let Err(e) = std::fs::write(path, &report.mermaid) {
+        if let Err(e) = std::fs::write(path, &rendered) {
             eprintln!("write {}: {e}", path.display());
             return ExitCode::Failure;
         }
         format!(" → {}", path.display())
     } else {
-        print!("{}", report.mermaid);
+        print!("{rendered}");
         String::new()
     };
 
@@ -712,6 +737,7 @@ mod tests {
             exclude: String::new(),
             out: None,
             r#ref: None,
+            format: AnalyzeFormat::default(),
         };
         let code = run_analyze(Level::Module, &flags);
         assert_eq!(code, ExitCode::UsageError);
@@ -725,6 +751,7 @@ mod tests {
             exclude: String::new(),
             out: None,
             r#ref: None,
+            format: AnalyzeFormat::default(),
         };
         let code = run_analyze(Level::Project, &flags);
         assert_eq!(code, ExitCode::Failure);
@@ -748,6 +775,7 @@ mod tests {
             exclude: String::new(),
             out: Some(out_file.clone()),
             r#ref: None,
+            format: AnalyzeFormat::default(),
         };
         let code = run_analyze(Level::Project, &flags);
         assert_eq!(code, ExitCode::Success);
@@ -763,9 +791,28 @@ mod tests {
             exclude: String::new(),
             out: None,
             r#ref: None,
+            format: AnalyzeFormat::default(),
         };
         let code = run_analyze(Level::Project, &flags);
         assert_eq!(code, ExitCode::Success);
+    }
+
+    #[test]
+    fn project_level_dot_format_emits_digraph() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let out_file = tmp.path().join("out.dot");
+        let flags = AnalyzeFlags {
+            path: tmp.path().to_path_buf(),
+            target: None,
+            exclude: String::new(),
+            out: Some(out_file.clone()),
+            r#ref: None,
+            format: AnalyzeFormat::Dot,
+        };
+        assert_eq!(run_analyze(Level::Project, &flags), ExitCode::Success);
+        let body = std::fs::read_to_string(&out_file).expect("read");
+        assert!(body.starts_with("digraph G {"), "got: {body}");
+        assert!(body.contains("rankdir=TB"), "got: {body}");
     }
 
     #[test]
