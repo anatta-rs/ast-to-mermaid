@@ -120,10 +120,20 @@ pub fn cat_file(repo_root: &Path, blob_sha: &str) -> Result<Vec<u8>> {
 }
 
 fn run_git(cwd: &Path, args: &[&str]) -> Result<std::process::Output> {
+    // Strip ambient `GIT_*` env vars before invoking the subprocess. They
+    // override `-C` / `current_dir` and would silently retarget our
+    // operations at whatever repository the caller was already inside —
+    // most painfully when `a2m` is invoked from a pre-commit hook
+    // running inside `git commit` (the parent operation exports
+    // `GIT_DIR`, `GIT_INDEX_FILE`, …) but also any other nested call.
     Command::new("git")
         .arg("-C")
         .arg(cwd)
         .args(args)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_INDEX_FILE")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_OBJECT_DIRECTORY")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()
@@ -162,10 +172,24 @@ mod tests {
     }
 
     fn run_or_panic(cwd: &Path, args: &[&str]) -> std::process::Output {
+        // Strip any ambient `GIT_*` env vars before invoking git: when this
+        // test suite runs from inside a `git commit` / `git push` (e.g. via
+        // a pre-commit hook that calls `cargo test`), the parent operation
+        // exports `GIT_DIR`, `GIT_INDEX_FILE`, `GIT_WORK_TREE`, and
+        // `GIT_OBJECT_DIRECTORY`. Those override `-C` / `current_dir` and
+        // make the subprocess operate against the *parent* repository
+        // instead of the tempdir we just initialised — historically this
+        // produced "could not lock config" failures and, worse, ghost
+        // commits authored by the fixture's `t <t@t>` identity that
+        // overwrote real source files in the parent worktree.
         let out = Command::new("git")
             .arg("-C")
             .arg(cwd)
             .args(args)
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_INDEX_FILE")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_OBJECT_DIRECTORY")
             .output()
             .unwrap_or_else(|e| panic!("git {args:?}: {e}"));
         if !out.status.success() {
