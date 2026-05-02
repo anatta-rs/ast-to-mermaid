@@ -140,43 +140,45 @@ That's a feature commit. A bug fix would have one orange node, a single edge to 
 
 ### Order of operations: `a2m sequence ./src --target <fn>`
 
-The other five views are unordered call graphs — they tell you *who calls whom*, not *in what order*. `a2m sequence` walks one function body in source order and emits a Mermaid `sequenceDiagram`: one lifeline per receiver, one arrow per call, control flow lifted into `alt` / `loop` blocks.
+The other five views are unordered call graphs — they tell you *who calls whom*, not *in what order*. `a2m sequence` walks one function body in source order and emits a Mermaid `sequenceDiagram`: lifelines per receiver, arrows per call, control flow lifted into `alt` / `loop` blocks. Take `dir_size_recursive` from this repo's cache module — 12 lines of Rust, a tree walk:
 
-Real output for `a2m sequence ./src --target bundle` — the entry point of `a2m bundle`, a four-stage pipeline that turns a source tree into the artifact bundle:
+```rust
+fn dir_size_recursive(dir: &Path) -> Result<u64> {
+    let mut total = 0;
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let meta = entry.metadata()?;
+        if meta.is_dir() {
+            total += dir_size_recursive(&entry.path())?;
+        } else {
+            total += meta.len();
+        }
+    }
+    Ok(total)
+}
+```
+
+`a2m sequence ./src --target dir_size_recursive` →
 
 ```mermaid
 sequenceDiagram
     autonumber
-    %% pub fn bundle(root: &Path, opts: &AnalyzeOptions) -> Result<(ArtifactSet, AnalyzeReport)>
+    %% fn dir_size_recursive(dir: &Path) -> Result<u64>
     participant self as self
-    participant AstToMermaidError as AstToMermaidError
-    participant Store as Store
-    participant opts as opts
-    participant root as root
-    participant artifacts as artifacts
-    alt if opts.git_ref.is_none() && !root.…
-        self->>AstToMermaidError: InvalidInput
-        self->>self: format!
+    participant entry as entry
+    participant meta as meta
+    loop for std::fs::read_dir(dir)?
+        self->>entry: metadata
+        alt if meta.is_dir()
+            self->>self: dir_size_recursive
+            self->>entry: path
+        else
+            self->>meta: len
+        end
     end
-    self->>self: collect_inputs
-    self->>Store: new
-    self->>self: parse_phase
-    self->>opts: as_deref
-    self->>self: resolve_phase
-    alt match opts.git_ref.as_deref()
-        self->>self: format!
-        self->>root: into_owned
-    end
-    self->>self: emit_artifacts
-    self->>artifacts: clone
 ```
 
-What the diagram tells you in five seconds, fanning out across six lifelines:
-
-- **The pre-flight check** is the first `alt` — only fires when there's no git ref *and* the working-tree path is missing. A path-doesn't-exist error is impossible in `--ref` mode, the diagram makes that explicit.
-- **The pipeline is four stages, in order**: `collect_inputs` → `Store::new` → `parse_phase` → `resolve_phase`. Reading the source you'd have to thread through error-handling and let-bindings to see the same shape.
-- **The second `alt match opts.git_ref`** is the source-root label: `path@ref` for git mode, plain path for working-tree mode — both branches show up.
-- **`emit_artifacts` is the only thing that touches the `artifacts` lifeline**, and it happens at the end. If you're auditing where the output gets shaped, that's the one place to look.
+The whole algorithm in one glance: a `for` over directory entries, branching on `is_dir()` — the recursive call (the `self`-loop on step 3) versus the leaf-file path (`meta.len()`). The recursion is *visually* a self-arrow on the `self` lifeline; the `else` branch on a different lifeline (`meta`) makes the dir/file split obvious without reading the source.
 
 Receiver classification is syntactic: `obj.method()` → `obj`, `Type::method()` → `Type`, bare ident → `self`. `.await` annotates the arrow. Test/panic plumbing (`assert!`, `Some`/`Ok` constructors, etc.) is filtered out as noise. Pass `--all --out <DIR>` to dump one `.mmd` per non-empty function across the tree.
 
