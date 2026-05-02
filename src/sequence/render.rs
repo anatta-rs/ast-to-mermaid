@@ -1,6 +1,6 @@
 //! [`SequenceDiagram`] → Mermaid `sequenceDiagram` text.
 
-use super::{Participant, SequenceDiagram, Step, SELF_ID};
+use super::{Participant, SELF_ID, SequenceDiagram, Step};
 use std::fmt::Write;
 
 /// Render a [`SequenceDiagram`] as Mermaid `sequenceDiagram` source.
@@ -54,11 +54,7 @@ fn write_step(out: &mut String, step: &Step, depth: usize) {
             let _ = SELF_ID; // silence unused-import lint when feature gates change.
         }
         Step::Note { over, text } => {
-            let _ = writeln!(
-                out,
-                "{indent}Note over {over}: {}",
-                escape_label(text)
-            );
+            let _ = writeln!(out, "{indent}Note over {over}: {}", escape_label(text));
         }
         Step::Loop { label, body } => {
             // Mermaid renders `loop X\nend` (empty body) as a tiny stub
@@ -75,9 +71,7 @@ fn write_step(out: &mut String, step: &Step, depth: usize) {
         }
         Step::Alt { cond, then, else_ } => {
             let then_visible = has_visible_steps(then);
-            let else_visible = else_
-                .as_deref()
-                .is_some_and(has_visible_steps);
+            let else_visible = else_.as_deref().is_some_and(has_visible_steps);
             if !then_visible && !else_visible {
                 return;
             }
@@ -107,8 +101,7 @@ fn has_visible_steps(steps: &[Step]) -> bool {
         Step::Call { .. } | Step::Note { .. } => true,
         Step::Loop { body, .. } => has_visible_steps(body),
         Step::Alt { then, else_, .. } => {
-            has_visible_steps(then)
-                || else_.as_deref().is_some_and(has_visible_steps)
+            has_visible_steps(then) || else_.as_deref().is_some_and(has_visible_steps)
         }
     })
 }

@@ -2,7 +2,7 @@
 //! [`super::Step`]s. Statement order is preserved by walking the AST
 //! depth-first, left-to-right.
 
-use super::{Participant, Step, SELF_ID};
+use super::{Participant, SELF_ID, Step};
 use std::collections::HashSet;
 use tree_sitter::Node;
 
@@ -204,9 +204,7 @@ impl State {
             }
             "scoped_identifier" => {
                 let text = node_text(callee, source).unwrap_or("");
-                let (head, tail) = text
-                    .rsplit_once("::")
-                    .map_or(("", text), |(h, t)| (h, t));
+                let (head, tail) = text.rsplit_once("::").map_or(("", text), |(h, t)| (h, t));
                 let head_root = head.split("::").next().unwrap_or("");
                 if head_root.is_empty() || head_root == "Self" {
                     (SELF_ID.to_owned(), self.self_label(), tail.to_owned())

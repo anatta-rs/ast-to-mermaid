@@ -766,12 +766,7 @@ pub struct SequenceFlags {
 /// - All (`--all`, requires `--out <DIR>`): every Rust function in the
 ///   source tree is rendered into its own `<DIR>/<file>__<name>.mmd`.
 pub fn run_sequence(flags: &SequenceFlags) -> ExitCode {
-    if !flags.all
-        && flags
-            .target
-            .as_deref()
-            .is_none_or(|t| t.trim().is_empty())
-    {
+    if !flags.all && flags.target.as_deref().is_none_or(|t| t.trim().is_empty()) {
         eprintln!("sequence: pass --target <NAME> or --all");
         return ExitCode::UsageError;
     }
@@ -1657,8 +1652,14 @@ mod tests {
             .filter_map(std::result::Result::ok)
             .filter_map(|e| e.file_name().into_string().ok())
             .collect();
-        assert!(entries.iter().any(|n| n.ends_with("__a.mmd")), "got: {entries:?}");
-        assert!(entries.iter().any(|n| n.contains("S__m")), "got: {entries:?}");
+        assert!(
+            entries.iter().any(|n| n.ends_with("__a.mmd")),
+            "got: {entries:?}"
+        );
+        assert!(
+            entries.iter().any(|n| n.contains("S__m")),
+            "got: {entries:?}"
+        );
         // Empty function `b` must NOT produce a file.
         assert!(
             !entries.iter().any(|n| n.ends_with("__b.mmd")),

@@ -123,13 +123,10 @@ pub fn extract(content: &[u8], file_path: &str, target_fn: &str) -> Result<Seque
 
     let root = tree.root_node();
     let (fn_node, container) = find_target(root, text, target_fn).ok_or_else(|| {
-        AstToMermaidError::InvalidInput(format!(
-            "no function `{target_fn}` found in {file_path}"
-        ))
+        AstToMermaidError::InvalidInput(format!("no function `{target_fn}` found in {file_path}"))
     })?;
 
-    let title = signature(&fn_node, text)
-        .map_or_else(|| target_fn.to_owned(), str::to_owned);
+    let title = signature(&fn_node, text).map_or_else(|| target_fn.to_owned(), str::to_owned);
 
     let mut state = visit::State::new(container.as_deref());
     let body = fn_node.child_by_field_name("body");
@@ -308,7 +305,10 @@ mod tests {
         let Step::Loop { body, .. } = &d.steps[0] else {
             panic!("expected loop, got {:?}", d.steps);
         };
-        assert!(body.iter().any(|s| matches!(s, Step::Call { label, .. } if label == "foo")));
+        assert!(
+            body.iter()
+                .any(|s| matches!(s, Step::Call { label, .. } if label == "foo"))
+        );
     }
 
     #[test]
@@ -317,9 +317,16 @@ mod tests {
         let Step::Alt { then, else_, .. } = &d.steps[0] else {
             panic!("expected alt, got {:?}", d.steps);
         };
-        assert!(then.iter().any(|s| matches!(s, Step::Call { label, .. } if label == "yes")));
+        assert!(
+            then.iter()
+                .any(|s| matches!(s, Step::Call { label, .. } if label == "yes"))
+        );
         let else_steps = else_.as_ref().expect("else branch");
-        assert!(else_steps.iter().any(|s| matches!(s, Step::Call { label, .. } if label == "no")));
+        assert!(
+            else_steps
+                .iter()
+                .any(|s| matches!(s, Step::Call { label, .. } if label == "no"))
+        );
     }
 
     #[test]
@@ -352,7 +359,11 @@ mod tests {
         }
         // The `real()` inside `Some(...)` is in expression position, so
         // it surfaces. (Calls inside `assert_eq!` arg-tokens do not.)
-        assert_eq!(labels.iter().filter(|l| **l == "real").count(), 1, "{labels:?}");
+        assert_eq!(
+            labels.iter().filter(|l| **l == "real").count(),
+            1,
+            "{labels:?}"
+        );
     }
 
     #[test]
@@ -360,10 +371,7 @@ mod tests {
         // `writeln!(buf, "...").expect()` — receiver of `.expect` is the
         // macro return value; pin the participant to `writeln`, not the
         // whole macro source.
-        let d = extract_ok(
-            "fn run() { writeln!(buf, \"x\").expect(\"io\"); }\n",
-            "run",
-        );
+        let d = extract_ok("fn run() { writeln!(buf, \"x\").expect(\"io\"); }\n", "run");
         let to_targets: Vec<&str> = d
             .steps
             .iter()
@@ -393,15 +401,16 @@ mod tests {
     fn impl_method_target_resolves() {
         let src = "impl Foo { fn build(&self) { go(); } }\n";
         let d = extract_ok(src, "Foo::build");
-        assert!(d.steps.iter().any(|s| matches!(s, Step::Call { label, .. } if label == "go")));
+        assert!(
+            d.steps
+                .iter()
+                .any(|s| matches!(s, Step::Call { label, .. } if label == "go"))
+        );
     }
 
     #[test]
     fn participants_deduped_and_ordered() {
-        let d = extract_ok(
-            "fn run(a: A, b: B) { a.x(); b.y(); a.z(); }\n",
-            "run",
-        );
+        let d = extract_ok("fn run(a: A, b: B) { a.x(); b.y(); a.z(); }\n", "run");
         let ids: Vec<&str> = d.participants.iter().map(|p| p.id.as_str()).collect();
         // self comes first (caller), then a, then b — order of first appearance.
         assert_eq!(ids.first().copied(), Some(SELF_ID));
@@ -412,4 +421,3 @@ mod tests {
         assert!(a_pos < b_pos, "a must appear before b: {ids:?}");
     }
 }
-
