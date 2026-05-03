@@ -188,9 +188,16 @@ fn qualified_fn_name(id: &str) -> Option<String> {
     id.split_once("::function::").map(|(_, q)| q.to_owned())
 }
 
-/// Write the artifact set to `out_dir`.
+/// Write the artifact set to `out_dir`, reconciling against any existing
+/// contents.
 ///
-/// Creates:
+/// Behavior is incremental: files whose bytes already match the new artifact
+/// are left untouched (mtimes preserved), and entity / sequence files for ids
+/// no longer present in `artifacts` are deleted. The top-level `index.json`
+/// is compared modulo its `generated_at` field — a run that produces the
+/// same entity set keeps the previous timestamp on disk.
+///
+/// Layout:
 /// - `<out_dir>/overview.mmd`
 /// - `<out_dir>/index.json`
 /// - `<out_dir>/entities/<sanitized-id>.mmd`
@@ -210,30 +217,115 @@ pub fn write_artifacts(
     let entities_dir = out_dir.join("entities");
     fs::create_dir_all(&entities_dir)?;
 
-    fs::write(out_dir.join("overview.mmd"), &artifacts.overview_mmd)?;
-    fs::write(
-        out_dir.join("index.json"),
-        serde_json::to_string_pretty(&artifacts.index_json).unwrap_or_default(),
-    )?;
-
+    let mut keep_entity_basenames: HashSet<String> = HashSet::new();
     for entity in &artifacts.entities {
         let base = sanitize_id(entity.id.as_str());
-        fs::write(entities_dir.join(format!("{base}.mmd")), &entity.mmd)?;
-        fs::write(
-            entities_dir.join(format!("{base}.meta.json")),
-            serde_json::to_string_pretty(&entity.meta).unwrap_or_default(),
+        keep_entity_basenames.insert(base.clone());
+        write_if_changed(
+            &entities_dir.join(format!("{base}.mmd")),
+            entity.mmd.as_bytes(),
+        )?;
+        write_if_changed(
+            &entities_dir.join(format!("{base}.meta.json")),
+            serde_json::to_string_pretty(&entity.meta)
+                .unwrap_or_default()
+                .as_bytes(),
         )?;
     }
 
+    let sequences_dir = out_dir.join("sequences");
+    let mut keep_seq_basenames: HashSet<String> = HashSet::new();
     if !artifacts.sequences.is_empty() {
-        let sequences_dir = out_dir.join("sequences");
         fs::create_dir_all(&sequences_dir)?;
         for seq in &artifacts.sequences {
             let base = sanitize_id(seq.entity_id.as_str());
-            fs::write(sequences_dir.join(format!("{base}.mmd")), &seq.mmd)?;
+            keep_seq_basenames.insert(base.clone());
+            write_if_changed(
+                &sequences_dir.join(format!("{base}.mmd")),
+                seq.mmd.as_bytes(),
+            )?;
         }
     }
 
+    prune_orphans(
+        &entities_dir,
+        &keep_entity_basenames,
+        &[".meta.json", ".mmd"],
+    )?;
+    prune_orphans(&sequences_dir, &keep_seq_basenames, &[".mmd"])?;
+
+    write_if_changed(
+        &out_dir.join("overview.mmd"),
+        artifacts.overview_mmd.as_bytes(),
+    )?;
+    write_index_json(&out_dir.join("index.json"), &artifacts.index_json)?;
+
+    Ok(())
+}
+
+/// Write `contents` to `path` only if the on-disk bytes differ. Returns
+/// `Ok(true)` if the file was (re)written, `Ok(false)` if it was identical
+/// and left alone.
+fn write_if_changed(path: &std::path::Path, contents: &[u8]) -> crate::error::Result<bool> {
+    if let Ok(existing) = std::fs::read(path)
+        && existing == contents
+    {
+        return Ok(false);
+    }
+    std::fs::write(path, contents)?;
+    Ok(true)
+}
+
+/// Write `index.json`, preserving the on-disk `generated_at` when the rest
+/// of the document is structurally unchanged. Keeps the timestamp meaningful
+/// (= last data change) instead of "last invocation".
+fn write_index_json(path: &std::path::Path, new_value: &Value) -> crate::error::Result<()> {
+    if let Ok(existing_bytes) = std::fs::read(path)
+        && let Ok(existing_value) = serde_json::from_slice::<Value>(&existing_bytes)
+        && structurally_equal_modulo_generated_at(&existing_value, new_value)
+    {
+        return Ok(());
+    }
+    let pretty = serde_json::to_string_pretty(new_value).unwrap_or_default();
+    std::fs::write(path, pretty)?;
+    Ok(())
+}
+
+fn structurally_equal_modulo_generated_at(a: &Value, b: &Value) -> bool {
+    let mut a = a.clone();
+    let mut b = b.clone();
+    if let Value::Object(m) = &mut a {
+        m.remove("generated_at");
+    }
+    if let Value::Object(m) = &mut b {
+        m.remove("generated_at");
+    }
+    a == b
+}
+
+/// Delete any file in `dir` whose name ends with one of `suffixes` and whose
+/// pre-suffix basename is not in `keep`. No-ops when `dir` doesn't exist.
+fn prune_orphans(
+    dir: &std::path::Path,
+    keep: &HashSet<String>,
+    suffixes: &[&str],
+) -> crate::error::Result<()> {
+    if !dir.is_dir() {
+        return Ok(());
+    }
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        for suffix in suffixes {
+            if let Some(base) = name_str.strip_suffix(suffix) {
+                if !keep.contains(base) {
+                    let _ = std::fs::remove_file(entry.path());
+                }
+                break;
+            }
+        }
+    }
     Ok(())
 }
 
@@ -591,5 +683,145 @@ mod tests {
         assert!(tmp.path().join("index.json").exists());
         // entities dir exists
         assert!(tmp.path().join("entities").is_dir());
+    }
+
+    /// Build a small artifact set with one fn entity at `(file, name, hash)`.
+    /// `source_root` controls the index's `source_root` field — irrelevant
+    /// for these tests but distinguishes runs.
+    fn small_set(file: &str, name: &str, hash: &str) -> ArtifactSet {
+        let store = Store::new();
+        let mut atom = fn_atom(&format!("code:{file}::function::{name}"), file, name);
+        atom.content_hash = hash.to_owned();
+        store.add_atom(atom);
+        emit_artifacts(&store, "/src")
+    }
+
+    fn mtime(path: &std::path::Path) -> std::time::SystemTime {
+        std::fs::metadata(path)
+            .expect("metadata")
+            .modified()
+            .expect("modified")
+    }
+
+    #[test]
+    fn write_artifacts_skips_unchanged_files() {
+        // Second write with the same artifacts must not rewrite any file —
+        // compared via mtime equality. APFS / ext4 give us sub-second
+        // resolution so no sleep is needed to make this observable.
+        let artifacts = small_set("src/lib.rs", "foo", "h1");
+        let tmp = tempfile::tempdir().expect("tmp");
+        write_artifacts(&artifacts, tmp.path()).expect("first write");
+
+        let overview = tmp.path().join("overview.mmd");
+        let index = tmp.path().join("index.json");
+        let foo_mmd = tmp
+            .path()
+            .join("entities/code_src_lib.rs__function__foo.mmd");
+        let foo_meta = tmp
+            .path()
+            .join("entities/code_src_lib.rs__function__foo.meta.json");
+
+        let m_overview = mtime(&overview);
+        let m_index = mtime(&index);
+        let m_mmd = mtime(&foo_mmd);
+        let m_meta = mtime(&foo_meta);
+
+        // Re-emit (so `generated_at` is fresh) and write again.
+        let artifacts2 = small_set("src/lib.rs", "foo", "h1");
+        write_artifacts(&artifacts2, tmp.path()).expect("second write");
+
+        assert_eq!(mtime(&overview), m_overview, "overview.mmd was rewritten");
+        assert_eq!(
+            mtime(&index),
+            m_index,
+            "index.json was rewritten despite only generated_at differing"
+        );
+        assert_eq!(mtime(&foo_mmd), m_mmd, "entity .mmd was rewritten");
+        assert_eq!(mtime(&foo_meta), m_meta, "entity .meta.json was rewritten");
+    }
+
+    #[test]
+    fn write_artifacts_rewrites_only_modified_entity() {
+        // Two entities; second pass changes one's content_hash. The
+        // unchanged entity's files keep their original mtime.
+        let store = Store::new();
+        let mut foo = fn_atom("code:src/lib.rs::function::foo", "src/lib.rs", "foo");
+        foo.content_hash = "h1".to_owned();
+        let mut bar = fn_atom("code:src/lib.rs::function::bar", "src/lib.rs", "bar");
+        bar.content_hash = "b1".to_owned();
+        store.add_atom(foo);
+        store.add_atom(bar);
+        let artifacts = emit_artifacts(&store, "/src");
+
+        let tmp = tempfile::tempdir().expect("tmp");
+        write_artifacts(&artifacts, tmp.path()).expect("first write");
+
+        let foo_mmd = tmp
+            .path()
+            .join("entities/code_src_lib.rs__function__foo.mmd");
+        let bar_mmd = tmp
+            .path()
+            .join("entities/code_src_lib.rs__function__bar.mmd");
+        let m_foo = mtime(&foo_mmd);
+        let m_bar = mtime(&bar_mmd);
+
+        // Second pass: bar's hash changes, foo unchanged.
+        let store2 = Store::new();
+        let mut foo2 = fn_atom("code:src/lib.rs::function::foo", "src/lib.rs", "foo");
+        foo2.content_hash = "h1".to_owned();
+        let mut bar2 = fn_atom("code:src/lib.rs::function::bar", "src/lib.rs", "bar");
+        bar2.content_hash = "b2".to_owned();
+        store2.add_atom(foo2);
+        store2.add_atom(bar2);
+        let artifacts2 = emit_artifacts(&store2, "/src");
+        write_artifacts(&artifacts2, tmp.path()).expect("second write");
+
+        assert_eq!(mtime(&foo_mmd), m_foo, "foo.mmd should not be rewritten");
+        assert!(
+            mtime(&bar_mmd) > m_bar,
+            "bar.mmd should be rewritten after content_hash change"
+        );
+    }
+
+    #[test]
+    fn write_artifacts_prunes_removed_entities() {
+        // First pass: foo + bar. Second pass: only foo. bar's .mmd and
+        // .meta.json must be deleted.
+        let store = Store::new();
+        store.add_atom(fn_atom(
+            "code:src/lib.rs::function::foo",
+            "src/lib.rs",
+            "foo",
+        ));
+        store.add_atom(fn_atom(
+            "code:src/lib.rs::function::bar",
+            "src/lib.rs",
+            "bar",
+        ));
+        let artifacts = emit_artifacts(&store, "/src");
+
+        let tmp = tempfile::tempdir().expect("tmp");
+        write_artifacts(&artifacts, tmp.path()).expect("first write");
+
+        let bar_mmd = tmp
+            .path()
+            .join("entities/code_src_lib.rs__function__bar.mmd");
+        let bar_meta = tmp
+            .path()
+            .join("entities/code_src_lib.rs__function__bar.meta.json");
+        assert!(bar_mmd.exists());
+        assert!(bar_meta.exists());
+
+        let store2 = Store::new();
+        store2.add_atom(fn_atom(
+            "code:src/lib.rs::function::foo",
+            "src/lib.rs",
+            "foo",
+        ));
+        let artifacts2 = emit_artifacts(&store2, "/src");
+        write_artifacts(&artifacts2, tmp.path()).expect("second write");
+
+        assert!(!bar_mmd.exists(), "bar.mmd should be pruned");
+        assert!(!bar_meta.exists(), "bar.meta.json should be pruned");
     }
 }
