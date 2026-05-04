@@ -146,21 +146,34 @@ pub fn run_analyze(level: Level, flags: &AnalyzeFlags) -> ExitCode {
         AnalyzeFormat::Dot => mermaid_to_dot(&report.mermaid),
     };
 
-    let suffix = if let Some(path) = flags.out.as_deref() {
+    if let Some(path) = flags.out.as_deref() {
         if let Err(e) = std::fs::write(path, &rendered) {
             eprintln!("write {}: {e}", path.display());
             return ExitCode::Failure;
         }
-        format!(" → {}", path.display())
+        eprintln!(
+            "analyzed {} files, {} atoms, {} cross-module edges → {}",
+            report.files_parsed,
+            report.atoms_indexed,
+            report.edges_resolved,
+            path.display(),
+        );
     } else {
+        // Stdout path: terminal users copy-paste the rendered output
+        // directly into mermaid.live or a fenced ```mermaid block. The
+        // summary used to land on stderr, but stderr renders adjacently in
+        // a TTY and gets swept into the copy-paste, breaking the parser.
+        // Inline it as a parser-ignored comment instead.
         print!("{rendered}");
-        String::new()
-    };
-
-    eprintln!(
-        "analyzed {} files, {} atoms, {} cross-module edges{}",
-        report.files_parsed, report.atoms_indexed, report.edges_resolved, suffix,
-    );
+        let comment_prefix = match flags.format {
+            AnalyzeFormat::Mermaid => "%%",
+            AnalyzeFormat::Dot => "//",
+        };
+        println!(
+            "{comment_prefix} analyzed {} files, {} atoms, {} cross-module edges",
+            report.files_parsed, report.atoms_indexed, report.edges_resolved,
+        );
+    }
     ExitCode::Success
 }
 
@@ -1033,6 +1046,13 @@ mod tests {
         let code = run_analyze(Level::Project, &flags);
         assert_eq!(code, ExitCode::Success);
         assert!(out_file.exists(), "output file must be written");
+        let body = std::fs::read_to_string(&out_file).expect("read");
+        // The summary lives on stderr (with " → path" suffix) when --out is
+        // set; the file itself stays clean for downstream renderers.
+        assert!(
+            !body.contains("%% analyzed"),
+            "file output must not contain the stdout-only %% summary; got: {body}"
+        );
     }
 
     #[test]
@@ -1066,6 +1086,12 @@ mod tests {
         let body = std::fs::read_to_string(&out_file).expect("read");
         assert!(body.starts_with("digraph G {"), "got: {body}");
         assert!(body.contains("rankdir=TB"), "got: {body}");
+        // DOT file stays clean: the stdout-only `// analyzed …` summary
+        // must not be appended when writing to a file.
+        assert!(
+            !body.contains("// analyzed"),
+            "file output must not contain the stdout-only summary comment; got: {body}"
+        );
     }
 
     #[test]
