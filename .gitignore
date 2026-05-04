@@ -19,3 +19,6 @@ docs/todo/
 .githooks/post-commit
 .githooks/post-merge
 .githooks/post-rewrite
+
+# Anatta `attach`: regenerated caches (bundle output + a2m content-addressed cache).
+.a2m/
