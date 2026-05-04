@@ -6,6 +6,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 
+## [0.5.1](https://github.com/anatta-rs/ast-to-mermaid/compare/v0.5.0...v0.5.1) - 2026-05-04
+
+### Bug fixes
+
+- *(stdout)* Inline analyze summary as mermaid/DOT comment ([#64](https://github.com/anatta-rs/ast-to-mermaid/pull/64))
+
+### Features
+
+- *(bundle)* Reconcile-on-write in write_artifacts ([#60](https://github.com/anatta-rs/ast-to-mermaid/pull/60))
+
 ## [0.5.0](https://github.com/anatta-rs/ast-to-mermaid/compare/v0.4.2...v0.5.0) - 2026-05-02
 
 ### Features
