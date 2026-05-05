@@ -257,7 +257,8 @@ impl State {
             "field_expression" => {
                 // `obj.method` — receiver is the leftmost ident along the
                 // value chain. `obj.field.method` collapses to `obj`.
-                let receiver_root = field_receiver_root(callee, source).unwrap_or("?");
+                let receiver_root =
+                    field_receiver_root(callee, source, self.max_depth).unwrap_or("?");
                 let method = callee
                     .child_by_field_name("field")
                     .and_then(|n| node_text(&n, source))
@@ -295,9 +296,11 @@ impl State {
                 s.walk_block_at(&b, source, depth);
             }
         });
+        let has_visible = body.iter().any(Step::has_visible);
         self.steps.push(Step::Loop {
             label: label.to_owned(),
             body,
+            has_visible,
         });
     }
 
@@ -317,10 +320,16 @@ impl State {
                 s.walk_expr(&alt, source, depth);
             })
         });
+        let then_has_visible = then.iter().any(Step::has_visible);
+        let else_has_visible = else_branch
+            .as_deref()
+            .is_some_and(|s| s.iter().any(Step::has_visible));
         self.steps.push(Step::Alt {
             cond,
             then,
             else_: else_branch,
+            then_has_visible,
+            else_has_visible,
         });
     }
 
@@ -343,10 +352,13 @@ impl State {
                 }
             }
         });
+        let then_has_visible = arms_steps.iter().any(Step::has_visible);
         self.steps.push(Step::Alt {
             cond,
             then: arms_steps,
             else_: None,
+            then_has_visible,
+            else_has_visible: false,
         });
     }
 
@@ -407,12 +419,14 @@ fn node_text<'a>(node: &Node, source: &'a str) -> Option<&'a str> {
 /// to the macro name instead of swallowing the whole macro body. For
 /// `scoped_identifier` (`Type::method`) the head segment wins.
 ///
-/// Bounded by [`max_ast_depth`]: once that many descent steps elapse
+/// `limit` is the depth cap captured once on the enclosing [`State`]
+/// (see [`State::max_depth`]) — passed in rather than re-resolved here
+/// so the recursive call path doesn't re-read `A2M_MAX_AST_DEPTH` for
+/// every receiver classification. Once that many descent steps elapse
 /// (an adversarial deeply nested chain) we stop walking and return the
 /// best-effort raw text of the current node so the caller still
 /// produces a finite label.
-fn field_receiver_root<'a>(node: &Node, source: &'a str) -> Option<&'a str> {
-    let limit = max_ast_depth();
+fn field_receiver_root<'a>(node: &Node, source: &'a str, limit: usize) -> Option<&'a str> {
     let mut current = *node;
     for _ in 0..limit {
         match current.kind() {

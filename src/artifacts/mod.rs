@@ -23,6 +23,7 @@ use crate::graph::Store;
 use crate::model::{AtomKind, CodeAtom, EntityId};
 use crate::render::{AdjMaps, AtomSnapshot, Level, render};
 use crate::sequence;
+use rayon::prelude::*;
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -187,18 +188,20 @@ fn build_sequences(
     }
 
     // Pass 2: parse each file exactly once and bulk-extract every target.
-    let mut sequences_by_file: HashMap<&str, sequence::SequenceMap> = HashMap::new();
-    for (file_path, targets) in &targets_by_file {
-        let content = by_path[*file_path];
-        let Ok(text) = std::str::from_utf8(content) else {
-            continue;
-        };
-        let Ok(tree) = sequence::parse_source_once(content, file_path) else {
-            continue;
-        };
-        let target_refs: Vec<&str> = targets.iter().map(String::as_str).collect();
-        sequences_by_file.insert(file_path, sequence::extract_all(&tree, text, &target_refs));
-    }
+    // Each file is independent — parsing dominates the work, so drive it
+    // through `rayon::par_iter`. Empty inputs short-circuit on the
+    // `is_empty` guard above so we don't pay rayon's setup on small
+    // bundles.
+    let sequences_by_file: HashMap<&str, sequence::SequenceMap> = targets_by_file
+        .par_iter()
+        .filter_map(|(file_path, targets)| {
+            let content = by_path[*file_path];
+            let text = std::str::from_utf8(content).ok()?;
+            let tree = sequence::parse_source_once(content, file_path).ok()?;
+            let target_refs: Vec<&str> = targets.iter().map(String::as_str).collect();
+            Some((*file_path, sequence::extract_all(&tree, text, &target_refs)))
+        })
+        .collect();
 
     // Pass 3: assemble artifacts in original entity order, looking up
     // each diagram in the per-file map.
