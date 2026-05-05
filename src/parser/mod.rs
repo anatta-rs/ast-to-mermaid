@@ -13,10 +13,10 @@
 //!
 //! # Layout
 //!
-//! Per-language extractors live in sibling modules — `rust`, `python`,
-//! `typescript`. This file holds the shared types ([`Language`],
-//! [`CodeParser`], [`ParseFailure`], [`ParseUnit`]) and the dispatch that
-//! routes each file at its language module.
+//! Per-language extractors live in sibling modules — `rust`, `python`.
+//! This file holds the shared types ([`Language`], [`CodeParser`],
+//! [`ParseFailure`], [`ParseUnit`]) and the dispatch that routes each file
+//! at its language module.
 
 use crate::error::{AstToMermaidError, Result};
 use crate::graph::Store;
@@ -29,7 +29,6 @@ use tree_sitter::{Node, Parser as TsParser, QueryCursor, StreamingIterator};
 mod python;
 mod queries;
 mod rust;
-mod typescript;
 
 // ── Parse output ─────────────────────────────────────────────────────────────
 
@@ -109,26 +108,30 @@ pub fn strip_bom(bytes: &[u8]) -> &[u8] {
 /// `\r\n` (CRLF) is left as-is — tree-sitter and `str::lines` already
 /// handle it. Returns `Cow::Borrowed` when no rewrite is needed so the
 /// hot path stays allocation-free.
+///
+/// Single-pass: scans `bytes` once, deferring the allocation until the
+/// first bare `\r` is seen. The all-LF / all-CRLF fast path returns
+/// `Cow::Borrowed` without ever building an output buffer.
 #[must_use]
 pub fn normalize_eol(bytes: &[u8]) -> Cow<'_, [u8]> {
-    let needs_rewrite = bytes
-        .iter()
-        .enumerate()
-        .any(|(i, &b)| b == b'\r' && bytes.get(i + 1) != Some(&b'\n'));
-    if !needs_rewrite {
-        return Cow::Borrowed(bytes);
-    }
-    let mut out = Vec::with_capacity(bytes.len());
+    let mut out: Option<Vec<u8>> = None;
     let mut i = 0;
     while i < bytes.len() {
-        if bytes[i] == b'\r' && bytes.get(i + 1) != Some(&b'\n') {
-            out.push(b'\n');
-        } else {
-            out.push(bytes[i]);
+        let b = bytes[i];
+        let is_bare_cr = b == b'\r' && bytes.get(i + 1) != Some(&b'\n');
+        if is_bare_cr {
+            let buf = out.get_or_insert_with(|| {
+                let mut v = Vec::with_capacity(bytes.len());
+                v.extend_from_slice(&bytes[..i]);
+                v
+            });
+            buf.push(b'\n');
+        } else if let Some(buf) = out.as_mut() {
+            buf.push(b);
         }
         i += 1;
     }
-    Cow::Owned(out)
+    out.map_or(Cow::Borrowed(bytes), Cow::Owned)
 }
 
 // ── Language ──────────────────────────────────────────────────────────────────
@@ -713,13 +716,7 @@ fn hex_sha256(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
     hasher.update(bytes);
-    let digest = hasher.finalize();
-    let mut out = String::with_capacity(64);
-    for byte in digest {
-        use std::fmt::Write as FmtWrite;
-        write!(out, "{byte:02x}").expect("string write is infallible");
-    }
-    out
+    hex::encode(hasher.finalize())
 }
 
 /// Extract the module name (file stem) from a path.

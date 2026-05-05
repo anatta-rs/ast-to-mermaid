@@ -248,6 +248,10 @@ pub struct BatchReader {
     child: Child,
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
+    /// Reusable scratch buffer for the per-blob header line. Cleared on
+    /// every [`Self::read_blob`] call instead of re-allocating a fresh
+    /// `String` per request.
+    header_scratch: String,
 }
 
 impl BatchReader {
@@ -285,6 +289,7 @@ impl BatchReader {
             child,
             stdin,
             stdout: BufReader::new(stdout),
+            header_scratch: String::new(),
         })
     }
 
@@ -313,17 +318,17 @@ impl BatchReader {
             .flush()
             .map_err(|e| AstToMermaidError::InvalidInput(format!("git cat-file flush: {e}")))?;
 
-        let mut header = String::new();
+        self.header_scratch.clear();
         let n = self
             .stdout
-            .read_line(&mut header)
+            .read_line(&mut self.header_scratch)
             .map_err(|e| AstToMermaidError::InvalidInput(format!("git cat-file read: {e}")))?;
         if n == 0 {
             return Err(AstToMermaidError::InvalidInput(
                 "git cat-file: unexpected EOF on header".into(),
             ));
         }
-        let trimmed = header.trim_end_matches('\n');
+        let trimmed = self.header_scratch.trim_end_matches('\n');
         // Format: "<sha> <type> <size>" or "<sha> missing".
         let parts: Vec<&str> = trimmed.splitn(3, ' ').collect();
         if parts.len() == 2 && parts[1] == "missing" {

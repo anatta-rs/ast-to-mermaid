@@ -9,7 +9,6 @@ use crate::render::AdjMaps;
 use crate::render::lookup::resolve_function;
 use crate::render::snapshot::AtomSnapshot;
 use crate::render::util::{escape_label_flowchart, sanitize_id};
-use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
 /// Render the function-zoom view of `target` against `snapshot`.
@@ -31,21 +30,29 @@ pub fn render(adj: &AdjMaps, snapshot: &AtomSnapshot<'_>, target: &str) -> Resul
         .get(&center_id)
         .expect("resolve_function vouched the id exists");
 
-    let mut who_calls: BTreeMap<String, String> = BTreeMap::new(); // id → name
-    for caller_arc in adj.callers(&center_id) {
-        let caller_id: &EntityId = caller_arc;
-        if let Some(atom) = snapshot.get(caller_id) {
-            who_calls.insert(caller_id.as_str().to_owned(), atom.name.clone());
-        }
-    }
+    let mut who_calls: Vec<(&EntityId, &str)> = adj
+        .callers(&center_id)
+        .iter()
+        .filter_map(|caller_arc| {
+            let caller_id: &EntityId = caller_arc;
+            snapshot
+                .get(caller_id)
+                .map(|atom| (caller_id, atom.name.as_str()))
+        })
+        .collect();
+    who_calls.sort_by_key(|(id, _)| id.as_str());
 
-    let mut whom_called: BTreeMap<String, String> = BTreeMap::new(); // id → name
-    for callee_arc in adj.callees(&center_id) {
-        let callee_id: &EntityId = callee_arc;
-        if let Some(atom) = snapshot.get(callee_id) {
-            whom_called.insert(callee_id.as_str().to_owned(), atom.name.clone());
-        }
-    }
+    let mut whom_called: Vec<(&EntityId, &str)> = adj
+        .callees(&center_id)
+        .iter()
+        .filter_map(|callee_arc| {
+            let callee_id: &EntityId = callee_arc;
+            snapshot
+                .get(callee_id)
+                .map(|atom| (callee_id, atom.name.as_str()))
+        })
+        .collect();
+    whom_called.sort_by_key(|(id, _)| id.as_str());
 
     let target_node_id = sanitize_id(center_id.as_str());
     let target_label = escape_label_flowchart(&format!("fn {} (target)", center_atom.name));
@@ -55,13 +62,13 @@ pub fn render(adj: &AdjMaps, snapshot: &AtomSnapshot<'_>, target: &str) -> Resul
         .expect("string write is infallible");
 
     for (caller_id, caller_name) in &who_calls {
-        let id = sanitize_id(caller_id);
+        let id = sanitize_id(caller_id.as_str());
         let label = escape_label_flowchart(caller_name);
         writeln!(mermaid, "    {id}[\"{label}\"]").expect("string write is infallible");
         writeln!(mermaid, "    {id} --> {target_node_id}").expect("string write is infallible");
     }
     for (callee_id, callee_name) in &whom_called {
-        let id = sanitize_id(callee_id);
+        let id = sanitize_id(callee_id.as_str());
         let label = escape_label_flowchart(callee_name);
         writeln!(mermaid, "    {id}[\"{label}\"]").expect("string write is infallible");
         writeln!(mermaid, "    {target_node_id} --> {id}").expect("string write is infallible");

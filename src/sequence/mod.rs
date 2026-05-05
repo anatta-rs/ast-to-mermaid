@@ -21,8 +21,6 @@
 //!   inlined (no spawn-style "par" blocks yet).
 //! - `.await` is annotated on the arrow label (not a separate lifeline).
 
-#![warn(missing_docs)]
-
 use crate::error::{AstToMermaidError, Result};
 use std::collections::HashMap;
 use tree_sitter::{Node, Parser as TsParser, Tree};
