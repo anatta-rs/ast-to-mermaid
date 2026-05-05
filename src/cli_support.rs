@@ -655,10 +655,12 @@ pub fn run_gc(flags: &GcFlags) -> ExitCode {
     ExitCode::Success
 }
 
-fn parse_size(s: &str) -> std::result::Result<u64, String> {
+fn parse_size(s: &str) -> crate::error::Result<u64> {
     let s = s.trim();
     if s.is_empty() {
-        return Err("empty value".into());
+        return Err(crate::error::AstToMermaidError::InvalidInput(
+            "empty value".into(),
+        ));
     }
     let (num, mult) = match s.chars().last() {
         Some('K' | 'k') => (&s[..s.len() - 1], 1024_u64),
@@ -667,14 +669,20 @@ fn parse_size(s: &str) -> std::result::Result<u64, String> {
         _ => (s, 1_u64),
     };
     num.parse::<u64>()
-        .map_err(|e| format!("expected `<num>[K|M|G]`, got `{s}`: {e}"))
+        .map_err(|e| {
+            crate::error::AstToMermaidError::InvalidInput(format!(
+                "expected `<num>[K|M|G]`, got `{s}`: {e}"
+            ))
+        })
         .map(|n| n * mult)
 }
 
-fn parse_duration(s: &str) -> std::result::Result<Duration, String> {
+fn parse_duration(s: &str) -> crate::error::Result<Duration> {
     let s = s.trim();
     if s.is_empty() {
-        return Err("empty value".into());
+        return Err(crate::error::AstToMermaidError::InvalidInput(
+            "empty value".into(),
+        ));
     }
     let (num, secs) = match s.chars().last() {
         Some('s') => (&s[..s.len() - 1], 1_u64),
@@ -685,7 +693,11 @@ fn parse_duration(s: &str) -> std::result::Result<Duration, String> {
         _ => (s, 1),
     };
     num.parse::<u64>()
-        .map_err(|e| format!("expected `<num>[s|m|h|d|w]`, got `{s}`: {e}"))
+        .map_err(|e| {
+            crate::error::AstToMermaidError::InvalidInput(format!(
+                "expected `<num>[s|m|h|d|w]`, got `{s}`: {e}"
+            ))
+        })
         .map(|n| Duration::from_secs(n * secs))
 }
 
@@ -1299,13 +1311,13 @@ mod tests {
 
     #[test]
     fn parse_size_empty_errors() {
-        let err = parse_size("   ").unwrap_err();
+        let err = parse_size("   ").unwrap_err().to_string();
         assert!(err.contains("empty"), "got: {err}");
     }
 
     #[test]
     fn parse_size_non_numeric_errors() {
-        let err = parse_size("abc").unwrap_err();
+        let err = parse_size("abc").unwrap_err().to_string();
         assert!(err.contains("expected"), "got: {err}");
     }
 
@@ -1324,12 +1336,17 @@ mod tests {
 
     #[test]
     fn parse_duration_empty_errors() {
-        assert!(parse_duration("").unwrap_err().contains("empty"));
+        assert!(
+            parse_duration("")
+                .unwrap_err()
+                .to_string()
+                .contains("empty")
+        );
     }
 
     #[test]
     fn parse_duration_non_numeric_errors() {
-        let err = parse_duration("xs").unwrap_err();
+        let err = parse_duration("xs").unwrap_err().to_string();
         assert!(err.contains("expected"), "got: {err}");
     }
 
