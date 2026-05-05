@@ -47,6 +47,17 @@ fn check_ref_arg(subcommand: &str, value: Option<&str>) -> Result<(), ExitCode> 
     }
 }
 
+/// Parse a CSV `--exclude` flag value into a list of directory basenames:
+/// split on `,`, trim whitespace, drop empty entries. Shared across the
+/// analyze / walk / bundle / sequence subcommands.
+fn parse_csv_exclude(s: &str) -> Vec<String> {
+    s.split(',')
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
 /// Exit code returned by CLI functions, convertible into [`process::ExitCode`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExitCode {
@@ -125,6 +136,7 @@ pub struct AnalyzeFlags {
 /// All failures are reported via `eprintln!` and surfaced as
 /// `ExitCode::Failure`. Bad CLI input (missing target for a level that
 /// requires one) yields `ExitCode::UsageError`.
+#[must_use]
 pub fn run_analyze(level: Level, flags: &AnalyzeFlags) -> ExitCode {
     if level.requires_target() && flags.target.is_none() {
         eprintln!("level={level} requires --target");
@@ -134,13 +146,7 @@ pub fn run_analyze(level: Level, flags: &AnalyzeFlags) -> ExitCode {
         return code;
     }
 
-    let exclude: Vec<String> = flags
-        .exclude
-        .split(',')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_owned)
-        .collect();
+    let exclude = parse_csv_exclude(&flags.exclude);
 
     // Wire the cache transparently for analyze-flavoured subcommands when we
     // can find a git toplevel. Failures (not in a git repo, can't open cache)
@@ -227,6 +233,7 @@ pub struct WalkFlags {
 
 /// Run the file-walker subcommand: print one line per source file, format
 /// `<lang>\t<path>`, to stdout.
+#[must_use]
 pub fn run_walk(flags: &WalkFlags) -> ExitCode {
     if let Err(code) = check_ref_arg("walk", flags.r#ref.as_deref()) {
         return code;
@@ -234,13 +241,7 @@ pub fn run_walk(flags: &WalkFlags) -> ExitCode {
     if let Some(git_ref) = flags.r#ref.as_deref() {
         return run_walk_ref(&flags.path, git_ref);
     }
-    let exclude: Vec<String> = flags
-        .exclude
-        .split(',')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_owned)
-        .collect();
+    let exclude = parse_csv_exclude(&flags.exclude);
 
     match walk_for_languages_with_exclude(&flags.path, &exclude) {
         Ok(files) => {
@@ -731,17 +732,12 @@ pub struct BundleFlags {
 
 /// Run the artifact-bundle subcommand: parse → resolve → emit a directory
 /// of per-entity Mermaid + metadata files plus a top-level `index.json`.
+#[must_use]
 pub fn run_bundle(flags: &BundleFlags) -> ExitCode {
     if let Err(code) = check_ref_arg("bundle", flags.r#ref.as_deref()) {
         return code;
     }
-    let exclude: Vec<String> = flags
-        .exclude
-        .split(',')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_owned)
-        .collect();
+    let exclude = parse_csv_exclude(&flags.exclude);
 
     let cache = open_default_cache(&flags.path);
 
@@ -824,6 +820,7 @@ pub struct SequenceFlags {
 ///   body to stdout or `--out <FILE>`.
 /// - All (`--all`, requires `--out <DIR>`): every Rust function in the
 ///   source tree is rendered into its own `<DIR>/<file>__<name>.mmd`.
+#[must_use]
 pub fn run_sequence(flags: &SequenceFlags) -> ExitCode {
     if !flags.all && flags.target.as_deref().is_none_or(|t| t.trim().is_empty()) {
         eprintln!("sequence: pass --target <NAME> or --all");
@@ -832,13 +829,7 @@ pub fn run_sequence(flags: &SequenceFlags) -> ExitCode {
     if let Err(code) = check_ref_arg("sequence", flags.r#ref.as_deref()) {
         return code;
     }
-    let exclude: Vec<String> = flags
-        .exclude
-        .split(',')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_owned)
-        .collect();
+    let exclude = parse_csv_exclude(&flags.exclude);
 
     let candidates = match collect_rust_sources(&flags.path, &exclude, flags.r#ref.as_deref()) {
         Ok(v) => v,
@@ -1062,6 +1053,14 @@ fn collect_rust_sources(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_csv_exclude_trims_and_drops_empties() {
+        assert_eq!(parse_csv_exclude("a,, b ,c"), vec!["a", "b", "c"]);
+        assert!(parse_csv_exclude("").is_empty());
+        assert!(parse_csv_exclude(" , , ").is_empty());
+        assert_eq!(parse_csv_exclude("target"), vec!["target"]);
+    }
 
     #[test]
     fn module_level_without_target_returns_usage_error() {
