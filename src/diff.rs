@@ -37,18 +37,8 @@ pub struct IndexEntity {
     pub content_hash: String,
     /// Outgoing edges (callees / contained / used). Used by the diff
     /// renderer to draw blast-radius arrows between changed entities.
-    #[serde(default, deserialize_with = "deserialize_out_edges")]
+    #[serde(default)]
     pub edges_out: Vec<String>,
-}
-
-/// Pull the `edges.out` array out of the nested `edges` object that
-/// `index.json` actually serializes. We accept both shapes so the diff
-/// loader is forward-compatible if the schema flattens later.
-fn deserialize_out_edges<'de, D>(d: D) -> std::result::Result<Vec<String>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    Vec::<String>::deserialize(d)
 }
 
 /// Top-level structure of a bundle's `index.json`. Mirrors the nested

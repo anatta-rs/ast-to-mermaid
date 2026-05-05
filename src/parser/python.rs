@@ -79,8 +79,9 @@ mod tests {
         let store = Store::new();
         let src = b"def foo():\n    pass\n\nclass Bar:\n    pass\n";
         CodeParser::python()
-            .parse_into(src, "mod.py", &store)
-            .expect("parse");
+            .parse(src, "mod.py")
+            .expect("parse")
+            .apply_to(&store);
         assert!(!store.atoms_by_kind("function").is_empty());
         assert!(!store.atoms_by_kind("struct").is_empty()); // class → struct
     }
@@ -90,8 +91,9 @@ mod tests {
         let store = Store::new();
         let src = b"def greet():\n    \"\"\"Say hello.\"\"\"\n    pass\n";
         CodeParser::python()
-            .parse_into(src, "greet.py", &store)
-            .expect("parse");
+            .parse(src, "greet.py")
+            .expect("parse")
+            .apply_to(&store);
         let id = EntityId::new("code:greet.py::function::greet");
         let atom = store.get_atom(&id).expect("atom");
         assert!(atom.doc.contains("Say hello"), "doc={:?}", atom.doc);
@@ -103,8 +105,9 @@ mod tests {
         // obj.method() — triggers method_call_expression in Python grammar
         let src = b"def runner():\n    obj.run()\n    helper()\n";
         CodeParser::python()
-            .parse_into(src, "runner.py", &store)
-            .expect("parse");
+            .parse(src, "runner.py")
+            .expect("parse")
+            .apply_to(&store);
         let id = EntityId::new("code:runner.py::function::runner");
         let atom = store.get_atom(&id).expect("atom");
         // calls list should contain extracted call names
