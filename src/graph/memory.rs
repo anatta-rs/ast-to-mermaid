@@ -17,10 +17,21 @@
 //! that maintains it is [`Store::add_edge`]; a `pub(crate)` escape hatch
 //! [`Store::rebuild_indices`] recomputes both maps from scratch for use
 //! by future bulk-load paths.
+//!
+//! Poison recovery: every accessor takes the lock via [`Store::read_or_recover`]
+//! / [`Store::write_or_recover`], which fall back to `PoisonError::into_inner`
+//! when the lock is poisoned. We trust the inner state across a poison
+//! because every mutation is a single, self-contained operation: `add_atom`
+//! is one `HashMap::insert`, `add_edge` is one `Vec::push` plus two
+//! `HashMap::entry().or_default().push()` — no compound update can be torn
+//! apart by a panic in the middle. A poisoned guard therefore observes a
+//! state that is either fully pre-mutation or fully post-mutation, never
+//! halfway. This lets a panic in one writer not cascade-kill every
+//! subsequent reader.
 
 use crate::model::{CodeAtom, Edge, EdgeKind, EntityId};
 use std::collections::HashMap;
-use std::sync::RwLock;
+use std::sync::{PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 // ── Store ─────────────────────────────────────────────────────────────────────
 
@@ -64,19 +75,31 @@ impl Store {
         }
     }
 
+    // ── Lock helpers ──────────────────────────────────────────────────────────
+
+    /// Acquire a read guard, recovering from a poisoned lock.
+    ///
+    /// Equivalent to `RwLock::read().unwrap_or_else(PoisonError::into_inner)`.
+    /// See the module docs for why partial mutations are impossible and
+    /// the recovered state is therefore safe to read.
+    fn read_or_recover(&self) -> RwLockReadGuard<'_, Inner> {
+        self.inner.read().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Acquire a write guard, recovering from a poisoned lock.
+    ///
+    /// Equivalent to `RwLock::write().unwrap_or_else(PoisonError::into_inner)`.
+    /// Does not re-poison: each mutation here is a single self-contained
+    /// op (see module docs), so subsequent writers see a consistent state.
+    fn write_or_recover(&self) -> RwLockWriteGuard<'_, Inner> {
+        self.inner.write().unwrap_or_else(PoisonError::into_inner)
+    }
+
     // ── Writes ────────────────────────────────────────────────────────────────
 
     /// Insert or replace an atom (upsert semantics).
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal `RwLock` is poisoned.
     pub fn add_atom(&self, atom: CodeAtom) {
-        self.inner
-            .write()
-            .expect("rwlock not poisoned")
-            .atoms
-            .insert(atom.id.clone(), atom);
+        self.write_or_recover().atoms.insert(atom.id.clone(), atom);
     }
 
     /// Record a directed edge.
@@ -87,12 +110,8 @@ impl Store {
     /// This is the sole mutation point for `forward_idx` / `reverse_idx`:
     /// the new edge's index is appended to both maps in lockstep with the
     /// `edges` push, so the invariant described at the module level holds.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal `RwLock` is poisoned.
     pub fn add_edge(&self, edge: Edge) {
-        let mut guard = self.inner.write().expect("rwlock not poisoned");
+        let mut guard = self.write_or_recover();
         let idx = guard.edges.len();
         let from = edge.from.clone();
         let to = edge.to.clone();
@@ -106,43 +125,23 @@ impl Store {
     /// Reserved for future bulk-load paths (e.g. bundle reconstruction)
     /// that may want to populate `edges` directly. Not used by `add_edge`,
     /// which maintains the maps incrementally.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal `RwLock` is poisoned.
     #[allow(dead_code)] // reserved for bundle reconstruction; see module docs
     pub(crate) fn rebuild_indices(&self) {
-        self.inner
-            .write()
-            .expect("rwlock not poisoned")
-            .rebuild_indices();
+        self.write_or_recover().rebuild_indices();
     }
 
     // ── Reads ─────────────────────────────────────────────────────────────────
 
     /// Look up a single atom by id.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal `RwLock` is poisoned.
     #[must_use]
     pub fn get_atom(&self, id: &EntityId) -> Option<CodeAtom> {
-        self.inner
-            .read()
-            .expect("rwlock not poisoned")
-            .atoms
-            .get(id)
-            .cloned()
+        self.read_or_recover().atoms.get(id).cloned()
     }
 
     /// Return all atoms whose `file_path` matches `path`.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal `RwLock` is poisoned.
     #[must_use]
     pub fn atoms_in_file(&self, path: &str) -> Vec<CodeAtom> {
-        let guard = self.inner.read().expect("rwlock not poisoned");
+        let guard = self.read_or_recover();
         let mut out: Vec<CodeAtom> = guard
             .atoms
             .values()
@@ -155,13 +154,9 @@ impl Store {
     }
 
     /// All atoms of a given kind string (e.g. `"function"`, `"module"`).
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal `RwLock` is poisoned.
     #[must_use]
     pub fn atoms_by_kind(&self, kind: &str) -> Vec<CodeAtom> {
-        let guard = self.inner.read().expect("rwlock not poisoned");
+        let guard = self.read_or_recover();
         let mut out: Vec<CodeAtom> = guard
             .atoms
             .values()
@@ -174,13 +169,9 @@ impl Store {
 
     /// All atoms for several kinds at once. Returns a `Vec<CodeAtom>` in a
     /// stable (id-sorted) order.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal `RwLock` is poisoned.
     #[must_use]
     pub fn atoms_by_kinds(&self, kinds: &[&str]) -> Vec<CodeAtom> {
-        let guard = self.inner.read().expect("rwlock not poisoned");
+        let guard = self.read_or_recover();
         let mut out: Vec<CodeAtom> = guard
             .atoms
             .values()
@@ -192,26 +183,18 @@ impl Store {
     }
 
     /// All atoms (id-sorted).
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal `RwLock` is poisoned.
     #[must_use]
     pub fn all_atoms(&self) -> Vec<CodeAtom> {
-        let guard = self.inner.read().expect("rwlock not poisoned");
+        let guard = self.read_or_recover();
         let mut out: Vec<CodeAtom> = guard.atoms.values().cloned().collect();
         out.sort_by_key(|a| a.id.clone());
         out
     }
 
     /// Outgoing edges from `from`, optionally filtered by kind.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal `RwLock` is poisoned.
     #[must_use]
     pub fn edges_from(&self, from: &EntityId) -> Vec<Edge> {
-        let guard = self.inner.read().expect("rwlock not poisoned");
+        let guard = self.read_or_recover();
         match guard.forward_idx.get(from) {
             Some(idxs) => idxs.iter().map(|&i| guard.edges[i].clone()).collect(),
             None => Vec::new(),
@@ -219,13 +202,9 @@ impl Store {
     }
 
     /// Incoming edges to `to`.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal `RwLock` is poisoned.
     #[must_use]
     pub fn edges_to(&self, to: &EntityId) -> Vec<Edge> {
-        let guard = self.inner.read().expect("rwlock not poisoned");
+        let guard = self.read_or_recover();
         match guard.reverse_idx.get(to) {
             Some(idxs) => idxs.iter().map(|&i| guard.edges[i].clone()).collect(),
             None => Vec::new(),
@@ -233,13 +212,9 @@ impl Store {
     }
 
     /// All edges whose kind is `Calls`, outgoing from `from`.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal `RwLock` is poisoned.
     #[must_use]
     pub fn call_edges_from(&self, from: &EntityId) -> Vec<EntityId> {
-        let guard = self.inner.read().expect("rwlock not poisoned");
+        let guard = self.read_or_recover();
         let Some(idxs) = guard.forward_idx.get(from) else {
             return Vec::new();
         };
@@ -251,13 +226,9 @@ impl Store {
     }
 
     /// All edges whose kind is `Calls`, incoming to `to`.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal `RwLock` is poisoned.
     #[must_use]
     pub fn call_edges_to(&self, to: &EntityId) -> Vec<EntityId> {
-        let guard = self.inner.read().expect("rwlock not poisoned");
+        let guard = self.read_or_recover();
         let Some(idxs) = guard.reverse_idx.get(to) else {
             return Vec::new();
         };
@@ -269,13 +240,9 @@ impl Store {
     }
 
     /// Items contained in `parent` (via `Contains` edges).
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal `RwLock` is poisoned.
     #[must_use]
     pub fn children_of(&self, parent: &EntityId) -> Vec<EntityId> {
-        let guard = self.inner.read().expect("rwlock not poisoned");
+        let guard = self.read_or_recover();
         let Some(idxs) = guard.forward_idx.get(parent) else {
             return Vec::new();
         };
@@ -301,10 +268,6 @@ impl Store {
     /// no path cloning, so a high fan-in target with `hops = 3` no longer
     /// blows up to `F^3` cloned `Vec<EntityId>` paths. Callers that need
     /// individual paths can use [`reconstruct_path`] to walk the map.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal `RwLock` is poisoned.
     #[must_use]
     pub fn reverse_call_paths(
         &self,
@@ -320,7 +283,7 @@ impl Store {
             return (predecessors, reachable);
         }
 
-        let guard = self.inner.read().expect("rwlock not poisoned");
+        let guard = self.read_or_recover();
         let mut visited: HashSet<EntityId> = HashSet::new();
         visited.insert(target.clone());
         // BFS spanning tree: each visited node remembers the first node
@@ -378,13 +341,9 @@ impl Store {
     }
 
     /// Whether a `Calls` edge already exists from `from` to `to`.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal `RwLock` is poisoned.
     #[must_use]
     pub fn has_call_edge(&self, from: &EntityId, to: &EntityId) -> bool {
-        let guard = self.inner.read().expect("rwlock not poisoned");
+        let guard = self.read_or_recover();
         let Some(idxs) = guard.forward_idx.get(from) else {
             return false;
         };
@@ -399,37 +358,34 @@ impl Store {
     /// [`Store::all_atoms`]. Use this when a consumer needs to bucket the
     /// full edge list in a single sweep (e.g. building several adjacency
     /// maps at once) rather than paying O(E) per atom.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal `RwLock` is poisoned.
     #[must_use]
     pub fn all_edges(&self) -> Vec<Edge> {
-        self.inner
-            .read()
-            .expect("rwlock not poisoned")
-            .edges
-            .clone()
+        self.read_or_recover().edges.clone()
     }
 
     /// Number of atoms stored (for tests / diagnostics).
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal `RwLock` is poisoned.
     #[must_use]
     pub fn atom_count(&self) -> usize {
-        self.inner.read().expect("rwlock not poisoned").atoms.len()
+        self.read_or_recover().atoms.len()
     }
 
     /// Number of edges stored (for tests / diagnostics).
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal `RwLock` is poisoned.
     #[must_use]
     pub fn edge_count(&self) -> usize {
-        self.inner.read().expect("rwlock not poisoned").edges.len()
+        self.read_or_recover().edges.len()
+    }
+
+    /// Test-only hook: take the write lock and panic, leaving the lock
+    /// poisoned for the rest of the test.
+    ///
+    /// Hidden from rustdoc and prefixed with double underscores to keep it
+    /// clearly out of the supported API. Used by `tests/store_lock_poison.rs`
+    /// to verify the recovery path because integration tests cannot reach
+    /// the private `inner` field.
+    #[doc(hidden)]
+    pub fn __poison_lock_for_tests(&self) {
+        let _guard = self.write_or_recover();
+        panic!("intentional poison for tests");
     }
 }
 
