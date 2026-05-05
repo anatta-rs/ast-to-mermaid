@@ -24,12 +24,17 @@
 #![warn(missing_docs)]
 
 use crate::error::{AstToMermaidError, Result};
-use tree_sitter::{Node, Parser as TsParser};
+use std::collections::HashMap;
+use tree_sitter::{Node, Parser as TsParser, Tree};
 
 mod render;
 mod visit;
 
 pub use render::render;
+
+/// Map from qualified target name (`name` or `Owner::name`) to the
+/// extracted [`SequenceDiagram`]. Returned by [`extract_all`].
+pub type SequenceMap = HashMap<String, SequenceDiagram>;
 
 /// One Mermaid `sequenceDiagram` worth of structure.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -94,11 +99,75 @@ pub enum Step {
 /// Synthetic participant id for the function-under-analysis itself.
 pub const SELF_ID: &str = "self";
 
+/// Parse `content` for `file_path` exactly once and return the
+/// tree-sitter [`Tree`]. Callers typically pass the result to
+/// [`extract_all`] (or, via the legacy single-target [`extract`] wrapper,
+/// to `extract` indirectly).
+///
+/// Sequence extraction is Rust-only — the parser is configured for the
+/// `tree-sitter-rust` grammar.
+///
+/// # Errors
+///
+/// - [`AstToMermaidError::InvalidInput`] when `set_language` rejects the
+///   grammar (only on tree-sitter ABI mismatch).
+/// - [`AstToMermaidError::InvalidInput`] when tree-sitter cannot parse the
+///   content (e.g. partial input + a hard timeout).
+pub fn parse_source_once(content: &[u8], file_path: &str) -> Result<Tree> {
+    let mut parser = TsParser::new();
+    parser
+        .set_language(&tree_sitter_rust::LANGUAGE.into())
+        .map_err(|e| {
+            AstToMermaidError::InvalidInput(format!("set_language for {file_path}: {e}"))
+        })?;
+    parser.parse(content, None).ok_or_else(|| {
+        AstToMermaidError::InvalidInput(format!("tree-sitter parse failed for {file_path}"))
+    })
+}
+
+/// Extract a [`SequenceDiagram`] for every name in `targets` that resolves
+/// to a function in `tree`. The returned [`SequenceMap`] is keyed by the
+/// caller-supplied target string (the same form accepted by
+/// [`extract`]: `name` or `Owner::name`).
+///
+/// Names that don't resolve are simply absent from the map — no error.
+/// `tree` must come from [`parse_source_once`] over `source`'s bytes;
+/// behaviour is undefined if it doesn't.
+#[must_use]
+pub fn extract_all(tree: &Tree, source: &str, targets: &[&str]) -> SequenceMap {
+    let root = tree.root_node();
+    let mut out = SequenceMap::with_capacity(targets.len());
+    for &target in targets {
+        let Some((fn_node, container)) = find_target(root, source, target) else {
+            continue;
+        };
+        let title = signature(&fn_node, source).map_or_else(|| target.to_owned(), str::to_owned);
+        let mut state = visit::State::new(container.as_deref());
+        if let Some(block) = fn_node.child_by_field_name("body") {
+            state.walk_block(&block, source);
+        }
+        let (participants, steps) = state.finish();
+        out.insert(
+            target.to_owned(),
+            SequenceDiagram {
+                title,
+                participants,
+                steps,
+            },
+        );
+    }
+    out
+}
+
 /// Extract a [`SequenceDiagram`] for `target_fn` from `content`.
 ///
 /// `target_fn` may be a bare function name (`run_diff`) or a method-style
 /// identifier (`Foo::method`). The first matching function in source
 /// order wins.
+///
+/// Thin wrapper over [`parse_source_once`] + [`extract_all`] for the
+/// single-target case. Callers extracting many functions from the same
+/// file should drive `extract_all` directly to amortise the parse.
 ///
 /// # Errors
 ///
@@ -110,36 +179,14 @@ pub fn extract(content: &[u8], file_path: &str, target_fn: &str) -> Result<Seque
     let text = std::str::from_utf8(content).map_err(|e| {
         AstToMermaidError::InvalidInput(format!("invalid utf-8 in {file_path}: {e}"))
     })?;
-
-    let mut parser = TsParser::new();
-    parser
-        .set_language(&tree_sitter_rust::LANGUAGE.into())
-        .map_err(|e| {
-            AstToMermaidError::InvalidInput(format!("set_language for {file_path}: {e}"))
-        })?;
-    let tree = parser.parse(content, None).ok_or_else(|| {
-        AstToMermaidError::InvalidInput(format!("tree-sitter parse failed for {file_path}"))
-    })?;
-
-    let root = tree.root_node();
-    let (fn_node, container) = find_target(root, text, target_fn).ok_or_else(|| {
-        AstToMermaidError::InvalidInput(format!("no function `{target_fn}` found in {file_path}"))
-    })?;
-
-    let title = signature(&fn_node, text).map_or_else(|| target_fn.to_owned(), str::to_owned);
-
-    let mut state = visit::State::new(container.as_deref());
-    let body = fn_node.child_by_field_name("body");
-    if let Some(block) = body {
-        state.walk_block(&block, text);
-    }
-
-    let (participants, steps) = state.finish();
-    Ok(SequenceDiagram {
-        title,
-        participants,
-        steps,
-    })
+    let tree = parse_source_once(content, file_path)?;
+    extract_all(&tree, text, &[target_fn])
+        .remove(target_fn)
+        .ok_or_else(|| {
+            AstToMermaidError::InvalidInput(format!(
+                "no function `{target_fn}` found in {file_path}"
+            ))
+        })
 }
 
 /// List every function defined in `content`, returning their qualified
