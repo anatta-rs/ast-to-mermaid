@@ -35,6 +35,7 @@ clap = { version = "4", features = ["derive"] }
 sha1_smol = "1"
 ciborium = "0.2"
 tempfile = "3"
+rayon = "1"
 
 [dev-dependencies]
 pretty_assertions = "1"

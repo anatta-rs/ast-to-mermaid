@@ -11,6 +11,7 @@ use crate::graph::Store;
 use crate::parser::{CodeParser, Language, ParseFailure, ParseUnit, git_blob_sha1};
 use crate::render::{Level, render};
 use crate::resolve::{resolve_cross_module_calls, resolve_implements_edges};
+use rayon::prelude::*;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -241,12 +242,23 @@ fn parse_phase(inputs: &[ParseInput], store: &Store, cache: Option<&Cache>) -> P
     let _enter = span.enter();
     let started = std::time::Instant::now();
 
+    // Tree-sitter parsing is CPU-bound and embarrassingly file-parallel, so
+    // fan out across rayon workers and collect partial results in input
+    // order. Applying units to the (non-Sync) `Store` and folding the
+    // failure list happens sequentially after the fan-in, which keeps the
+    // resulting atom/edge order — and therefore the rendered output —
+    // byte-identical to the sequential implementation.
+    let results: Vec<Result<(ParseUnit, bool)>> = inputs
+        .par_iter()
+        .map(|input| parse_one_file(input, cache))
+        .collect();
+
     let mut report = ParseReport::default();
     let mut hits = 0usize;
     let mut misses = 0usize;
 
-    for input in inputs {
-        match parse_one_file(input, cache) {
+    for (input, res) in inputs.iter().zip(results) {
+        match res {
             Ok((unit, was_hit)) => {
                 report.atoms_indexed += unit.atom_count();
                 unit.apply_to(store);
