@@ -50,11 +50,7 @@ pub fn sanitize_id(name: &str) -> String {
             sanitized.push('_');
         }
     }
-    if sanitized
-        .as_bytes()
-        .first()
-        .is_some_and(u8::is_ascii_digit)
-    {
+    if sanitized.as_bytes().first().is_some_and(u8::is_ascii_digit) {
         let mut prefixed = String::with_capacity(sanitized.len() + 1);
         prefixed.push('_');
         prefixed.push_str(&sanitized);
