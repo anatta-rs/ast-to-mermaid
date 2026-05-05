@@ -53,6 +53,10 @@ harness = false
 name = "render"
 harness = false
 
+[[bench]]
+name = "resolve"
+harness = false
+
 [lints.rust]
 unsafe_code = "deny"
 missing_docs = "warn"

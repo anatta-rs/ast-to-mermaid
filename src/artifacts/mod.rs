@@ -90,28 +90,29 @@ pub fn emit_artifacts_with_sequences(
 ) -> ArtifactSet {
     let overview_mmd = render(Level::Project, store, None).unwrap_or_default();
 
-    let atoms = store.all_atoms();
-    let mut entities: Vec<EntityArtifact> = Vec::with_capacity(atoms.len());
-
     let adj = build_adjacency_maps(store);
-    let empty: Vec<EntityId> = Vec::new();
 
-    for atom in &atoms {
-        let kind = AtomKind::parse(&atom.kind);
-        let outgoing = adj.callees.get(&atom.id).unwrap_or(&empty);
-        let incoming = adj.callers.get(&atom.id).unwrap_or(&empty);
-        let children = adj.children.get(&atom.id).unwrap_or(&empty);
+    let mut entities: Vec<EntityArtifact> = store.with_atoms(|atoms| {
+        let mut out: Vec<EntityArtifact> = Vec::with_capacity(atoms.len());
+        let empty: Vec<EntityId> = Vec::new();
+        for atom in atoms {
+            let kind = AtomKind::parse(&atom.kind);
+            let outgoing = adj.callees.get(&atom.id).unwrap_or(&empty);
+            let incoming = adj.callers.get(&atom.id).unwrap_or(&empty);
+            let children = adj.children.get(&atom.id).unwrap_or(&empty);
 
-        let mmd = entity_mmd(atom, outgoing, incoming);
-        let meta = entity_meta(atom, outgoing, incoming, children, &adj);
+            let mmd = entity_mmd(atom, outgoing, incoming);
+            let meta = entity_meta(atom, outgoing, incoming, children, &adj);
 
-        entities.push(EntityArtifact {
-            id: atom.id.clone(),
-            kind,
-            mmd,
-            meta,
-        });
-    }
+            out.push(EntityArtifact {
+                id: atom.id.clone(),
+                kind,
+                mmd,
+                meta,
+            });
+        }
+        out
+    });
 
     // Sort entities deterministically by id.
     entities.sort_by(|a, b| a.id.as_str().cmp(b.id.as_str()));
@@ -497,8 +498,10 @@ struct AdjMaps {
     implements_in: HashMap<EntityId, Vec<EntityId>>,
 }
 
-/// Single sweep over `store.all_edges()` that yields the five logical
-/// adjacency buckets consumed by [`emit_artifacts`] and [`entity_meta`].
+/// Single sweep over the edge slice (held under [`Store::with_edges`]) that
+/// yields the five logical adjacency buckets consumed by [`emit_artifacts`]
+/// and [`entity_meta`]. Borrowing avoids the per-call deep clone of the
+/// store's full edge vector.
 fn build_adjacency_maps(store: &Store) -> AdjMaps {
     let mut maps = AdjMaps {
         callers: HashMap::new(),
@@ -509,37 +512,48 @@ fn build_adjacency_maps(store: &Store) -> AdjMaps {
         implements_out: HashMap::new(),
         implements_in: HashMap::new(),
     };
-    for edge in store.all_edges() {
-        match edge.kind {
-            EdgeKind::Calls => {
-                maps.callees
-                    .entry(edge.from.clone())
-                    .or_default()
-                    .push(edge.to.clone());
-                maps.callers.entry(edge.to).or_default().push(edge.from);
-            }
-            EdgeKind::Contains => {
-                maps.children.entry(edge.from).or_default().push(edge.to);
-            }
-            EdgeKind::Uses => {
-                maps.uses_out
-                    .entry(edge.from.clone())
-                    .or_default()
-                    .push(edge.to.clone());
-                maps.uses_in.entry(edge.to).or_default().push(edge.from);
-            }
-            EdgeKind::Implements => {
-                maps.implements_out
-                    .entry(edge.from.clone())
-                    .or_default()
-                    .push(edge.to.clone());
-                maps.implements_in
-                    .entry(edge.to)
-                    .or_default()
-                    .push(edge.from);
+    store.with_edges(|edges| {
+        for edge in edges {
+            match edge.kind {
+                EdgeKind::Calls => {
+                    maps.callees
+                        .entry(edge.from.clone())
+                        .or_default()
+                        .push(edge.to.clone());
+                    maps.callers
+                        .entry(edge.to.clone())
+                        .or_default()
+                        .push(edge.from.clone());
+                }
+                EdgeKind::Contains => {
+                    maps.children
+                        .entry(edge.from.clone())
+                        .or_default()
+                        .push(edge.to.clone());
+                }
+                EdgeKind::Uses => {
+                    maps.uses_out
+                        .entry(edge.from.clone())
+                        .or_default()
+                        .push(edge.to.clone());
+                    maps.uses_in
+                        .entry(edge.to.clone())
+                        .or_default()
+                        .push(edge.from.clone());
+                }
+                EdgeKind::Implements => {
+                    maps.implements_out
+                        .entry(edge.from.clone())
+                        .or_default()
+                        .push(edge.to.clone());
+                    maps.implements_in
+                        .entry(edge.to.clone())
+                        .or_default()
+                        .push(edge.from.clone());
+                }
             }
         }
-    }
+    });
     maps
 }
 
