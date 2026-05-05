@@ -9,7 +9,7 @@ use crate::error::{AstToMermaidError, Result};
 use crate::git_source;
 use crate::graph::Store;
 use crate::parser::{CodeParser, Language, ParseFailure, ParseUnit, git_blob_sha1};
-use crate::render::{AdjMaps, Level, render};
+use crate::render::{AdjMaps, AtomSnapshot, Level, render};
 use crate::resolve::{resolve_cross_module_calls, resolve_implements_edges};
 use rayon::prelude::*;
 use std::path::{Path, PathBuf};
@@ -215,7 +215,14 @@ pub fn analyze(root: &Path, opts: &AnalyzeOptions) -> Result<AnalyzeReport> {
     let parse_report = parse_phase(&inputs, &store, opts.cache.as_deref());
     let edges_resolved = resolve_phase(&store, parse_report.atoms_indexed);
     let adj = AdjMaps::build(&store);
-    let mermaid = render(opts.level, &store, &adj, opts.target.as_deref())?;
+    // Hold one read guard for the whole render: build the snapshot from
+    // the borrowed atom slice and let the dispatcher resolve targets +
+    // walk adjacency against it. Avoids the prior 100k+ `Store::get_atom`
+    // RwLock acquisitions per render call.
+    let mermaid = store.with_atoms(|atoms| {
+        let snapshot = AtomSnapshot::build(atoms);
+        render(opts.level, &adj, &snapshot, opts.target.as_deref())
+    })?;
 
     Ok(AnalyzeReport {
         mermaid,

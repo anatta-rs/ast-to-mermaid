@@ -1,4 +1,5 @@
-//! Mermaid renderers driven by a [`Store`] populated with code atoms.
+//! Mermaid renderers driven by a [`crate::graph::Store`] populated with code
+//! atoms.
 //!
 //! v0.3 ships five levels:
 //! - [`Level::Project`] — one node per crate with `(modules, functions,
@@ -21,6 +22,7 @@ pub mod lookup;
 mod module;
 mod overview;
 mod project;
+pub mod snapshot;
 pub mod util;
 
 use crate::error::{AstToMermaidError, Result as AtmResult};
@@ -31,6 +33,7 @@ use std::str::FromStr;
 pub use adj::AdjMaps;
 pub use dot::mermaid_to_dot;
 pub use impact::DEFAULT_HOPS;
+pub use snapshot::AtomSnapshot;
 
 /// Which view to render.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -90,7 +93,7 @@ impl FromStr for Level {
     }
 }
 
-/// Render `level` against `store`, reusing `adj` for every adjacency
+/// Render `level` against `snapshot`, reusing `adj` for every adjacency
 /// lookup. `target` is required for module / function / impact levels and
 /// ignored for project / overview.
 ///
@@ -99,24 +102,54 @@ impl FromStr for Level {
 /// point of threading it explicitly: bundle invocations avoid re-sweeping
 /// the edge slice once per level.
 ///
+/// `snapshot` is a borrowed `id → &CodeAtom` view (see [`AtomSnapshot`]).
+/// Build it once inside a [`crate::graph::Store::with_atoms`] callback —
+/// every per-atom lookup downstream is then a single `HashMap` probe with
+/// no `RwLock` traffic and no [`crate::model::CodeAtom`] clones.
+///
 /// # Errors
 ///
 /// - [`AstToMermaidError::InvalidInput`] when a target is required but absent
 ///   or doesn't resolve.
 pub fn render(
     level: Level,
+    adj: &AdjMaps,
+    snapshot: &AtomSnapshot<'_>,
+    target: Option<&str>,
+) -> AtmResult<String> {
+    let s = match level {
+        Level::Project => project::render(adj, snapshot),
+        Level::Overview => overview::render(adj, snapshot),
+        Level::Module => module::render(adj, snapshot, require_target(level, target)?)?,
+        Level::Function => function::render(adj, snapshot, require_target(level, target)?)?,
+        Level::Impact => {
+            impact::render(adj, snapshot, require_target(level, target)?, DEFAULT_HOPS)?
+        }
+    };
+    Ok(s)
+}
+
+/// Convenience wrapper that builds an [`AtomSnapshot`] from `store` under a
+/// single read guard and dispatches to [`render`].
+///
+/// Prefer [`render`] directly when the caller already needs the snapshot for
+/// other work in the same critical section (e.g. [`crate::artifacts::emit_artifacts`]
+/// builds the snapshot once and reuses it for every per-entity render +
+/// metadata pass).
+///
+/// # Errors
+///
+/// Same as [`render`].
+pub fn render_in_store(
+    level: Level,
     store: &Store,
     adj: &AdjMaps,
     target: Option<&str>,
 ) -> AtmResult<String> {
-    let s = match level {
-        Level::Project => project::render(store, adj),
-        Level::Overview => overview::render(store, adj),
-        Level::Module => module::render(store, adj, require_target(level, target)?)?,
-        Level::Function => function::render(store, adj, require_target(level, target)?)?,
-        Level::Impact => impact::render(store, adj, require_target(level, target)?, DEFAULT_HOPS)?,
-    };
-    Ok(s)
+    store.with_atoms(|atoms| {
+        let snapshot = AtomSnapshot::build(atoms);
+        render(level, adj, &snapshot, target)
+    })
 }
 
 fn require_target(level: Level, target: Option<&str>) -> AtmResult<&str> {
@@ -190,8 +223,8 @@ mod tests {
     fn render_dispatches_project_and_overview_without_target() {
         let store = Store::new();
         let adj = AdjMaps::build(&store);
-        let project = render(Level::Project, &store, &adj, None).expect("project");
-        let overview = render(Level::Overview, &store, &adj, None).expect("overview");
+        let project = render_in_store(Level::Project, &store, &adj, None).expect("project");
+        let overview = render_in_store(Level::Overview, &store, &adj, None).expect("overview");
         assert_eq!(project, "graph TD\n");
         assert_eq!(overview, "graph TD\n");
     }
@@ -201,7 +234,7 @@ mod tests {
         let store = Store::new();
         let adj = AdjMaps::build(&store);
         for lvl in [Level::Module, Level::Function, Level::Impact] {
-            let err = render(lvl, &store, &adj, None).expect_err("must require target");
+            let err = render_in_store(lvl, &store, &adj, None).expect_err("must require target");
             assert!(err.to_string().contains("--target"));
         }
     }

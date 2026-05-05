@@ -1,13 +1,18 @@
 //! Resolve user-friendly target strings to concrete [`EntityId`]s.
 //!
 //! The CLI / MCP layer accepts targets like `"CodeParser"` or
-//! `"crates/foo/src/lib.rs"`. These helpers walk the [`Store`] and
+//! `"crates/foo/src/lib.rs"`. These helpers walk an [`AtomSnapshot`] and
 //! return the matching `EntityId`, or an error listing the candidates when
 //! the input is ambiguous.
+//!
+//! Snapshot-driven (not [`crate::graph::Store`]-driven) on purpose: the
+//! whole render pipeline holds a single read guard via
+//! [`crate::graph::Store::with_atoms`], and resolving against the snapshot
+//! avoids re-acquiring the same lock recursively.
 
 use crate::error::{AstToMermaidError, Result};
-use crate::graph::Store;
 use crate::model::EntityId;
+use crate::render::snapshot::AtomSnapshot;
 
 /// Resolve a target string to a `module` atom id.
 ///
@@ -25,17 +30,17 @@ use crate::model::EntityId;
 /// Panics on internal `Vec` invariants we just established (`len==1` after
 /// match) — these expects are safety nets for changes to the surrounding
 /// logic, never reachable through normal use.
-pub fn resolve_module(store: &Store, target: &str) -> Result<EntityId> {
+pub fn resolve_module(snapshot: &AtomSnapshot<'_>, target: &str) -> Result<EntityId> {
     if target.is_empty() {
         return Err(AstToMermaidError::InvalidInput(
             "module target cannot be empty".to_owned(),
         ));
     }
 
-    let modules = store.atoms_by_kind("module");
+    let modules = || snapshot.iter().filter(|a| a.kind == "module");
 
     // Pass 1: exact id.
-    for m in &modules {
+    for m in modules() {
         if m.id.as_str() == target {
             return Ok(m.id.clone());
         }
@@ -43,7 +48,7 @@ pub fn resolve_module(store: &Store, target: &str) -> Result<EntityId> {
 
     // Pass 2: file_path match (only when target looks path-like).
     if target.contains('/') {
-        for m in &modules {
+        for m in modules() {
             if m.file_path == target {
                 return Ok(m.id.clone());
             }
@@ -51,11 +56,11 @@ pub fn resolve_module(store: &Store, target: &str) -> Result<EntityId> {
     }
 
     // Pass 3: name match (must be unique).
-    let matches: Vec<EntityId> = modules
-        .iter()
+    let mut matches: Vec<EntityId> = modules()
         .filter(|m| m.name == target)
         .map(|m| m.id.clone())
         .collect();
+    matches.sort();
 
     match matches.len() {
         0 => Err(AstToMermaidError::InvalidInput(format!(
@@ -95,17 +100,17 @@ pub fn resolve_module(store: &Store, target: &str) -> Result<EntityId> {
 ///
 /// Panics on internal `Vec` invariants we just established (`len==1` after
 /// match) — never reachable through normal use.
-pub fn resolve_function(store: &Store, target: &str) -> Result<EntityId> {
+pub fn resolve_function(snapshot: &AtomSnapshot<'_>, target: &str) -> Result<EntityId> {
     if target.is_empty() {
         return Err(AstToMermaidError::InvalidInput(
             "function target cannot be empty".to_owned(),
         ));
     }
 
-    let functions = store.atoms_by_kind("function");
+    let functions = || snapshot.iter().filter(|a| a.kind == "function");
 
     // Pass 1: exact id.
-    for f in &functions {
+    for f in functions() {
         if f.id.as_str() == target {
             return Ok(f.id.clone());
         }
@@ -116,11 +121,11 @@ pub fn resolve_function(store: &Store, target: &str) -> Result<EntityId> {
         && !owner_hint.is_empty()
         && !method_name.is_empty()
     {
-        let matches: Vec<EntityId> = functions
-            .iter()
+        let mut matches: Vec<EntityId> = functions()
             .filter(|f| f.name == method_name && f.id.as_str().contains(owner_hint))
             .map(|f| f.id.clone())
             .collect();
+        matches.sort();
         match matches.len() {
             0 => {} // fall through to bare-name pass
             1 => return Ok(matches.into_iter().next().expect("len==1")),
@@ -140,11 +145,11 @@ pub fn resolve_function(store: &Store, target: &str) -> Result<EntityId> {
     }
 
     // Pass 3: exact name (may be ambiguous).
-    let matches: Vec<EntityId> = functions
-        .iter()
+    let mut matches: Vec<EntityId> = functions()
         .filter(|f| f.name == target)
         .map(|f| f.id.clone())
         .collect();
+    matches.sort();
 
     match matches.len() {
         0 => Err(AstToMermaidError::InvalidInput(format!(
@@ -168,7 +173,7 @@ pub fn resolve_function(store: &Store, target: &str) -> Result<EntityId> {
 mod tests {
     use super::*;
     use crate::graph::Store;
-    use crate::model::{CodeAtom, EntityId};
+    use crate::model::CodeAtom;
 
     fn module(id: &str, file_path: &str, name: &str) -> CodeAtom {
         CodeAtom {
@@ -204,10 +209,20 @@ mod tests {
         }
     }
 
+    fn with_snap<F, R>(store: &Store, f: F) -> R
+    where
+        F: FnOnce(&AtomSnapshot<'_>) -> R,
+    {
+        store.with_atoms(|atoms| {
+            let snap = AtomSnapshot::build(atoms);
+            f(&snap)
+        })
+    }
+
     #[test]
     fn resolve_module_empty_target_errors() {
         let store = Store::new();
-        let err = resolve_module(&store, "").expect_err("empty rejected");
+        let err = with_snap(&store, |s| resolve_module(s, "")).expect_err("empty rejected");
         assert!(matches!(err, AstToMermaidError::InvalidInput(_)));
     }
 
@@ -215,7 +230,7 @@ mod tests {
     fn resolve_module_by_exact_id() {
         let store = Store::new();
         store.add_atom(module("code:src/foo.rs", "src/foo.rs", "foo"));
-        let id = resolve_module(&store, "code:src/foo.rs").expect("ok");
+        let id = with_snap(&store, |s| resolve_module(s, "code:src/foo.rs")).expect("ok");
         assert_eq!(id.as_str(), "code:src/foo.rs");
     }
 
@@ -223,7 +238,7 @@ mod tests {
     fn resolve_module_by_file_path() {
         let store = Store::new();
         store.add_atom(module("code:src/foo.rs", "src/foo.rs", "foo"));
-        let id = resolve_module(&store, "src/foo.rs").expect("ok");
+        let id = with_snap(&store, |s| resolve_module(s, "src/foo.rs")).expect("ok");
         assert_eq!(id.as_str(), "code:src/foo.rs");
     }
 
@@ -231,7 +246,7 @@ mod tests {
     fn resolve_module_by_name_unique() {
         let store = Store::new();
         store.add_atom(module("code:src/foo.rs", "src/foo.rs", "foo"));
-        let id = resolve_module(&store, "foo").expect("ok");
+        let id = with_snap(&store, |s| resolve_module(s, "foo")).expect("ok");
         assert_eq!(id.as_str(), "code:src/foo.rs");
     }
 
@@ -240,7 +255,7 @@ mod tests {
         let store = Store::new();
         store.add_atom(module("code:a/queries.rs", "a/queries.rs", "queries"));
         store.add_atom(module("code:b/queries.rs", "b/queries.rs", "queries"));
-        let err = resolve_module(&store, "queries").expect_err("ambiguous");
+        let err = with_snap(&store, |s| resolve_module(s, "queries")).expect_err("ambiguous");
         assert!(err.to_string().contains("ambiguous"));
         assert!(err.to_string().contains("2 candidates"));
     }
@@ -249,7 +264,7 @@ mod tests {
     fn resolve_module_no_match_errors() {
         let store = Store::new();
         store.add_atom(module("code:src/foo.rs", "src/foo.rs", "foo"));
-        let err = resolve_module(&store, "ghost").expect_err("missing");
+        let err = with_snap(&store, |s| resolve_module(s, "ghost")).expect_err("missing");
         assert!(err.to_string().contains("no module"));
     }
 
@@ -261,7 +276,10 @@ mod tests {
             "src/lib.rs",
             "foo",
         ));
-        let id = resolve_function(&store, "code:src/lib.rs::function::foo").expect("ok");
+        let id = with_snap(&store, |s| {
+            resolve_function(s, "code:src/lib.rs::function::foo")
+        })
+        .expect("ok");
         assert_eq!(id.as_str(), "code:src/lib.rs::function::foo");
     }
 
@@ -273,7 +291,7 @@ mod tests {
             "src/lib.rs",
             "foo",
         ));
-        let id = resolve_function(&store, "foo").expect("ok");
+        let id = with_snap(&store, |s| resolve_function(s, "foo")).expect("ok");
         assert_eq!(id.as_str(), "code:src/lib.rs::function::foo");
     }
 
@@ -284,7 +302,7 @@ mod tests {
             let id = format!("code:{file}::function::render");
             store.add_atom(function(&id, file, "render"));
         }
-        let err = resolve_function(&store, "render").expect_err("ambiguous");
+        let err = with_snap(&store, |s| resolve_function(s, "render")).expect_err("ambiguous");
         assert!(err.to_string().contains("ambiguous"));
         assert!(err.to_string().contains("3 candidates"));
     }
@@ -297,7 +315,7 @@ mod tests {
             let file = format!("src/m{i}.rs");
             store.add_atom(function(&id, &file, "f"));
         }
-        let err = resolve_function(&store, "f").expect_err("ambiguous");
+        let err = with_snap(&store, |s| resolve_function(s, "f")).expect_err("ambiguous");
         let s = err.to_string();
         assert!(s.contains("6 candidates"), "got: {s}");
         assert!(s.contains("..."), "list should be truncated, got: {s}");
@@ -307,7 +325,7 @@ mod tests {
     fn resolve_function_empty_target_errors() {
         let store = Store::new();
         assert!(matches!(
-            resolve_function(&store, "").expect_err("empty"),
+            with_snap(&store, |s| resolve_function(s, "")).expect_err("empty"),
             AstToMermaidError::InvalidInput(_)
         ));
     }
@@ -320,7 +338,7 @@ mod tests {
             "src/lib.rs",
             "foo",
         ));
-        let err = resolve_function(&store, "ghost").expect_err("missing");
+        let err = with_snap(&store, |s| resolve_function(s, "ghost")).expect_err("missing");
         assert!(err.to_string().contains("no function"));
     }
 
@@ -336,7 +354,7 @@ mod tests {
             let file = format!("src/{}.rs", owner.to_lowercase());
             store.add_atom(function(&id, &file, "build"));
         }
-        let id = resolve_function(&store, "Foo::build").expect("ok");
+        let id = with_snap(&store, |s| resolve_function(s, "Foo::build")).expect("ok");
         assert_eq!(id.as_str(), "code:src/foo.rs::function::Foo::build");
     }
 
@@ -357,7 +375,7 @@ mod tests {
             "src/python.rs",
             "build",
         ));
-        let id = resolve_function(&store, "HnswBuilder::build").expect("ok");
+        let id = with_snap(&store, |s| resolve_function(s, "HnswBuilder::build")).expect("ok");
         assert!(
             id.as_str().contains("HnswBuilder<'a, D, M, M0>"),
             "got {id}"
@@ -376,7 +394,8 @@ mod tests {
         ));
         // `Nonexistent::foo` — no atom contains `Nonexistent`. Falls through
         // to bare-name match on `Nonexistent::foo` which fails too.
-        let err = resolve_function(&store, "Nonexistent::foo").expect_err("no match");
+        let err =
+            with_snap(&store, |s| resolve_function(s, "Nonexistent::foo")).expect_err("no match");
         assert!(err.to_string().contains("no function"));
     }
 }

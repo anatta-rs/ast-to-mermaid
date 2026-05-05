@@ -21,7 +21,7 @@
 
 use crate::graph::Store;
 use crate::model::{AtomKind, CodeAtom, EntityId};
-use crate::render::{AdjMaps, Level, render};
+use crate::render::{AdjMaps, AtomSnapshot, Level, render};
 use crate::sequence;
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
@@ -94,10 +94,15 @@ pub fn emit_artifacts_with_sequences(
     // overview's children_of) and the per-edge `EntityId` deep clones.
     let adj = AdjMaps::build(store);
 
-    let overview_mmd = render(Level::Project, store, &adj, None).unwrap_or_default();
+    // Hold the read guard for the full render + per-entity sweep. The
+    // snapshot is the borrowed `id → &CodeAtom` view that every renderer
+    // probes in O(1) — no per-child `Store::get_atom` lock acquisition,
+    // no `CodeAtom` clone.
+    let (overview_mmd, mut entities) = store.with_atoms(|atoms| {
+        let snapshot = AtomSnapshot::build(atoms);
+        let overview_mmd = render(Level::Project, &adj, &snapshot, None).unwrap_or_default();
 
-    let mut entities: Vec<EntityArtifact> = store.with_atoms(|atoms| {
-        let mut out: Vec<EntityArtifact> = Vec::with_capacity(atoms.len());
+        let mut entity_list: Vec<EntityArtifact> = Vec::with_capacity(atoms.len());
         for atom in atoms {
             let kind = AtomKind::parse(&atom.kind);
             let outgoing = adj.callees(&atom.id);
@@ -107,14 +112,14 @@ pub fn emit_artifacts_with_sequences(
             let mmd = entity_mmd(atom, outgoing, incoming);
             let meta = entity_meta(atom, outgoing, incoming, children, &adj);
 
-            out.push(EntityArtifact {
+            entity_list.push(EntityArtifact {
                 id: atom.id.clone(),
                 kind,
                 mmd,
                 meta,
             });
         }
-        out
+        (overview_mmd, entity_list)
     });
 
     // Sort entities deterministically by id.
