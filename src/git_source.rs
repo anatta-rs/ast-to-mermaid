@@ -119,6 +119,11 @@ pub fn show_toplevel(start: &Path) -> Result<PathBuf> {
 /// spawned, and is passed after `--end-of-options` so it cannot be
 /// reinterpreted as a flag.
 ///
+/// Non-UTF-8 paths (rare but legal in git — filesystems on Linux allow any
+/// byte except `/` and NUL) are decoded with `from_utf8_lossy`, logged via
+/// `tracing::warn!`, and skipped. The rest of the tree is still returned;
+/// a single weird path no longer aborts the whole scan.
+///
 /// # Errors
 /// Returns `InvalidInput` when the ref is malformed (validation) or
 /// `git ls-tree` fails.
@@ -142,16 +147,36 @@ pub fn ls_tree(repo_root: &Path, git_ref: &str) -> Result<Vec<TreeEntry>> {
             stderr.trim()
         )));
     }
-    let raw = String::from_utf8(output.stdout)
-        .map_err(|_| AstToMermaidError::InvalidInput("non-utf8 git output".into()))?;
 
+    Ok(parse_ls_tree_z(&output.stdout))
+}
+
+/// Parse the NUL-delimited stdout of `git ls-tree -r -z`.
+///
+/// Each entry is `<mode> SP <type> SP <sha> TAB <path>`. Only blob entries
+/// are emitted; submodules (`commit`) and trees are filtered out. Paths
+/// that are not valid UTF-8 are skipped with a `tracing::warn!` (lossy-
+/// decoded into the message) so a single weird path does not abort the
+/// whole scan.
+fn parse_ls_tree_z(stdout: &[u8]) -> Vec<TreeEntry> {
     let mut out = Vec::new();
-    for entry in raw.split('\0') {
+    for entry in stdout.split(|&b| b == 0) {
         if entry.is_empty() {
             continue;
         }
-        // Format: "<mode> <type> <sha>\t<path>"
-        let Some((meta, path)) = entry.split_once('\t') else {
+        let Some(tab_pos) = entry.iter().position(|&b| b == b'\t') else {
+            continue;
+        };
+        let (meta_bytes, path_bytes_with_tab) = entry.split_at(tab_pos);
+        let path_bytes = &path_bytes_with_tab[1..];
+
+        // Meta is "<mode> <type> <sha>" — always ASCII, so utf-8 decoding
+        // here is essentially total; we still guard against corruption.
+        let Ok(meta) = std::str::from_utf8(meta_bytes) else {
+            tracing::warn!(
+                meta = %String::from_utf8_lossy(meta_bytes),
+                "git ls-tree: non-utf8 in entry meta; skipping",
+            );
             continue;
         };
         let parts: Vec<&str> = meta.splitn(3, ' ').collect();
@@ -161,12 +186,21 @@ pub fn ls_tree(repo_root: &Path, git_ref: &str) -> Result<Vec<TreeEntry>> {
         if parts[1] != "blob" {
             continue; // skip submodules ("commit"), trees, etc.
         }
+
+        let Ok(path_str) = std::str::from_utf8(path_bytes) else {
+            tracing::warn!(
+                path = %String::from_utf8_lossy(path_bytes),
+                "git ls-tree: non-utf8 path; skipping",
+            );
+            continue;
+        };
+        let path = path_str.to_owned();
         out.push(TreeEntry {
-            path: path.to_owned(),
+            path,
             blob_sha: parts[2].to_owned(),
         });
     }
-    Ok(out)
+    out
 }
 
 /// Read a blob's content by SHA via `git cat-file -p`.
@@ -512,6 +546,43 @@ mod tests {
             fs::canonicalize(&top).unwrap(),
             fs::canonicalize(tmp.path()).unwrap()
         );
+    }
+
+    #[test]
+    fn encoding_edges_parse_ls_tree_skips_non_utf8_paths() {
+        // Two entries: one valid ASCII path, one with an invalid UTF-8 byte
+        // (0xff) embedded in the path. The second must be silently dropped
+        // (with a warn), but the first must survive.
+        let mut buf: Vec<u8> = Vec::new();
+        buf.extend_from_slice(b"100644 blob 1111111111111111111111111111111111111111\tsrc/good.rs");
+        buf.push(0);
+        buf.extend_from_slice(b"100644 blob 2222222222222222222222222222222222222222\tsrc/b");
+        buf.push(0xff); // invalid UTF-8
+        buf.extend_from_slice(b"ad.rs");
+        buf.push(0);
+
+        let entries = parse_ls_tree_z(&buf);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].path, "src/good.rs");
+        assert_eq!(
+            entries[0].blob_sha,
+            "1111111111111111111111111111111111111111"
+        );
+    }
+
+    #[test]
+    fn encoding_edges_parse_ls_tree_skips_submodules() {
+        let mut buf: Vec<u8> = Vec::new();
+        buf.extend_from_slice(
+            b"160000 commit 3333333333333333333333333333333333333333\tvendor/sub",
+        );
+        buf.push(0);
+        buf.extend_from_slice(b"100644 blob 4444444444444444444444444444444444444444\tsrc/lib.rs");
+        buf.push(0);
+
+        let entries = parse_ls_tree_z(&buf);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].path, "src/lib.rs");
     }
 
     #[test]

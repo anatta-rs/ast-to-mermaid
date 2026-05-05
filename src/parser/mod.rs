@@ -16,6 +16,7 @@ use crate::graph::Store;
 use crate::model::{CodeAtom, Edge, EdgeKind, EntityId};
 use crate::sequence::max_ast_depth;
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use tree_sitter::{Node, Parser as TsParser, QueryCursor, StreamingIterator};
 
@@ -85,6 +86,40 @@ pub fn git_blob_sha1(bytes: &[u8]) -> String {
     hasher.update(format!("blob {}\0", bytes.len()).as_bytes());
     hasher.update(bytes);
     hasher.digest().to_string()
+}
+
+/// Strip a leading UTF-8 BOM (`EF BB BF`) if present, otherwise return
+/// `bytes` unchanged. Tree-sitter's first-token detection trips on the
+/// BOM and reports the whole file as malformed.
+#[must_use]
+pub fn strip_bom(bytes: &[u8]) -> &[u8] {
+    bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(bytes)
+}
+
+/// Replace bare `\r` (CR-only line endings, classic-Mac style) with `\n`.
+/// `\r\n` (CRLF) is left as-is — tree-sitter and `str::lines` already
+/// handle it. Returns `Cow::Borrowed` when no rewrite is needed so the
+/// hot path stays allocation-free.
+#[must_use]
+pub fn normalize_eol(bytes: &[u8]) -> Cow<'_, [u8]> {
+    let needs_rewrite = bytes
+        .iter()
+        .enumerate()
+        .any(|(i, &b)| b == b'\r' && bytes.get(i + 1) != Some(&b'\n'));
+    if !needs_rewrite {
+        return Cow::Borrowed(bytes);
+    }
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\r' && bytes.get(i + 1) != Some(&b'\n') {
+            out.push(b'\n');
+        } else {
+            out.push(bytes[i]);
+        }
+        i += 1;
+    }
+    Cow::Owned(out)
 }
 
 // ── Language ──────────────────────────────────────────────────────────────────
@@ -205,6 +240,12 @@ impl CodeParser {
     /// - `InvalidInput` when tree-sitter fails to parse.
     #[allow(clippy::too_many_lines)]
     pub fn parse(&self, content: &[u8], file_path: &str) -> Result<ParseUnit> {
+        // Normalise three encoding edges before tree-sitter sees the bytes:
+        // a leading UTF-8 BOM (trips first-token detection) and CR-only
+        // line endings (break line-based scanners like `rust_doc_comment`).
+        // Both are no-ops for well-formed UTF-8 / LF / CRLF input.
+        let normalized = normalize_eol(strip_bom(content));
+        let content: &[u8] = normalized.as_ref();
         let text = std::str::from_utf8(content).map_err(|e| {
             AstToMermaidError::InvalidInput(format!("invalid utf-8 in {file_path}: {e}"))
         })?;
@@ -927,7 +968,9 @@ fn join_path(prefix: &str, tail: &str) -> String {
 // ── Doc comment extraction ────────────────────────────────────────────────────
 
 fn rust_doc_comment(source: &str, item_row: usize) -> String {
-    let lines: Vec<&str> = source.lines().collect();
+    // Accept LF, CRLF, *and* bare CR as line terminators so the doc-comment
+    // scanner survives even if a caller forgot to run `normalize_eol`.
+    let lines: Vec<&str> = split_doc_lines(source);
     let mut doc_lines: Vec<&str> = Vec::new();
     let mut row = item_row;
     loop {
@@ -948,6 +991,37 @@ fn rust_doc_comment(source: &str, item_row: usize) -> String {
         .map(|l| l.trim_start_matches("///").trim_start_matches("//!").trim())
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// Split `source` on any of `\r\n`, `\n`, or bare `\r`, treating each as
+/// one line terminator (so `\r\n` does not produce a phantom blank line).
+fn split_doc_lines(source: &str) -> Vec<&str> {
+    let bytes = source.as_bytes();
+    let mut out: Vec<&str> = Vec::new();
+    let mut start = 0usize;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\n' => {
+                out.push(&source[start..i]);
+                i += 1;
+                start = i;
+            }
+            b'\r' => {
+                out.push(&source[start..i]);
+                i += 1;
+                if bytes.get(i) == Some(&b'\n') {
+                    i += 1;
+                }
+                start = i;
+            }
+            _ => i += 1,
+        }
+    }
+    if start < bytes.len() {
+        out.push(&source[start..]);
+    }
+    out
 }
 
 fn python_docstring(node: &Node, source: &str) -> String {
@@ -1452,6 +1526,65 @@ impl Bar {\n\
         let bar_new = EntityId::new("code:src/foo.rs::function::Bar::new");
         assert!(store.has_call_edge(&foo_build, &foo_new));
         assert!(!store.has_call_edge(&foo_build, &bar_new));
+    }
+
+    #[test]
+    fn encoding_edges_strip_bom_removes_leading_efbbbf() {
+        assert_eq!(strip_bom(&[0xEF, 0xBB, 0xBF, b'a', b'b']), b"ab");
+        // Idempotent on input without BOM.
+        assert_eq!(strip_bom(b"ab"), b"ab");
+        // Only leading BOM is stripped — mid-buffer bytes are kept.
+        assert_eq!(
+            strip_bom(&[b'a', 0xEF, 0xBB, 0xBF, b'b']),
+            &[b'a', 0xEF, 0xBB, 0xBF, b'b']
+        );
+        // Partial / single-byte input doesn't panic.
+        assert_eq!(strip_bom(b""), b"");
+        assert_eq!(strip_bom(&[0xEF]), &[0xEF]);
+    }
+
+    #[test]
+    fn encoding_edges_normalize_eol_rewrites_cr_only_keeps_crlf() {
+        // CR-only → LF.
+        assert_eq!(normalize_eol(b"a\rb\rc").as_ref(), b"a\nb\nc");
+        // CRLF stays as-is.
+        assert_eq!(normalize_eol(b"a\r\nb").as_ref(), b"a\r\nb");
+        // Mixed: CRLF preserved, lone CR rewritten.
+        assert_eq!(normalize_eol(b"a\r\nb\rc").as_ref(), b"a\r\nb\nc");
+        // No change → borrowed (no allocation).
+        let s: &[u8] = b"plain\nlf\nonly";
+        let cow = normalize_eol(s);
+        assert!(matches!(cow, std::borrow::Cow::Borrowed(_)));
+        // Trailing bare CR is rewritten too.
+        assert_eq!(normalize_eol(b"end\r").as_ref(), b"end\n");
+    }
+
+    #[test]
+    fn encoding_edges_parser_accepts_file_with_bom() {
+        // EF BB BF prefix on otherwise-valid Rust source. Without
+        // BOM-stripping tree-sitter reports the whole file as malformed.
+        let mut src: Vec<u8> = vec![0xEF, 0xBB, 0xBF];
+        src.extend_from_slice(b"/// hello\nfn main() {}\n");
+        let store = Store::new();
+        CodeParser::rust()
+            .parse_into(&src, "bom.rs", &store)
+            .expect("parse must succeed after BOM strip");
+        let id = EntityId::new("code:bom.rs::function::main");
+        let atom = store.get_atom(&id).expect("function atom");
+        assert!(atom.doc.contains("hello"), "doc={:?}", atom.doc);
+    }
+
+    #[test]
+    fn encoding_edges_parser_accepts_cr_only_line_endings() {
+        // Classic-Mac line endings: bare \r between lines.
+        let src = b"/// docline\rfn cr_only() {}\r";
+        let store = Store::new();
+        CodeParser::rust()
+            .parse_into(src, "cr.rs", &store)
+            .expect("parse must succeed after CR-only normalisation");
+        let id = EntityId::new("code:cr.rs::function::cr_only");
+        let atom = store.get_atom(&id).expect("function atom");
+        assert!(atom.doc.contains("docline"), "doc={:?}", atom.doc);
     }
 
     #[test]
