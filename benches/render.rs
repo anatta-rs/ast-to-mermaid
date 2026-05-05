@@ -2,12 +2,12 @@
 //!
 //! Builds a synthetic 10k-function fixture spread across several crates and
 //! measures `render::project::render` end-to-end. Before C2 the loop was
-//! O(F·E); after C2 it's O(F·avg_degree) thanks to forward adjacency. The
+//! `O(F·E)`; after C2 it's `O(F·avg_degree)` thanks to forward adjacency. The
 //! acceptance criterion in issue #67 is ≥10× speedup on this fixture.
 //!
 //! The overview bench targets issue #68 — same forward-adjacency switch
 //! plus pre-bucketed Contains edges — at 1k modules / 10k functions, where
-//! the pre-fix nested loop was O(modules·E).
+//! the pre-fix nested loop was `O(modules·E)`.
 
 use ast_to_mermaid::graph::Store;
 use ast_to_mermaid::model::{CodeAtom, Edge, EdgeKind, EntityId};
@@ -54,7 +54,11 @@ fn build_store() -> Store {
     for (i, from) in ids.iter().enumerate() {
         for k in 0..CALLS_PER_FN {
             let target = i.wrapping_mul(2_654_435_761).wrapping_add(k) % FUNCTIONS;
-            store.add_edge(Edge::new(from.clone(), ids[target].clone(), EdgeKind::Calls));
+            store.add_edge(Edge::new(
+                from.clone(),
+                ids[target].clone(),
+                EdgeKind::Calls,
+            ));
         }
     }
     store
@@ -89,7 +93,11 @@ fn build_overview_store() -> Store {
             let f = fn_atom(&file_path, &format!("f{m}_{k}"));
             let fid = f.id.clone();
             store.add_atom(f);
-            store.add_edge(Edge::new(module_id.clone(), fid.clone(), EdgeKind::Contains));
+            store.add_edge(Edge::new(
+                module_id.clone(),
+                fid.clone(),
+                EdgeKind::Contains,
+            ));
             fn_ids.push(fid);
         }
     }
@@ -97,7 +105,11 @@ fn build_overview_store() -> Store {
     for (i, from) in fn_ids.iter().enumerate() {
         for k in 0..OVERVIEW_CALLS_PER_FN {
             let target = i.wrapping_mul(2_654_435_761).wrapping_add(k) % total;
-            store.add_edge(Edge::new(from.clone(), fn_ids[target].clone(), EdgeKind::Calls));
+            store.add_edge(Edge::new(
+                from.clone(),
+                fn_ids[target].clone(),
+                EdgeKind::Calls,
+            ));
         }
     }
     store
@@ -121,5 +133,10 @@ fn bench_overview(c: &mut Criterion) {
     });
 }
 
-criterion_group!(benches, bench_project, bench_overview);
-criterion_main!(benches);
+#[allow(missing_docs)]
+mod bench_group {
+    use super::{bench_overview, bench_project, criterion_group};
+    criterion_group!(benches, bench_project, bench_overview);
+}
+
+criterion_main!(bench_group::benches);
