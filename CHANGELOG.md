@@ -6,6 +6,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 
+## [Unreleased]
+
+### Bug fixes
+
+- *(artifacts)* Filename collision-safe IDs on case-insensitive filesystems ([#82](https://github.com/anatta-rs/ast-to-mermaid/issues/82))
+
+  Bundle filenames for entities and sequences whose ids contain ASCII
+  uppercase letters are now lowercased and given an `_H<6 hex chars>`
+  disambig suffix (e.g. `Foo` → `foo_H<hash>`). Without this, `Foo`,
+  `foo`, and `FOO` all clobbered each other to a single file on macOS
+  APFS and Windows NTFS (case-insensitive defaults). The `a2m sequence
+  --all` command also pre-detects case-fold collisions and applies the
+  same `_H` suffix only to colliding entries. Bundle layout for
+  mixed-case identifiers therefore changes — re-run `a2m bundle` to
+  regenerate.
+
 ## [0.5.1](https://github.com/anatta-rs/ast-to-mermaid/compare/v0.5.0...v0.5.1) - 2026-05-04
 
 ### Features
