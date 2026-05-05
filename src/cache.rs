@@ -229,71 +229,79 @@ impl Cache {
     /// # Errors
     /// Propagates filesystem read or remove errors.
     pub fn gc(&self, opts: &GcOptions) -> Result<GcReport> {
-        let mut entries: Vec<GcEntry> = Vec::new();
-        collect_gc_entries(&self.root.join("blobs"), GcKind::Blob, &mut entries)?;
-        collect_gc_entries(&self.root.join("refs"), GcKind::Bundle, &mut entries)?;
+        gc_at(&self.root, opts)
+    }
+}
 
-        let now = std::time::SystemTime::now();
-        let total_before: u64 = entries.iter().map(|e| e.size).sum();
-        let count_before = entries.len();
+/// Free-function form of [`Cache::gc`], operating directly on a cache
+/// root path. Shared with [`maybe_auto_gc`] so the auto path doesn't
+/// have to re-`Cache::open` (and re-walk the tree for the symlink
+/// audit) on every bundle write.
+fn gc_at(root: &Path, opts: &GcOptions) -> Result<GcReport> {
+    let mut entries: Vec<GcEntry> = Vec::new();
+    collect_gc_entries(&root.join("blobs"), GcKind::Blob, &mut entries)?;
+    collect_gc_entries(&root.join("refs"), GcKind::Bundle, &mut entries)?;
 
-        let mut to_remove: Vec<&GcEntry> = Vec::new();
-        if let Some(older_than) = opts.older_than {
-            for e in &entries {
-                if let Ok(age) = now.duration_since(e.mtime)
-                    && age > older_than
-                {
-                    to_remove.push(e);
-                }
-            }
-        }
+    let now = std::time::SystemTime::now();
+    let total_before: u64 = entries.iter().map(|e| e.size).sum();
+    let count_before = entries.len();
 
-        // Then size-cap: keep oldest-eviction order, only walk entries not
-        // already marked for removal.
-        let mut sorted: Vec<&GcEntry> = entries
-            .iter()
-            .filter(|e| !to_remove.iter().any(|r| r.path == e.path))
-            .collect();
-        sorted.sort_by_key(|e| e.mtime);
-        let mut kept_size: u64 = sorted.iter().map(|e| e.size).sum();
-        if let Some(cap) = opts.max_size_bytes {
-            for e in &sorted {
-                if kept_size <= cap {
-                    break;
-                }
-                kept_size = kept_size.saturating_sub(e.size);
+    let mut to_remove: Vec<&GcEntry> = Vec::new();
+    if let Some(older_than) = opts.older_than {
+        for e in &entries {
+            if let Ok(age) = now.duration_since(e.mtime)
+                && age > older_than
+            {
                 to_remove.push(e);
             }
         }
+    }
 
-        let removed_size: u64 = to_remove.iter().map(|e| e.size).sum();
-        let removed_count = to_remove.len();
+    // Then size-cap: keep oldest-eviction order, only walk entries not
+    // already marked for removal.
+    let mut sorted: Vec<&GcEntry> = entries
+        .iter()
+        .filter(|e| !to_remove.iter().any(|r| r.path == e.path))
+        .collect();
+    sorted.sort_by_key(|e| e.mtime);
+    let mut kept_size: u64 = sorted.iter().map(|e| e.size).sum();
+    if let Some(cap) = opts.max_size_bytes {
+        for e in &sorted {
+            if kept_size <= cap {
+                break;
+            }
+            kept_size = kept_size.saturating_sub(e.size);
+            to_remove.push(e);
+        }
+    }
 
-        if !opts.dry_run {
-            for e in &to_remove {
-                let meta = fs::symlink_metadata(&e.path)?;
-                if meta.file_type().is_symlink() {
-                    return Err(AstToMermaidError::InvalidInput(format!(
-                        "refusing to remove symlink in cache: {}",
-                        e.path.display()
-                    )));
-                }
-                if meta.is_dir() {
-                    remove_dir_all_safe(&e.path)?;
-                } else {
-                    fs::remove_file(&e.path)?;
-                }
+    let removed_size: u64 = to_remove.iter().map(|e| e.size).sum();
+    let removed_count = to_remove.len();
+
+    if !opts.dry_run {
+        for e in &to_remove {
+            let meta = fs::symlink_metadata(&e.path)?;
+            if meta.file_type().is_symlink() {
+                return Err(AstToMermaidError::InvalidInput(format!(
+                    "refusing to remove symlink in cache: {}",
+                    e.path.display()
+                )));
+            }
+            if meta.is_dir() {
+                remove_dir_all_safe(&e.path)?;
+            } else {
+                fs::remove_file(&e.path)?;
             }
         }
-
-        Ok(GcReport {
-            total_before,
-            removed_count,
-            removed_size,
-            count_before,
-            dry_run: opts.dry_run,
-        })
     }
+
+    Ok(GcReport {
+        total_before,
+        removed_count,
+        removed_size,
+        count_before,
+        dry_run: opts.dry_run,
+    })
 }
 
 /// Options controlling [`Cache::gc`].
@@ -306,6 +314,72 @@ pub struct GcOptions {
     pub older_than: Option<std::time::Duration>,
     /// Compute what would be removed without touching the filesystem.
     pub dry_run: bool,
+}
+
+/// High-water-mark policy for auto-triggered cache GC.
+///
+/// Both caps are optional; `None` disables that dimension. Defaults are
+/// 1 GiB total / 30-day age. Policy is consulted by [`maybe_auto_gc`]
+/// after each [`write_bundle_atomic`]; if any cap is breached, an
+/// iterative LRU eviction runs until the cache is back within bounds.
+///
+/// Use [`GcPolicy::from_env`] to honour the operator-facing env knobs:
+/// - `A2M_AUTO_GC=0` → return `None` (auto-gc disabled entirely)
+/// - `A2M_AUTO_GC_MAX_BYTES=<u64>` → override `max_total_bytes`
+/// - `A2M_AUTO_GC_MAX_AGE_SECS=<u64>` → override `max_age_secs`
+#[derive(Debug, Clone)]
+pub struct GcPolicy {
+    /// Total cache footprint cap (bytes). `None` disables the size cap.
+    pub max_total_bytes: Option<u64>,
+    /// Per-entry age cap (seconds). `None` disables the age filter.
+    pub max_age_secs: Option<u64>,
+}
+
+impl Default for GcPolicy {
+    fn default() -> Self {
+        Self {
+            // 1 GiB — conservative single-repo default.
+            max_total_bytes: Some(1024 * 1024 * 1024),
+            // 30 days.
+            max_age_secs: Some(30 * 24 * 3600),
+        }
+    }
+}
+
+impl GcPolicy {
+    /// Read policy from `A2M_AUTO_GC_*` env. Returns `None` when
+    /// `A2M_AUTO_GC=0` (operator opt-out — `maybe_auto_gc` becomes a
+    /// no-op). Otherwise returns a `GcPolicy` with defaults overridden
+    /// by `A2M_AUTO_GC_MAX_BYTES` / `A2M_AUTO_GC_MAX_AGE_SECS` when
+    /// those parse as `u64`.
+    #[must_use]
+    pub fn from_env() -> Option<Self> {
+        if std::env::var("A2M_AUTO_GC").as_deref() == Ok("0") {
+            return None;
+        }
+        let mut p = Self::default();
+        if let Ok(v) = std::env::var("A2M_AUTO_GC_MAX_BYTES")
+            && let Ok(n) = v.parse::<u64>()
+        {
+            p.max_total_bytes = Some(n);
+        }
+        if let Ok(v) = std::env::var("A2M_AUTO_GC_MAX_AGE_SECS")
+            && let Ok(n) = v.parse::<u64>()
+        {
+            p.max_age_secs = Some(n);
+        }
+        Some(p)
+    }
+}
+
+impl From<&GcPolicy> for GcOptions {
+    fn from(p: &GcPolicy) -> Self {
+        Self {
+            max_size_bytes: p.max_total_bytes,
+            older_than: p.max_age_secs.map(std::time::Duration::from_secs),
+            dry_run: false,
+        }
+    }
 }
 
 /// Summary of a [`Cache::gc`] run.
@@ -409,24 +483,54 @@ fn collect_gc_entries(dir: &Path, kind: GcKind, out: &mut Vec<GcEntry>) -> Resul
 }
 
 fn dir_size_recursive(dir: &Path) -> Result<u64> {
+    // Delegated to `walk_safe` (C13): every entry is verified
+    // non-symlink before recursion, so a planted `a -> b -> a` loop
+    // surfaces as `InvalidInput` on the first hop instead of blowing
+    // the stack. Sums regular-file lengths only; directory inode
+    // sizes are intentionally ignored to match `du -sb` semantics.
+    let entries = walk_safe(dir)?;
+    Ok(entries
+        .iter()
+        .filter(|(_, m)| m.is_file())
+        .map(|(_, m)| m.len())
+        .sum())
+}
+
+/// Total bytes used by the two cache subtrees (`blobs/` and `refs/`).
+/// Returns 0 if either is missing. Errors propagate (e.g. planted
+/// symlink → [`AstToMermaidError::InvalidInput`]).
+fn cache_total_size(cache_root: &Path) -> Result<u64> {
     let mut total = 0;
-    for entry in fs::read_dir(dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        let meta = fs::symlink_metadata(&path)?;
-        if meta.file_type().is_symlink() {
-            return Err(AstToMermaidError::InvalidInput(format!(
-                "refusing to follow symlink in cache: {}",
-                path.display()
-            )));
-        }
-        if meta.is_dir() {
-            total += dir_size_recursive(&path)?;
-        } else {
-            total += meta.len();
+    for sub in ["blobs", "refs"] {
+        let p = cache_root.join(sub);
+        if p.exists() {
+            total += dir_size_recursive(&p)?;
         }
     }
     Ok(total)
+}
+
+/// High-water-mark check after a bundle write: if the cache exceeds
+/// `policy.max_total_bytes` (or has any age cap set), runs an
+/// iterative LRU eviction via [`Cache::gc`] until the cache fits.
+/// Returns `Ok(None)` when no GC was needed, `Ok(Some(report))` when
+/// it ran. Called from [`write_bundle_atomic`] post-rename.
+///
+/// Distinct from explicit `Cache::gc`: this is the *automatic* path
+/// — operator opt-out lives in [`GcPolicy::from_env`] (`A2M_AUTO_GC=0`).
+///
+/// # Errors
+/// Propagates filesystem errors and the symlink-refusal contract from
+/// the underlying [`dir_size_recursive`] / [`Cache::gc`].
+pub fn maybe_auto_gc(cache_root: &Path, policy: &GcPolicy) -> Result<Option<GcReport>> {
+    let total = cache_total_size(cache_root)?;
+    let over_size = policy.max_total_bytes.is_some_and(|cap| total > cap);
+    let has_age = policy.max_age_secs.is_some();
+    if !over_size && !has_age {
+        return Ok(None);
+    }
+    let report = gc_at(cache_root, &GcOptions::from(policy))?;
+    Ok(Some(report))
 }
 
 /// Recursively walk `root` without following symlinks. Visits every regular
@@ -582,6 +686,16 @@ pub fn write_bundle_atomic(
         }
     }
     atomic_rename(&tmp_dir, final_dir)?;
+
+    // High-water-mark auto-gc (C14): once a bundle lands, check whether
+    // the cache has crossed its size/age policy and evict LRU until it
+    // hasn't. Derives the cache root as `final_dir/../..` to match the
+    // `<root>/refs/<sha>` layout. `A2M_AUTO_GC=0` disables this path.
+    if let Some(policy) = GcPolicy::from_env()
+        && let Some(cache_root) = final_dir.parent().and_then(Path::parent)
+    {
+        maybe_auto_gc(cache_root, &policy)?;
+    }
     Ok(())
 }
 
