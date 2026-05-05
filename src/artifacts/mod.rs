@@ -90,25 +90,17 @@ pub fn emit_artifacts_with_sequences(
     let atoms = store.all_atoms();
     let mut entities: Vec<EntityArtifact> = Vec::with_capacity(atoms.len());
 
-    // Build a reverse-edge cache: entity_id → vec of caller ids (Calls incoming).
-    let mut callers_of: HashMap<EntityId, Vec<EntityId>> = HashMap::new();
-    for atom in &atoms {
-        let incoming = store.call_edges_to(&atom.id);
-        if !incoming.is_empty() {
-            callers_of.insert(atom.id.clone(), incoming);
-        }
-    }
+    let adj = build_adjacency_maps(store);
+    let empty: Vec<EntityId> = Vec::new();
 
     for atom in &atoms {
         let kind = AtomKind::parse(&atom.kind);
-        let outgoing = store.call_edges_from(&atom.id);
-        let incoming = callers_of.get(&atom.id).cloned().unwrap_or_default();
+        let outgoing = adj.callees.get(&atom.id).unwrap_or(&empty);
+        let incoming = adj.callers.get(&atom.id).unwrap_or(&empty);
+        let children = adj.children.get(&atom.id).unwrap_or(&empty);
 
-        // Children (contained items) and parent module.
-        let children = store.children_of(&atom.id);
-
-        let mmd = entity_mmd(atom, &outgoing, &incoming);
-        let meta = entity_meta(atom, &outgoing, &incoming, &children, store);
+        let mmd = entity_mmd(atom, outgoing, incoming);
+        let meta = entity_meta(atom, outgoing, incoming, children, &adj);
 
         entities.push(EntityArtifact {
             id: atom.id.clone(),
@@ -428,6 +420,73 @@ fn class_colors(kind: &str) -> (&'static str, &'static str) {
     }
 }
 
+// ── Adjacency maps ────────────────────────────────────────────────────────────
+
+/// Five buckets of pre-computed adjacency, built once per
+/// [`emit_artifacts`] invocation by [`build_adjacency_maps`]. Replaces
+/// the per-atom O(E) edge filters that previously dominated bundle build
+/// time.
+///
+/// `callers` and `callees` are the reverse / forward `Calls` map;
+/// `children` is the forward `Contains` map; `uses_out` / `uses_in` and
+/// `implements_out` / `implements_in` are the forward / reverse maps for
+/// the two remaining edge kinds.
+struct AdjMaps {
+    callers: HashMap<EntityId, Vec<EntityId>>,
+    callees: HashMap<EntityId, Vec<EntityId>>,
+    children: HashMap<EntityId, Vec<EntityId>>,
+    uses_out: HashMap<EntityId, Vec<EntityId>>,
+    uses_in: HashMap<EntityId, Vec<EntityId>>,
+    implements_out: HashMap<EntityId, Vec<EntityId>>,
+    implements_in: HashMap<EntityId, Vec<EntityId>>,
+}
+
+/// Single sweep over `store.all_edges()` that yields the five logical
+/// adjacency buckets consumed by [`emit_artifacts`] and [`entity_meta`].
+fn build_adjacency_maps(store: &Store) -> AdjMaps {
+    let mut maps = AdjMaps {
+        callers: HashMap::new(),
+        callees: HashMap::new(),
+        children: HashMap::new(),
+        uses_out: HashMap::new(),
+        uses_in: HashMap::new(),
+        implements_out: HashMap::new(),
+        implements_in: HashMap::new(),
+    };
+    for edge in store.all_edges() {
+        match edge.kind {
+            EdgeKind::Calls => {
+                maps.callees
+                    .entry(edge.from.clone())
+                    .or_default()
+                    .push(edge.to.clone());
+                maps.callers.entry(edge.to).or_default().push(edge.from);
+            }
+            EdgeKind::Contains => {
+                maps.children.entry(edge.from).or_default().push(edge.to);
+            }
+            EdgeKind::Uses => {
+                maps.uses_out
+                    .entry(edge.from.clone())
+                    .or_default()
+                    .push(edge.to.clone());
+                maps.uses_in.entry(edge.to).or_default().push(edge.from);
+            }
+            EdgeKind::Implements => {
+                maps.implements_out
+                    .entry(edge.from.clone())
+                    .or_default()
+                    .push(edge.to.clone());
+                maps.implements_in
+                    .entry(edge.to)
+                    .or_default()
+                    .push(edge.from);
+            }
+        }
+    }
+    maps
+}
+
 // ── Per-entity meta JSON ──────────────────────────────────────────────────────
 
 fn entity_meta(
@@ -435,35 +494,16 @@ fn entity_meta(
     outgoing: &[EntityId],
     incoming: &[EntityId],
     children: &[EntityId],
-    store: &Store,
+    adj: &AdjMaps,
 ) -> Value {
-    // Collect import paths (for modules: atoms that import this module's file).
-    let imports: Vec<String> = store
-        .edges_from(&atom.id)
-        .iter()
-        .filter(|e| e.kind == EdgeKind::Uses)
-        .map(|e| e.to.as_str().to_owned())
-        .collect();
-    let imported_by: Vec<String> = store
-        .edges_to(&atom.id)
-        .iter()
-        .filter(|e| e.kind == EdgeKind::Uses)
-        .map(|e| e.from.as_str().to_owned())
-        .collect();
-    // For impl atoms: which trait this impl block satisfies.
-    // For trait atoms: which impl atoms satisfy this trait.
-    let implements: Vec<String> = store
-        .edges_from(&atom.id)
-        .iter()
-        .filter(|e| e.kind == EdgeKind::Implements)
-        .map(|e| e.to.as_str().to_owned())
-        .collect();
-    let implemented_by: Vec<String> = store
-        .edges_to(&atom.id)
-        .iter()
-        .filter(|e| e.kind == EdgeKind::Implements)
-        .map(|e| e.from.as_str().to_owned())
-        .collect();
+    let to_strings = |ids: Option<&Vec<EntityId>>| -> Vec<String> {
+        ids.map(|v| v.iter().map(|e| e.as_str().to_owned()).collect())
+            .unwrap_or_default()
+    };
+    let imports = to_strings(adj.uses_out.get(&atom.id));
+    let imported_by = to_strings(adj.uses_in.get(&atom.id));
+    let implements = to_strings(adj.implements_out.get(&atom.id));
+    let implemented_by = to_strings(adj.implements_in.get(&atom.id));
 
     json!({
         "id": atom.id.as_str(),
