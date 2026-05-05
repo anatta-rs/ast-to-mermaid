@@ -78,8 +78,10 @@ impl std::fmt::Debug for AnalyzeOptions {
 struct ParseInput {
     /// Display path used for entity ids (relative-to-root, slash-separated).
     display_path: String,
-    /// File contents as bytes.
-    content: Vec<u8>,
+    /// File contents as bytes. Held behind an `Arc` so the bundle path can
+    /// hand the same bytes to the sequence extractor without a deep copy
+    /// (refcount bump only).
+    content: Arc<[u8]>,
     /// Language detected from the file extension.
     language: Language,
     /// Git blob SHA-1 of the content. From `git ls-tree` in `--ref` mode,
@@ -106,7 +108,7 @@ fn collect_from_worktree(root: &Path, exclude: &[String]) -> Result<Vec<ParseInp
         let display_path = display_path(root, &path);
         out.push(ParseInput {
             display_path,
-            content,
+            content: Arc::from(content.into_boxed_slice()),
             language,
             blob_sha,
         });
@@ -142,7 +144,7 @@ fn collect_from_git_ref(root: &Path, git_ref: &str) -> Result<Vec<ParseInput>> {
         let content = reader.read_blob(&entry.blob_sha)?;
         out.push(ParseInput {
             display_path: entry.path,
-            content,
+            content: Arc::from(content.into_boxed_slice()),
             language,
             blob_sha: entry.blob_sha,
         });
@@ -381,11 +383,12 @@ pub fn bundle(root: &Path, opts: &AnalyzeOptions) -> Result<(ArtifactSet, Analyz
     };
     let artifacts = if opts.with_sequences {
         // Re-use the bytes already in memory — only Rust files can produce
-        // sequence diagrams, so we filter the rest out cheaply.
-        let sources: Vec<(String, Vec<u8>)> = inputs
+        // sequence diagrams, so we filter the rest out cheaply. The
+        // `Arc::clone` is a refcount bump; no source bytes are copied.
+        let sources: Vec<(String, Arc<[u8]>)> = inputs
             .iter()
             .filter(|i| matches!(i.language, Language::Rust))
-            .map(|i| (i.display_path.clone(), i.content.clone()))
+            .map(|i| (i.display_path.clone(), Arc::clone(&i.content)))
             .collect();
         emit_artifacts_with_sequences(&store, &source_root, &sources)
     } else {
