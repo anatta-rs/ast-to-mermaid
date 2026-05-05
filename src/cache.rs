@@ -17,9 +17,36 @@
 //! On open, if the version file doesn't match the current expected version,
 //! both `blobs/` and `refs/` are wiped — coarse but correct, and matches
 //! the design's chosen invalidation strategy.
+//!
+//! ## Atomic-write tmp file naming (C26)
+//!
+//! [`atomic_write`] writes to a sibling tmp file then `rename`s into place.
+//! Under v0.6.0's rayon parallelism, two workers persisting byte-identical
+//! files (e.g. empty `mod.rs`, `__init__.py`) collide on the same
+//! `blob_sha`, and a pid-only suffix produces identical tmp paths across
+//! threads — the second worker's `fs::write` corrupts the first's bytes
+//! mid-rename.
+//!
+//! Tmp suffix shape:
+//!
+//! ```text
+//! .{file_name}.tmp.{pid}.{thread_id}.{counter}
+//! ```
+//!
+//! - `pid` = `std::process::id()` (cross-process disambiguation).
+//! - `thread_id` = u64 hash of `std::thread::current().id()`
+//!   (intra-process per-thread disambiguation; `ThreadId::as_u64` is still
+//!   unstable, so we hash to extract a stable u64 with the same effect).
+//! - `counter` = per-process `AtomicU64::fetch_add(1)` (disambiguates
+//!   sequential writes from the same thread targeting the same path).
+//!
+//! [`Cache::open`] sweeps any leftover `blobs/.*.tmp.*` files (any
+//! suffix shape) on startup so a crashed prior run can't accumulate
+//! garbage in the blob dir.
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 
@@ -128,6 +155,8 @@ impl Cache {
             }
             fs::write(&version_path, &want)?;
         }
+
+        sweep_stale_tmp_blobs(&root.join("blobs"))?;
 
         Ok(Self { root })
     }
@@ -410,9 +439,28 @@ enum GcKind {
     Bundle,
 }
 
+/// Process-wide counter appended to every [`atomic_write`] tmp suffix.
+/// Combined with pid + thread id, guarantees no two concurrent writers
+/// pick the same tmp path even when targeting the same final path.
+static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Hash `std::thread::current().id()` to a u64. Used as a stable
+/// substitute for the unstable [`std::thread::ThreadId::as_u64`] in
+/// [`atomic_write`]'s tmp suffix — only the per-thread distinctness
+/// matters, not the exact numeric value.
+fn current_thread_id_u64() -> u64 {
+    use std::hash::BuildHasher;
+    std::collections::hash_map::RandomState::new().hash_one(std::thread::current().id())
+}
+
 /// Write `bytes` to `path` atomically: a temp sibling is written and
 /// `rename`'d into place. Concurrent readers either see the old content
 /// or the new content — never partial bytes.
+///
+/// Tmp suffix is `.{file_name}.tmp.{pid}.{thread_id}.{counter}` so two
+/// workers targeting the same final path (rayon's `parse_phase` racing
+/// on byte-identical blobs) cannot collide on the tmp file. See the
+/// module header for the full naming contract.
 ///
 /// # Errors
 /// Propagates I/O errors. If `rename` fails, the temp file is left on
@@ -426,10 +474,49 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     })?;
     fs::create_dir_all(parent)?;
     let pid = std::process::id();
+    let tid = current_thread_id_u64();
+    let counter = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
     let stem = path.file_name().and_then(|s| s.to_str()).unwrap_or("file");
-    let tmp = parent.join(format!(".{stem}.tmp.{pid}"));
+    let tmp = parent.join(format!(".{stem}.tmp.{pid}.{tid}.{counter}"));
     fs::write(&tmp, bytes)?;
     fs::rename(&tmp, path)?;
+    Ok(())
+}
+
+/// Crash-recovery sweep: remove any leftover [`atomic_write`] tmp files
+/// from `blobs_dir`. Matches files whose name starts with `.` and
+/// contains `.tmp.` — covers every suffix shape this module has ever
+/// produced (pid-only, pid+tid+counter, future variants).
+///
+/// Silent: a stale tmp is expected after a crash, not an error.
+/// Symlinks are refused (consistent with the rest of the module).
+fn sweep_stale_tmp_blobs(blobs_dir: &Path) -> Result<()> {
+    let read = match fs::read_dir(blobs_dir) {
+        Ok(r) => r,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e.into()),
+    };
+    for entry in read {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(s) = name.to_str() else { continue };
+        if !s.starts_with('.') || !s.contains(".tmp.") {
+            continue;
+        }
+        let path = entry.path();
+        let meta = fs::symlink_metadata(&path)?;
+        if meta.file_type().is_symlink() {
+            return Err(AstToMermaidError::InvalidInput(format!(
+                "refusing to remove symlinked tmp in cache: {}",
+                path.display()
+            )));
+        }
+        if meta.is_dir() {
+            remove_dir_all_safe(&path)?;
+        } else {
+            fs::remove_file(&path)?;
+        }
+    }
     Ok(())
 }
 
