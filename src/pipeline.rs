@@ -514,7 +514,10 @@ fn walk_into(
     Ok(())
 }
 
-fn language_for(path: &Path) -> Option<Language> {
+/// Single source of truth for extension → [`Language`]. Callers in
+/// `cli/run/{walk,sequence}` go through this so the supported-language
+/// set never drifts between subcommands.
+pub(crate) fn language_for(path: &Path) -> Option<Language> {
     match path.extension().and_then(|e| e.to_str()) {
         Some("rs") => Some(Language::Rust),
         Some("py") => Some(Language::Python),

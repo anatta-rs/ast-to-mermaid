@@ -1,7 +1,7 @@
 use super::check_ref_arg;
 use crate::cli::flags::{ExitCode, SequenceFlags};
 use crate::cli::format::parse_csv_exclude;
-use crate::pipeline::walk_for_languages_with_exclude;
+use crate::pipeline::{language_for, walk_for_languages_with_exclude};
 use crate::sequence;
 use std::path::Path;
 
@@ -240,10 +240,7 @@ fn collect_rust_sources(
         let mut reader = crate::git_source::BatchReader::spawn(&toplevel)?;
         let mut out = Vec::new();
         for entry in entries {
-            if !Path::new(&entry.path)
-                .extension()
-                .is_some_and(|e| e.eq_ignore_ascii_case("rs"))
-            {
+            if language_for(Path::new(&entry.path)) != Some(crate::parser::Language::Rust) {
                 continue;
             }
             let content = reader.read_blob(&entry.blob_sha)?;
