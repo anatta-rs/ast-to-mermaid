@@ -124,6 +124,10 @@ fn collect_from_git_ref(root: &Path, git_ref: &str) -> Result<Vec<ParseInput>> {
         .filter(|s| !s.is_empty());
 
     let entries = git_source::ls_tree(&toplevel, git_ref)?;
+    // One persistent `git cat-file --batch` child for the whole loop,
+    // dropped (= killed + reaped) when this function returns. Avoids
+    // ~50 ms fork+exec per blob on macOS.
+    let mut reader = git_source::BatchReader::spawn(&toplevel)?;
     let mut out = Vec::new();
     for entry in entries {
         if let Some(p) = prefix.as_deref()
@@ -134,7 +138,7 @@ fn collect_from_git_ref(root: &Path, git_ref: &str) -> Result<Vec<ParseInput>> {
         let Some(language) = language_for(Path::new(&entry.path)) else {
             continue;
         };
-        let content = git_source::cat_file(&toplevel, &entry.blob_sha)?;
+        let content = reader.read_blob(&entry.blob_sha)?;
         out.push(ParseInput {
             display_path: entry.path,
             content,

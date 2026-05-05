@@ -8,8 +8,9 @@
 //! they do not check for a `.git` directory upfront. Callers that need a
 //! repo toplevel should call [`show_toplevel`] first.
 
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
 use crate::error::{AstToMermaidError, Result};
 
@@ -105,18 +106,146 @@ pub fn ls_tree(repo_root: &Path, git_ref: &str) -> Result<Vec<TreeEntry>> {
 
 /// Read a blob's content by SHA via `git cat-file -p`.
 ///
+/// Thin wrapper around [`BatchReader`] kept for API compatibility and for
+/// one-shot reads outside of [`collect_from_git_ref`]-style loops. Callers
+/// reading many blobs from the same repo should construct a [`BatchReader`]
+/// directly to amortise the subprocess fork+exec across the whole batch.
+///
 /// # Errors
 /// Returns `InvalidInput` when the blob is missing or unreadable.
 pub fn cat_file(repo_root: &Path, blob_sha: &str) -> Result<Vec<u8>> {
-    let output = run_git(repo_root, &["cat-file", "-p", blob_sha])?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(AstToMermaidError::InvalidInput(format!(
-            "git cat-file {blob_sha}: {}",
-            stderr.trim()
-        )));
+    let mut reader = BatchReader::spawn(repo_root)?;
+    reader.read_blob(blob_sha)
+}
+
+/// Persistent `git cat-file --batch` child process for amortised blob reads.
+///
+/// Spawns one subprocess and feeds SHAs to its stdin, reading the blob bytes
+/// back from its stdout. Callers loop with [`Self::read_blob`]; on drop the
+/// child's stdin is closed and the process is killed and reaped, guaranteeing
+/// no orphan even on panic or early return.
+///
+/// # Protocol
+/// `git cat-file --batch` answers each `<sha>\n` request with a header line
+/// `<sha> <type> <size>\n`, followed by `<size>` bytes of content, followed
+/// by a single trailing `\n`. Missing objects produce `<sha> missing\n`.
+pub struct BatchReader {
+    child: Child,
+    stdin: ChildStdin,
+    stdout: BufReader<ChildStdout>,
+}
+
+impl BatchReader {
+    /// Spawn `git cat-file --batch` rooted at `repo_root` with stdin / stdout
+    /// piped.
+    ///
+    /// We deliberately do not pass `--buffer` — that flag makes git apply
+    /// stdio buffering to its output, which deadlocks an interactive
+    /// write-then-read loop because the response stays trapped in git's
+    /// internal buffer until it fills up. Without it, git flushes after
+    /// every object, which is what we need.
+    ///
+    /// # Errors
+    /// Returns `InvalidInput` when the child fails to spawn.
+    pub fn spawn(repo_root: &Path) -> Result<Self> {
+        let mut child = Command::new("git")
+            .arg("-C")
+            .arg(repo_root)
+            .args(["cat-file", "--batch"])
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_INDEX_FILE")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_OBJECT_DIRECTORY")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| {
+                AstToMermaidError::InvalidInput(format!("git cat-file --batch spawn: {e}"))
+            })?;
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| AstToMermaidError::InvalidInput("git cat-file: stdin missing".into()))?;
+        let stdout = child.stdout.take().ok_or_else(|| {
+            AstToMermaidError::InvalidInput("git cat-file: stdout missing".into())
+        })?;
+        Ok(Self {
+            child,
+            stdin,
+            stdout: BufReader::new(stdout),
+        })
     }
-    Ok(output.stdout)
+
+    /// Read the blob at `blob_sha` from the persistent batch stream.
+    ///
+    /// # Errors
+    /// Returns `InvalidInput` when the blob is missing, the header is
+    /// malformed, or the child died unexpectedly.
+    pub fn read_blob(&mut self, blob_sha: &str) -> Result<Vec<u8>> {
+        // Ask for the next blob. `--buffer` requires an explicit flush.
+        self.stdin
+            .write_all(blob_sha.as_bytes())
+            .map_err(|e| AstToMermaidError::InvalidInput(format!("git cat-file write: {e}")))?;
+        self.stdin
+            .write_all(b"\n")
+            .map_err(|e| AstToMermaidError::InvalidInput(format!("git cat-file write: {e}")))?;
+        self.stdin
+            .flush()
+            .map_err(|e| AstToMermaidError::InvalidInput(format!("git cat-file flush: {e}")))?;
+
+        let mut header = String::new();
+        let n = self
+            .stdout
+            .read_line(&mut header)
+            .map_err(|e| AstToMermaidError::InvalidInput(format!("git cat-file read: {e}")))?;
+        if n == 0 {
+            return Err(AstToMermaidError::InvalidInput(
+                "git cat-file: unexpected EOF on header".into(),
+            ));
+        }
+        let trimmed = header.trim_end_matches('\n');
+        // Format: "<sha> <type> <size>" or "<sha> missing".
+        let parts: Vec<&str> = trimmed.splitn(3, ' ').collect();
+        if parts.len() == 2 && parts[1] == "missing" {
+            return Err(AstToMermaidError::InvalidInput(format!(
+                "git cat-file {blob_sha}: missing"
+            )));
+        }
+        if parts.len() != 3 {
+            return Err(AstToMermaidError::InvalidInput(format!(
+                "git cat-file: malformed header {trimmed:?}"
+            )));
+        }
+        let size: usize = parts[2].parse().map_err(|_| {
+            AstToMermaidError::InvalidInput(format!(
+                "git cat-file: non-numeric size in header {trimmed:?}"
+            ))
+        })?;
+
+        let mut buf = vec![0u8; size];
+        self.stdout
+            .read_exact(&mut buf)
+            .map_err(|e| AstToMermaidError::InvalidInput(format!("git cat-file body: {e}")))?;
+        // Consume the trailing newline that follows every blob in the
+        // `--batch` stream so the next header lines up.
+        let mut nl = [0u8; 1];
+        self.stdout
+            .read_exact(&mut nl)
+            .map_err(|e| AstToMermaidError::InvalidInput(format!("git cat-file trailer: {e}")))?;
+        Ok(buf)
+    }
+}
+
+impl Drop for BatchReader {
+    fn drop(&mut self) {
+        // Best-effort shutdown: closing stdin signals git to exit; if it
+        // doesn't, kill the child outright. Always reap so the OS doesn't
+        // accumulate zombies.
+        let _ = self.stdin.flush();
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
 }
 
 fn run_git(cwd: &Path, args: &[&str]) -> Result<std::process::Output> {
@@ -252,5 +381,78 @@ mod tests {
         let _ = init_repo(tmp.path(), "f.rs", "fn x(){}");
         let err = cat_file(tmp.path(), "0000000000000000000000000000000000000000").unwrap_err();
         assert!(err.to_string().contains("git cat-file"));
+    }
+
+    #[test]
+    fn batch_reader_reads_single_blob() {
+        let tmp = tempdir().unwrap();
+        let (blob, _) = init_repo(tmp.path(), "src/lib.rs", "fn x(){}\n");
+        let mut reader = BatchReader::spawn(tmp.path()).unwrap();
+        let content = reader.read_blob(&blob).unwrap();
+        assert_eq!(content, b"fn x(){}\n");
+    }
+
+    #[test]
+    fn batch_reader_reads_multiple_blobs_in_sequence() {
+        let tmp = tempdir().unwrap();
+        run_or_panic(tmp.path(), &["init", "-q", "-b", "main"]);
+        run_or_panic(tmp.path(), &["config", "user.email", "t@t"]);
+        run_or_panic(tmp.path(), &["config", "user.name", "t"]);
+        run_or_panic(tmp.path(), &["config", "commit.gpgsign", "false"]);
+        let files = [
+            ("a.rs", "fn a(){}\n"),
+            ("b.rs", "fn b(){println!(\"hi\");}\n"),
+            ("c.rs", ""), // empty blob — exercises size=0 path
+        ];
+        let mut shas = Vec::new();
+        for (name, content) in &files {
+            fs::write(tmp.path().join(name), content).unwrap();
+            run_or_panic(tmp.path(), &["add", name]);
+            let sha = String::from_utf8(run_or_panic(tmp.path(), &["hash-object", name]).stdout)
+                .unwrap()
+                .trim()
+                .to_owned();
+            shas.push(sha);
+        }
+        run_or_panic(tmp.path(), &["commit", "-q", "-m", "init"]);
+
+        let mut reader = BatchReader::spawn(tmp.path()).unwrap();
+        for ((_, expected), sha) in files.iter().zip(&shas) {
+            let got = reader.read_blob(sha).unwrap();
+            assert_eq!(got, expected.as_bytes(), "sha {sha}");
+        }
+        // Same reader can be re-used for blobs it has already served — it's
+        // just a stream of (sha, response) pairs to git.
+        let again = reader.read_blob(&shas[0]).unwrap();
+        assert_eq!(again, files[0].1.as_bytes());
+    }
+
+    #[test]
+    fn batch_reader_missing_blob_errors_without_killing_stream() {
+        let tmp = tempdir().unwrap();
+        let (blob, _) = init_repo(tmp.path(), "src/lib.rs", "fn x(){}\n");
+        let mut reader = BatchReader::spawn(tmp.path()).unwrap();
+        let err = reader
+            .read_blob("0000000000000000000000000000000000000000")
+            .unwrap_err();
+        assert!(err.to_string().contains("missing"), "{err}");
+        // Stream is still usable: a real sha after a missing one must succeed.
+        let content = reader.read_blob(&blob).unwrap();
+        assert_eq!(content, b"fn x(){}\n");
+    }
+
+    #[test]
+    fn batch_reader_drop_kills_child() {
+        // Smoke test: dropping the reader must not leak zombies. We can't
+        // easily assert that across platforms, but we can at least verify
+        // the Drop runs without panic.
+        let tmp = tempdir().unwrap();
+        let _ = init_repo(tmp.path(), "f.rs", "fn x(){}\n");
+        {
+            let _reader = BatchReader::spawn(tmp.path()).unwrap();
+        }
+        // Spawning a fresh reader after the previous one was dropped must
+        // still work (i.e. nothing left half-broken in the repo).
+        let _reader2 = BatchReader::spawn(tmp.path()).unwrap();
     }
 }
