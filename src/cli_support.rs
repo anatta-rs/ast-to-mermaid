@@ -27,6 +27,26 @@ fn open_default_cache(start: &Path) -> Option<Arc<Cache>> {
     Cache::open(&root).ok().map(Arc::new)
 }
 
+/// Reject a `--ref` value that's empty or shaped like a `git` flag (the
+/// `--upload-pack=…` flag-injection vector and friends). Mirrors the
+/// stricter [`crate::git_source::validate_git_ref`] check, but maps the
+/// failure to [`ExitCode::UsageError`] (exit 2) and emits the error on
+/// stderr without ever invoking `git`. `subcommand` is included in the
+/// message so users see e.g. `overview: --ref: …` rather than a bare
+/// `invalid input: …`.
+fn check_ref_arg(subcommand: &str, value: Option<&str>) -> Result<(), ExitCode> {
+    let Some(s) = value else {
+        return Ok(());
+    };
+    match crate::git_source::validate_git_ref(s) {
+        Ok(_) => Ok(()),
+        Err(e) => {
+            eprintln!("{subcommand}: --ref: {e}");
+            Err(ExitCode::UsageError)
+        }
+    }
+}
+
 /// Exit code returned by CLI functions, convertible into [`process::ExitCode`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExitCode {
@@ -109,6 +129,9 @@ pub fn run_analyze(level: Level, flags: &AnalyzeFlags) -> ExitCode {
     if level.requires_target() && flags.target.is_none() {
         eprintln!("level={level} requires --target");
         return ExitCode::UsageError;
+    }
+    if let Err(code) = check_ref_arg(level.as_str(), flags.r#ref.as_deref()) {
+        return code;
     }
 
     let exclude: Vec<String> = flags
@@ -205,6 +228,9 @@ pub struct WalkFlags {
 /// Run the file-walker subcommand: print one line per source file, format
 /// `<lang>\t<path>`, to stdout.
 pub fn run_walk(flags: &WalkFlags) -> ExitCode {
+    if let Err(code) = check_ref_arg("walk", flags.r#ref.as_deref()) {
+        return code;
+    }
     if let Some(git_ref) = flags.r#ref.as_deref() {
         return run_walk_ref(&flags.path, git_ref);
     }
@@ -331,6 +357,9 @@ pub struct IndexFlags {
 /// working tree) into the cache. Idempotent — cached re-runs are a no-op
 /// unless `--force` is set.
 pub fn run_index(flags: &IndexFlags) -> ExitCode {
+    if let Err(code) = check_ref_arg("index", flags.r#ref.as_deref()) {
+        return code;
+    }
     let (cache_root, _ephemeral) = match flags.cache.resolve(&flags.path) {
         Ok(t) => t,
         Err(e) => {
@@ -436,6 +465,12 @@ pub fn run_diff(flags: &DiffFlags) -> ExitCode {
     if ref_a.is_empty() || ref_b.is_empty() {
         eprintln!("diff: both refs must be non-empty in `{}`", flags.range);
         return ExitCode::UsageError;
+    }
+    if let Err(code) = check_ref_arg("diff", Some(ref_a)) {
+        return code;
+    }
+    if let Err(code) = check_ref_arg("diff", Some(ref_b)) {
+        return code;
     }
 
     let (cache_root, _ephemeral) = match flags.cache.resolve(&flags.path) {
@@ -717,6 +752,9 @@ pub struct BundleFlags {
 /// Run the artifact-bundle subcommand: parse → resolve → emit a directory
 /// of per-entity Mermaid + metadata files plus a top-level `index.json`.
 pub fn run_bundle(flags: &BundleFlags) -> ExitCode {
+    if let Err(code) = check_ref_arg("bundle", flags.r#ref.as_deref()) {
+        return code;
+    }
     let exclude: Vec<String> = flags
         .exclude
         .split(',')
@@ -810,6 +848,9 @@ pub fn run_sequence(flags: &SequenceFlags) -> ExitCode {
     if !flags.all && flags.target.as_deref().is_none_or(|t| t.trim().is_empty()) {
         eprintln!("sequence: pass --target <NAME> or --all");
         return ExitCode::UsageError;
+    }
+    if let Err(code) = check_ref_arg("sequence", flags.r#ref.as_deref()) {
+        return code;
     }
     let exclude: Vec<String> = flags
         .exclude

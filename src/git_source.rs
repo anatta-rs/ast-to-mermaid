@@ -23,13 +23,62 @@ pub struct TreeEntry {
     pub blob_sha: String,
 }
 
-/// Resolve `git_ref` to a 40-char commit SHA via `git rev-parse --verify`.
+/// Validate `s` is safe to pass to `git` as a positional ref argument.
+///
+/// Rejects strings that look like CLI flags (`--upload-pack=/usr/bin/evil`,
+/// the canonical flag-injection vector against `git ls-tree` &
+/// `git rev-parse`), strings that contain whitespace, NUL, the path-traversal
+/// sequence `..`, or any byte outside printable ASCII (`0x21..=0x7e`).
+///
+/// On success returns the input slice unchanged so callers can chain:
+/// `let ref_arg = validate_git_ref(input)?;`.
 ///
 /// # Errors
-/// Returns `InvalidInput` when the ref does not exist, with a hint to
-/// `git fetch` (the most common cause for a missing ref).
+/// Returns `InvalidInput` with a message that names the offending feature
+/// of the ref so the CLI can surface it to the user.
+pub fn validate_git_ref(s: &str) -> Result<&str> {
+    if s.is_empty() {
+        return Err(AstToMermaidError::InvalidInput("git ref is empty".into()));
+    }
+    if s.starts_with('-') {
+        return Err(AstToMermaidError::InvalidInput(format!(
+            "git ref looks like a CLI flag (starts with '-'): {s:?}"
+        )));
+    }
+    if s.contains("..") {
+        return Err(AstToMermaidError::InvalidInput(format!(
+            "git ref contains '..' (path-traversal-like sequence): {s:?}"
+        )));
+    }
+    for &b in s.as_bytes() {
+        // Printable-ASCII gate: anything outside `!`..`~` (which excludes
+        // the space, every C0/C1 control byte, NUL, tab, CR, LF, and
+        // every non-ASCII byte) is rejected.
+        if !(0x21..=0x7e).contains(&b) {
+            return Err(AstToMermaidError::InvalidInput(format!(
+                "git ref contains disallowed byte 0x{b:02x}: {s:?}"
+            )));
+        }
+    }
+    Ok(s)
+}
+
+/// Resolve `git_ref` to a 40-char commit SHA via `git rev-parse --verify`.
+///
+/// `git_ref` is validated by [`validate_git_ref`] before any subprocess is
+/// spawned, and is passed after `--end-of-options` so it cannot be
+/// reinterpreted as a flag (`--upload-pack=…`) even if validation regressed.
+///
+/// # Errors
+/// Returns `InvalidInput` when the ref is malformed (validation), or when
+/// the ref does not exist, with a hint to `git fetch` (the most common
+/// cause for a missing ref).
 pub fn rev_parse(repo_root: &Path, git_ref: &str) -> Result<String> {
-    let output = run_git(repo_root, &["rev-parse", "--verify", git_ref])?;
+    let git_ref = validate_git_ref(git_ref)?;
+    let output = run_git(
+        repo_root,
+        &["rev-parse", "--verify", "--end-of-options", git_ref],
+    )?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(AstToMermaidError::InvalidInput(format!(
@@ -66,10 +115,26 @@ pub fn show_toplevel(start: &Path) -> Result<PathBuf> {
 /// Submodules and non-blob entries are skipped. Output is NUL-delimited so
 /// paths with embedded whitespace are handled correctly.
 ///
+/// `git_ref` is validated by [`validate_git_ref`] before any subprocess is
+/// spawned, and is passed after `--end-of-options` so it cannot be
+/// reinterpreted as a flag.
+///
 /// # Errors
-/// Returns `InvalidInput` when `git ls-tree` fails.
+/// Returns `InvalidInput` when the ref is malformed (validation) or
+/// `git ls-tree` fails.
 pub fn ls_tree(repo_root: &Path, git_ref: &str) -> Result<Vec<TreeEntry>> {
-    let output = run_git(repo_root, &["ls-tree", "-r", "-z", "--full-tree", git_ref])?;
+    let git_ref = validate_git_ref(git_ref)?;
+    let output = run_git(
+        repo_root,
+        &[
+            "ls-tree",
+            "-r",
+            "-z",
+            "--full-tree",
+            "--end-of-options",
+            git_ref,
+        ],
+    )?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(AstToMermaidError::InvalidInput(format!(
@@ -326,6 +391,98 @@ mod tests {
             panic!("git {args:?} failed: {stderr}");
         }
         out
+    }
+
+    #[test]
+    fn validate_git_ref_accepts_real_refs() {
+        for good in [
+            "HEAD",
+            "main",
+            "master",
+            "v0.5.0",
+            "abcdef0",
+            "feature/foo-bar",
+            "HEAD~3",
+            "HEAD^",
+            "release-1.2.3",
+        ] {
+            assert!(
+                validate_git_ref(good).is_ok(),
+                "expected `{good}` to validate"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_git_ref_rejects_flag_like_inputs() {
+        for bad in [
+            "--upload-pack=/usr/bin/evil",
+            "--upload-pack=/bin/echo",
+            "-x",
+            "--help",
+        ] {
+            let err = validate_git_ref(bad).unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.contains("CLI flag") || msg.contains("starts with '-'"),
+                "expected flag-rejection message for `{bad}`, got: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_git_ref_rejects_path_traversal() {
+        let err = validate_git_ref("..").unwrap_err();
+        assert!(err.to_string().contains(".."));
+        let err = validate_git_ref("foo/../bar").unwrap_err();
+        assert!(err.to_string().contains(".."));
+    }
+
+    #[test]
+    fn validate_git_ref_rejects_whitespace_nul_and_nonprintable() {
+        for bad in [
+            "with space",
+            "tab\there",
+            "newline\nhere",
+            "carriage\rreturn",
+            "nul\0byte",
+            "café", // non-ASCII byte
+        ] {
+            assert!(
+                validate_git_ref(bad).is_err(),
+                "expected `{bad:?}` to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_git_ref_rejects_empty_string() {
+        assert!(validate_git_ref("").is_err());
+    }
+
+    #[test]
+    fn rev_parse_rejects_flag_like_ref_without_spawning_git() {
+        // No git invocation needed: validation runs before any subprocess.
+        // Use a non-existent path to prove no `git` is even started — if it
+        // were, it would error with a different message about the cwd.
+        let nowhere = Path::new("/definitely/not/a/path/exists/here");
+        let err = rev_parse(nowhere, "--upload-pack=/bin/echo HACKED").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("CLI flag") || msg.contains("starts with '-'"),
+            "expected validation error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn ls_tree_rejects_flag_like_ref_without_spawning_git() {
+        let nowhere = Path::new("/definitely/not/a/path/exists/here");
+        let err = ls_tree(nowhere, "--upload-pack=evil").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("CLI flag") || msg.contains("starts with '-'"),
+            "expected validation error, got: {msg}"
+        );
     }
 
     #[test]
