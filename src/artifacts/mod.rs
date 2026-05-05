@@ -639,9 +639,17 @@ fn build_index(
 /// Filenames need to keep `.` (extensions) and `-` (idiomatic in repo
 /// paths), so the allowed set is wider; we don't apply Mermaid's
 /// keyword/digit guards because they're meaningless on disk.
+///
+/// When the input contains ASCII uppercase letters, the result is
+/// lowercased and an `_H<hash>` suffix is appended so `Foo`, `foo`,
+/// and `FOO` map to distinct filenames on case-insensitive
+/// filesystems (macOS APFS default, Windows NTFS). The suffix is
+/// derived deterministically from the original id via
+/// [`hash_disambig`].
 #[must_use]
 pub fn filename_id(id: &str) -> String {
-    id.chars()
+    let safe: String = id
+        .chars()
         .map(|c| {
             if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
                 c
@@ -649,7 +657,32 @@ pub fn filename_id(id: &str) -> String {
                 '_'
             }
         })
-        .collect()
+        .collect();
+
+    if safe.bytes().any(|b| b.is_ascii_uppercase()) {
+        format!("{}_H{}", safe.to_ascii_lowercase(), hash_disambig(id))
+    } else {
+        safe
+    }
+}
+
+/// Short deterministic hex suffix used as a tie-breaker when two
+/// entity ids fold to the same lowercase filename on a
+/// case-insensitive filesystem.
+///
+/// Returns the first 6 hex chars of SHA-256 over `input` — 24 bits is
+/// plenty for disambiguating a handful of case-only siblings within a
+/// single bundle, and SHA-256 is already in our dependency tree.
+#[must_use]
+pub fn hash_disambig(input: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(input.as_bytes());
+    let mut out = String::with_capacity(6);
+    for &b in digest.iter().take(3) {
+        use std::fmt::Write as _;
+        let _ = write!(out, "{b:02x}");
+    }
+    out
 }
 
 /// Returns an RFC 3339 UTC timestamp. Falls back to the Unix epoch if the
@@ -756,6 +789,82 @@ mod tests {
         );
         assert_eq!(filename_id("abc_123-def.rs"), "abc_123-def.rs");
         assert_eq!(filename_id("a::b"), "a__b");
+    }
+
+    #[test]
+    fn filename_id_case_collision_distinct_outputs() {
+        // Inputs differ only in case → outputs must be distinct, even
+        // after case-folding (so they survive APFS / NTFS).
+        let a = filename_id("Foo");
+        let b = filename_id("foo");
+        let c = filename_id("FOO");
+        assert_ne!(a, b);
+        assert_ne!(a, c);
+        assert_ne!(b, c);
+        assert_ne!(a.to_ascii_lowercase(), b.to_ascii_lowercase());
+        assert_ne!(a.to_ascii_lowercase(), c.to_ascii_lowercase());
+        assert_ne!(b.to_ascii_lowercase(), c.to_ascii_lowercase());
+        // All-lowercase input must keep its plain form (back-compat).
+        assert_eq!(b, "foo");
+        // Mixed-case forms are lowercased + suffixed with `_H<hash>`.
+        assert!(a.starts_with("foo_H"), "got: {a}");
+        assert!(c.starts_with("foo_H"), "got: {c}");
+    }
+
+    #[test]
+    fn filename_id_is_deterministic() {
+        // Same input must produce the same suffix every call.
+        assert_eq!(filename_id("MyStruct"), filename_id("MyStruct"));
+    }
+
+    /// On macOS APFS the default filesystem is case-insensitive, so two
+    /// files whose names differ only in case clobber each other on
+    /// write. This test exercises the case-collision path end-to-end:
+    /// it writes three artifacts whose ids fold to the same lowercase
+    /// form, and asserts that all three end up on disk as distinct
+    /// files.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn filename_id_case_collision_survives_apfs() {
+        let store = Store::new();
+        store.add_atom(fn_atom(
+            "code:src/lib.rs::function::Foo",
+            "src/lib.rs",
+            "Foo",
+        ));
+        store.add_atom(fn_atom(
+            "code:src/lib.rs::function::foo",
+            "src/lib.rs",
+            "foo",
+        ));
+        store.add_atom(fn_atom(
+            "code:src/lib.rs::function::FOO",
+            "src/lib.rs",
+            "FOO",
+        ));
+        let artifacts = emit_artifacts(&store, "/src");
+
+        let tmp = tempfile::tempdir().expect("tmp");
+        write_artifacts(&artifacts, tmp.path()).expect("write");
+
+        let entities_dir = tmp.path().join("entities");
+        let mmd_files: Vec<String> = std::fs::read_dir(&entities_dir)
+            .expect("read entities")
+            .filter_map(std::result::Result::ok)
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| {
+                std::path::Path::new(n)
+                    .extension()
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("mmd"))
+            })
+            .collect();
+        // 3 distinct entities → 3 distinct .mmd files survive on disk
+        // (would be 1 without case-disambiguation on APFS).
+        assert_eq!(
+            mmd_files.len(),
+            3,
+            "expected 3 .mmd files for Foo/foo/FOO, got: {mmd_files:?}"
+        );
     }
 
     #[test]

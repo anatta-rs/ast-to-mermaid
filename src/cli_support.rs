@@ -904,9 +904,13 @@ fn run_sequence_all(candidates: &[(String, Vec<u8>)], out: Option<&Path>) -> Exi
         return ExitCode::Failure;
     }
 
-    let mut written = 0usize;
+    // Pass 1: enumerate every (file, function name) candidate and its
+    // would-be filename, so we can spot pre-collisions on
+    // case-insensitive filesystems (macOS APFS default, Windows NTFS)
+    // before any file is written.
+    let mut entries: Vec<(usize, String, String)> = Vec::new();
     let mut skipped = 0usize;
-    for (file_rel, content) in candidates {
+    for (file_idx, (file_rel, content)) in candidates.iter().enumerate() {
         let names = match sequence::list_functions(content) {
             Ok(n) => n,
             Err(e) => {
@@ -916,25 +920,54 @@ fn run_sequence_all(candidates: &[(String, Vec<u8>)], out: Option<&Path>) -> Exi
             }
         };
         for name in names {
-            let Ok(diagram) = sequence::extract(content, file_rel, &name) else {
-                skipped += 1;
-                continue;
-            };
-            // Empty bodies (getters, single-line returns, doc-only fns)
-            // produce a Mermaid header with no steps — useless on disk.
-            if diagram.steps.is_empty() {
-                skipped += 1;
-                continue;
-            }
-            let filename = sequence_filename(file_rel, &name);
-            let target_path = out_dir.join(&filename);
-            let rendered = sequence::render(&diagram);
-            if let Err(e) = std::fs::write(&target_path, rendered) {
-                eprintln!("sequence: write {}: {e}", target_path.display());
-                return ExitCode::Failure;
-            }
-            written += 1;
+            let base = sequence_filename(file_rel, &name);
+            entries.push((file_idx, name, base));
         }
+    }
+
+    let mut lower_counts: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+    for (_, _, base) in &entries {
+        *lower_counts.entry(base.to_ascii_lowercase()).or_insert(0) += 1;
+    }
+
+    // Pass 2: extract + render + write. Bases that case-fold to the
+    // same lowercase as another candidate get a `_H<hash>` suffix from
+    // [`crate::artifacts::hash_disambig`] so all members survive on
+    // disk.
+    let mut written = 0usize;
+    for (file_idx, name, base) in &entries {
+        let (file_rel, content) = &candidates[*file_idx];
+        let Ok(diagram) = sequence::extract(content, file_rel, name) else {
+            skipped += 1;
+            continue;
+        };
+        if diagram.steps.is_empty() {
+            skipped += 1;
+            continue;
+        }
+        let collides = lower_counts
+            .get(&base.to_ascii_lowercase())
+            .copied()
+            .unwrap_or(0)
+            > 1;
+        let final_name = if collides {
+            let stem = base.strip_suffix(".mmd").unwrap_or(base);
+            let key = format!("{file_rel}::{name}");
+            format!(
+                "{stem}_H{hash}.mmd",
+                hash = crate::artifacts::hash_disambig(&key)
+            )
+        } else {
+            base.clone()
+        };
+        let target_path = out_dir.join(&final_name);
+        let rendered = sequence::render(&diagram);
+        if let Err(e) = std::fs::write(&target_path, rendered) {
+            eprintln!("sequence: write {}: {e}", target_path.display());
+            return ExitCode::Failure;
+        }
+        written += 1;
     }
     eprintln!(
         "sequence --all: {written} diagrams written to {} ({skipped} skipped: empty / parse fail)",
@@ -1774,6 +1807,55 @@ mod tests {
             !entries.iter().any(|n| n.ends_with("__b.mmd")),
             "empty b leaked: {entries:?}",
         );
+    }
+
+    /// `Foo`, `foo`, `FOO` clobber each other on case-insensitive
+    /// APFS. `run_sequence_all` must pre-detect the collision and
+    /// disambiguate so all three survive on disk.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn sequence_all_disambiguates_case_collisions_on_macos() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        write_rust(
+            tmp.path(),
+            "lib.rs",
+            "fn Foo(){ helper(); }\nfn foo(){ helper(); }\nfn FOO(){ helper(); }\nfn helper(){}\n",
+        );
+        let out = tmp.path().join("diagrams");
+        let mut flags = flags_for(tmp.path().to_path_buf(), None);
+        flags.all = true;
+        flags.out = Some(out.clone());
+        assert_eq!(run_sequence(&flags), ExitCode::Success);
+        let entries: Vec<String> = std::fs::read_dir(&out)
+            .expect("read out_dir")
+            .filter_map(std::result::Result::ok)
+            .filter_map(|e| e.file_name().into_string().ok())
+            .filter(|n| {
+                Path::new(n)
+                    .extension()
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("mmd"))
+            })
+            .collect();
+        // 3 distinct .mmd files survive on APFS — Foo, foo, FOO with
+        // disambig suffixes.
+        let case_files: Vec<&String> = entries
+            .iter()
+            .filter(|n| {
+                let lc = n.to_ascii_lowercase();
+                lc.contains("__foo") || lc.contains("__foo_h")
+            })
+            .collect();
+        assert_eq!(
+            case_files.len(),
+            3,
+            "expected 3 distinct files for Foo/foo/FOO, got: {entries:?}"
+        );
+        // And their lowercased names are all distinct (the actual
+        // case-insensitive-FS guarantee).
+        let mut lowered: Vec<String> = case_files.iter().map(|s| s.to_ascii_lowercase()).collect();
+        lowered.sort();
+        lowered.dedup();
+        assert_eq!(lowered.len(), 3, "filenames collide on APFS: {entries:?}");
     }
 
     #[test]
