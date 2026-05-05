@@ -2,6 +2,11 @@
 //! function takes the corresponding [`crate::cli::flags`] arg struct and
 //! returns an [`ExitCode`].
 
+// `run_*` deliberately drop `#[must_use]`: every caller in `bin/a2m.rs`
+// already feeds the return into `ExitCode::into()`, and uniformity beats
+// the lint's hint here.
+#![allow(clippy::must_use_candidate)]
+
 use crate::artifacts::write_artifacts;
 use crate::cache::{Cache, GcOptions, write_bundle_atomic};
 use crate::cli::flags::{
@@ -50,16 +55,9 @@ fn check_ref_arg(subcommand: &str, value: Option<&str>) -> Result<(), ExitCode> 
 
 /// Run the analyze pipeline for `level`, writing the resulting Mermaid to
 /// `flags.out` or stdout. Returns the program's exit code.
-///
-/// # Errors
-///
-/// All failures are reported via `eprintln!` and surfaced as
-/// `ExitCode::Failure`. Bad CLI input (missing target for a level that
-/// requires one) yields `ExitCode::UsageError`.
-#[must_use]
 pub fn run_analyze(level: Level, flags: &AnalyzeFlags) -> ExitCode {
     if level.requires_target() && flags.target.is_none() {
-        eprintln!("level={level} requires --target");
+        eprintln!("{}: --target: required for this level", level.as_str());
         return ExitCode::UsageError;
     }
     if let Err(code) = check_ref_arg(level.as_str(), flags.r#ref.as_deref()) {
@@ -85,7 +83,7 @@ pub fn run_analyze(level: Level, flags: &AnalyzeFlags) -> ExitCode {
     let report = match analyze(&flags.path, &opts) {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("analyze: {e}");
+            eprintln!("{}: analyze {}: {e}", level.as_str(), flags.path.display());
             return ExitCode::Failure;
         }
     };
@@ -104,7 +102,7 @@ pub fn run_analyze(level: Level, flags: &AnalyzeFlags) -> ExitCode {
 
     if let Some(path) = flags.out.as_deref() {
         if let Err(e) = std::fs::write(path, &rendered) {
-            eprintln!("write {}: {e}", path.display());
+            eprintln!("{}: write {}: {e}", level.as_str(), path.display());
             return ExitCode::Failure;
         }
         eprintln!(
@@ -136,7 +134,6 @@ pub fn run_analyze(level: Level, flags: &AnalyzeFlags) -> ExitCode {
 
 /// Run the file-walker subcommand: print one line per source file, format
 /// `<lang>\t<path>`, to stdout.
-#[must_use]
 pub fn run_walk(flags: &WalkFlags) -> ExitCode {
     if let Err(code) = check_ref_arg("walk", flags.r#ref.as_deref()) {
         return code;
@@ -154,7 +151,7 @@ pub fn run_walk(flags: &WalkFlags) -> ExitCode {
             ExitCode::Success
         }
         Err(e) => {
-            eprintln!("walk: {e}");
+            eprintln!("walk: walk {}: {e}", flags.path.display());
             ExitCode::Failure
         }
     }
@@ -167,14 +164,14 @@ fn run_walk_ref(start: &std::path::Path, git_ref: &str) -> ExitCode {
     let toplevel = match git_source::show_toplevel(start) {
         Ok(t) => t,
         Err(e) => {
-            eprintln!("walk: {e}");
+            eprintln!("walk: resolve toplevel {}: {e}", start.display());
             return ExitCode::Failure;
         }
     };
     let entries = match git_source::ls_tree(&toplevel, git_ref) {
         Ok(es) => es,
         Err(e) => {
-            eprintln!("walk: {e}");
+            eprintln!("walk: ls-tree {git_ref}: {e}");
             return ExitCode::Failure;
         }
     };
@@ -242,7 +239,7 @@ pub fn run_index(flags: &IndexFlags) -> ExitCode {
     let (artifacts, report) = match bundle(&flags.path, &opts) {
         Ok(t) => t,
         Err(e) => {
-            eprintln!("index: {e}");
+            eprintln!("index: bundle {}: {e}", flags.path.display());
             return ExitCode::Failure;
         }
     };
@@ -266,7 +263,6 @@ pub fn run_index(flags: &IndexFlags) -> ExitCode {
 
 /// Run the `diff` subcommand: compute the structural diff between two
 /// cached bundles. Auto-runs `index` for any ref that isn't already cached.
-#[must_use]
 pub fn run_diff(flags: &DiffFlags) -> ExitCode {
     let Some((ref_a, ref_b)) = flags.range.split_once("..") else {
         eprintln!("diff: expected `<ref-a>..<ref-b>`, got `{}`", flags.range);
@@ -316,14 +312,14 @@ pub fn run_diff(flags: &DiffFlags) -> ExitCode {
     let from_entities = match load_bundle_entities(&cache.bundle_dir(&from_sha)) {
         Ok(e) => e,
         Err(e) => {
-            eprintln!("diff: {e}");
+            eprintln!("diff: load bundle {ref_a}: {e}");
             return ExitCode::Failure;
         }
     };
     let to_entities = match load_bundle_entities(&cache.bundle_dir(&to_sha)) {
         Ok(e) => e,
         Err(e) => {
-            eprintln!("diff: {e}");
+            eprintln!("diff: load bundle {ref_b}: {e}");
             return ExitCode::Failure;
         }
     };
@@ -375,7 +371,6 @@ fn ensure_indexed(
 }
 
 /// Run the `gc` subcommand: evict old / oversized cache entries.
-#[must_use]
 pub fn run_gc(flags: &GcFlags) -> ExitCode {
     let max_size = match parse_size(&flags.max_size) {
         Ok(b) => b,
@@ -418,7 +413,7 @@ pub fn run_gc(flags: &GcFlags) -> ExitCode {
     let report = match cache.gc(&opts) {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("gc: {e}");
+            eprintln!("gc: collect {}: {e}", cache_root.display());
             return ExitCode::Failure;
         }
     };
@@ -441,7 +436,6 @@ pub fn run_gc(flags: &GcFlags) -> ExitCode {
 
 /// Run the artifact-bundle subcommand: parse → resolve → emit a directory
 /// of per-entity Mermaid + metadata files plus a top-level `index.json`.
-#[must_use]
 pub fn run_bundle(flags: &BundleFlags) -> ExitCode {
     if let Err(code) = check_ref_arg("bundle", flags.r#ref.as_deref()) {
         return code;
@@ -461,7 +455,7 @@ pub fn run_bundle(flags: &BundleFlags) -> ExitCode {
     let (artifacts, report) = match bundle(&flags.path, &opts) {
         Ok(t) => t,
         Err(e) => {
-            eprintln!("bundle: {e}");
+            eprintln!("bundle: bundle {}: {e}", flags.path.display());
             return ExitCode::Failure;
         }
     };
@@ -496,7 +490,6 @@ pub fn run_bundle(flags: &BundleFlags) -> ExitCode {
 ///   body to stdout or `--out <FILE>`.
 /// - All (`--all`, requires `--out <DIR>`): every Rust function in the
 ///   source tree is rendered into its own `<DIR>/<file>__<name>.mmd`.
-#[must_use]
 pub fn run_sequence(flags: &SequenceFlags) -> ExitCode {
     if !flags.all && flags.target.as_deref().is_none_or(|t| t.trim().is_empty()) {
         eprintln!("sequence: pass --target <NAME> or --all");
@@ -510,7 +503,7 @@ pub fn run_sequence(flags: &SequenceFlags) -> ExitCode {
     let candidates = match collect_rust_sources(&flags.path, &exclude, flags.r#ref.as_deref()) {
         Ok(v) => v,
         Err(e) => {
-            eprintln!("sequence: {e}");
+            eprintln!("sequence: collect sources {}: {e}", flags.path.display());
             return ExitCode::Failure;
         }
     };
@@ -557,7 +550,7 @@ fn run_sequence_single(
 
     let suffix = if let Some(path) = out {
         if let Err(e) = std::fs::write(path, &rendered) {
-            eprintln!("write {}: {e}", path.display());
+            eprintln!("sequence: write {}: {e}", path.display());
             return ExitCode::Failure;
         }
         format!(" → {}", path.display())
