@@ -1,7 +1,7 @@
 use super::check_ref_arg;
 use crate::cli::flags::{ExitCode, WalkFlags};
 use crate::cli::format::parse_csv_exclude;
-use crate::pipeline::walk_for_languages_with_exclude;
+use crate::pipeline::{language_for, walk_for_languages_with_exclude};
 
 /// Run the file-walker subcommand: print one line per source file, format
 /// `<lang>\t<path>`, to stdout.
@@ -30,7 +30,6 @@ pub fn run_walk(flags: &WalkFlags) -> ExitCode {
 
 fn run_walk_ref(start: &std::path::Path, git_ref: &str) -> ExitCode {
     use crate::git_source;
-    use crate::parser::Language;
 
     let toplevel = match git_source::show_toplevel(start) {
         Ok(t) => t,
@@ -47,13 +46,8 @@ fn run_walk_ref(start: &std::path::Path, git_ref: &str) -> ExitCode {
         }
     };
     for entry in entries {
-        let lang = match std::path::Path::new(&entry.path)
-            .extension()
-            .and_then(|e| e.to_str())
-        {
-            Some("rs") => Language::Rust,
-            Some("py") => Language::Python,
-            _ => continue,
+        let Some(lang) = language_for(std::path::Path::new(&entry.path)) else {
+            continue;
         };
         println!("{}\t{}", lang.name(), entry.path);
     }
