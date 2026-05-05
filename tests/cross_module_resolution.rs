@@ -593,8 +593,13 @@ fn reverse_call_paths_handles_high_fanin() {
     let (predecessors, reachable) = store.reverse_call_paths(&target, 3);
     let elapsed = started.elapsed();
 
+    // 5 s ceiling instead of 1 s: the legacy path-cloning BFS would not
+    // finish on this fixture under any timeout (it OOMs the runner). The
+    // predecessor-map rewrite finishes in low single-digit seconds even on
+    // the slowest GH Actions runner — we only need to assert "completes in
+    // bounded time", not "fast on dev hardware".
     assert!(
-        elapsed.as_secs_f64() < 1.0,
+        elapsed.as_secs_f64() < 5.0,
         "reverse_call_paths(F={f}, hops=3) took {elapsed:?}; legacy code OOMs here"
     );
 
