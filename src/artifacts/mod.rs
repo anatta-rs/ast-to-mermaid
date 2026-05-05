@@ -335,7 +335,14 @@ pub fn write_artifacts(
 /// Write `contents` to `path` only if the on-disk bytes differ. Returns
 /// `Ok(true)` if the file was (re)written, `Ok(false)` if it was identical
 /// and left alone.
+///
+/// Refuses to write if `path` already exists as a symlink — `fs::write`
+/// would otherwise follow the link and clobber whatever it points at,
+/// turning an attacker-controlled symlink in `--out` into an arbitrary
+/// file write. The cache path is safe via `write_bundle_atomic`; this
+/// guard covers the direct `--out` path.
 fn write_if_changed(path: &std::path::Path, contents: &[u8]) -> crate::error::Result<bool> {
+    refuse_symlink(path)?;
     if let Ok(existing) = std::fs::read(path)
         && existing == contents
     {
@@ -345,10 +352,31 @@ fn write_if_changed(path: &std::path::Path, contents: &[u8]) -> crate::error::Re
     Ok(true)
 }
 
+/// Reject writes that would follow a symlink at `path`.
+///
+/// `fs::symlink_metadata` does not traverse the final component, so a
+/// symlink (dangling or otherwise) is reported as `file_type().is_symlink()`.
+/// Missing files are fine (`NotFound` → `Ok(())`). Anything else is the
+/// underlying I/O error.
+fn refuse_symlink(path: &std::path::Path) -> crate::error::Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            Err(crate::error::AstToMermaidError::InvalidInput(format!(
+                "refusing to write through symlink: {}",
+                path.display()
+            )))
+        }
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e.into()),
+    }
+}
+
 /// Write `index.json`, preserving the on-disk `generated_at` when the rest
 /// of the document is structurally unchanged. Keeps the timestamp meaningful
 /// (= last data change) instead of "last invocation".
 fn write_index_json(path: &std::path::Path, new_value: &Value) -> crate::error::Result<()> {
+    refuse_symlink(path)?;
     if let Ok(existing_bytes) = std::fs::read(path)
         && let Ok(existing_value) = serde_json::from_slice::<Value>(&existing_bytes)
         && structurally_equal_modulo_generated_at(&existing_value, new_value)
@@ -991,5 +1019,41 @@ mod tests {
 
         assert!(!bar_mmd.exists(), "bar.mmd should be pruned");
         assert!(!bar_meta.exists(), "bar.meta.json should be pruned");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_artifacts_refuses_to_follow_symlink() {
+        // Plant a symlink at <out>/overview.mmd that points outside the
+        // tmpdir. A naive `fs::write` would follow the symlink and
+        // clobber the target — the guard must abort with InvalidInput
+        // instead.
+        let tmp = tempfile::tempdir().expect("tmp");
+        let target_dir = tempfile::tempdir().expect("target tmp");
+        let target = target_dir.path().join("victim.txt");
+        std::fs::write(&target, b"untouched").expect("write victim");
+
+        std::fs::create_dir_all(tmp.path()).expect("mkdir out");
+        std::os::unix::fs::symlink(&target, tmp.path().join("overview.mmd"))
+            .expect("plant symlink");
+
+        let store = Store::new();
+        store.add_atom(fn_atom(
+            "code:src/lib.rs::function::foo",
+            "src/lib.rs",
+            "foo",
+        ));
+        let artifacts = emit_artifacts(&store, "/src");
+        let err = write_artifacts(&artifacts, tmp.path(), false).expect_err("must refuse");
+        assert!(
+            err.to_string().contains("symlink"),
+            "expected symlink-refusal diagnostic, got: {err}"
+        );
+        // Victim must be untouched.
+        assert_eq!(
+            std::fs::read(&target).expect("read victim"),
+            b"untouched",
+            "symlink target was clobbered",
+        );
     }
 }

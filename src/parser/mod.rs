@@ -398,19 +398,27 @@ fn extract_item(
     language: Language,
     imports: &HashMap<String, String>,
 ) -> Option<(CodeAtom, Vec<String>)> {
-    let ts_kind = node.kind();
-    if !language.item_node_kinds().contains(&ts_kind) {
+    // Python decorators — unwrap inner definition iteratively. Tree-sitter
+    // can in principle hand us arbitrarily nested `decorated_definition`
+    // nodes (a malicious or pathological source — `@a` then `@b` etc.
+    // each producing another wrapper); the previous tail-call would blow
+    // the stack on adversarial input. The loop is bounded by the input
+    // tree depth and short-circuits the moment an inner definition is
+    // missing.
+    let mut node = *node;
+    if !language.item_node_kinds().contains(&node.kind()) {
         return None;
     }
-
-    // Python decorators — unwrap inner definition.
-    if ts_kind == "decorated_definition" {
-        let inner = node.child_by_field_name("definition")?;
-        return extract_item(&inner, source, file_path, language, imports);
+    while node.kind() == "decorated_definition" {
+        node = node.child_by_field_name("definition")?;
+        if !language.item_node_kinds().contains(&node.kind()) {
+            return None;
+        }
     }
+    let ts_kind = node.kind();
 
     let atom_kind = language.map_node_kind(ts_kind)?;
-    let item_name = extract_name(node, source, ts_kind)?;
+    let item_name = extract_name(&node, source, ts_kind)?;
 
     let item_text = node.utf8_text(source.as_bytes()).unwrap_or_default();
     let content_hash = format!("sha256:{}", hex_sha256(item_text.as_bytes()));
@@ -427,11 +435,11 @@ fn extract_item(
         .trim()
         .to_owned();
 
-    let doc = doc_for(language, node, source);
+    let doc = doc_for(language, &node, source);
 
     // Call names for functions.
     let extracted = if ts_kind == "function_item" || ts_kind == "function_definition" {
-        extract_calls(node, source, language, imports)
+        extract_calls(&node, source, language, imports)
     } else {
         ExtractedCalls::default()
     };
@@ -844,5 +852,44 @@ mod tests {
         let id = EntityId::new("code:cr.rs::function::cr_only");
         let atom = store.get_atom(&id).expect("function atom");
         assert!(atom.doc.contains("docline"), "doc={:?}", atom.doc);
+    }
+
+    #[test]
+    fn extract_item_decorator_unwraps_to_inner_function() {
+        // A Python `@deco`-prefixed top-level function. tree-sitter wraps
+        // it in `decorated_definition`; extract_item must unwrap that and
+        // surface the inner `function_definition`'s name + body.
+        let src = b"@deco\ndef wrapped():\n    pass\n";
+        let store = Store::new();
+        CodeParser::python()
+            .parse(src, "deco.py")
+            .expect("parse")
+            .apply_to(&store);
+        let id = EntityId::new("code:deco.py::function::wrapped");
+        let atom = store
+            .get_atom(&id)
+            .expect("decorated function should produce a function atom");
+        assert_eq!(atom.name, "wrapped");
+        assert_eq!(atom.kind, "function");
+    }
+
+    #[test]
+    fn extract_item_handles_stacked_decorators_iteratively() {
+        // Multiple stacked decorators on one definition. The wrapper is a
+        // single `decorated_definition` (tree-sitter's grammar collapses
+        // the chain), but the iterative unwrap must still terminate
+        // correctly and yield the inner def. This is the canonical
+        // shape that exercises the loop body.
+        let src = b"@deco_one\n@deco_two\n@deco_three\ndef triple():\n    pass\n";
+        let store = Store::new();
+        CodeParser::python()
+            .parse(src, "stacked.py")
+            .expect("parse")
+            .apply_to(&store);
+        let id = EntityId::new("code:stacked.py::function::triple");
+        assert!(
+            store.get_atom(&id).is_some(),
+            "stacked-decorator function must extract"
+        );
     }
 }

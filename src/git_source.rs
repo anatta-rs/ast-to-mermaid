@@ -63,6 +63,36 @@ pub fn validate_git_ref(s: &str) -> Result<&str> {
     Ok(s)
 }
 
+/// Validate `s` is a canonical 40-character lowercase ASCII hex SHA-1.
+///
+/// `git cat-file --batch` is a stdin-driven protocol: anything we write to
+/// git's stdin is interpreted as a fresh request line. A SHA that contains
+/// a `\n` (or any other byte git treats as a separator) would let a caller
+/// inject extra requests, desync the response stream, or hang the process.
+/// 40 lowercase hex is the canonical form `ls-tree` and `hash-object` emit,
+/// so anything else is a bug at the call site, not user input we have to
+/// be lenient about.
+///
+/// # Errors
+/// Returns `InvalidInput` when `s` is not exactly 40 chars, or when any
+/// char is outside `0-9a-f`.
+pub fn validate_blob_sha(s: &str) -> Result<&str> {
+    if s.len() != 40 {
+        return Err(AstToMermaidError::InvalidInput(format!(
+            "blob sha must be 40 hex chars, got {} chars: {s:?}",
+            s.len()
+        )));
+    }
+    for &b in s.as_bytes() {
+        if !matches!(b, b'0'..=b'9' | b'a'..=b'f') {
+            return Err(AstToMermaidError::InvalidInput(format!(
+                "blob sha contains non-hex byte 0x{b:02x}: {s:?}"
+            )));
+        }
+    }
+    Ok(s)
+}
+
 /// Resolve `git_ref` to a 40-char commit SHA via `git rev-parse --verify`.
 ///
 /// `git_ref` is validated by [`validate_git_ref`] before any subprocess is
@@ -233,21 +263,17 @@ impl BatchReader {
     /// # Errors
     /// Returns `InvalidInput` when the child fails to spawn.
     pub fn spawn(repo_root: &Path) -> Result<Self> {
-        let mut child = Command::new("git")
-            .arg("-C")
+        let mut cmd = Command::new("git");
+        cmd.arg("-C")
             .arg(repo_root)
             .args(["cat-file", "--batch"])
-            .env_remove("GIT_DIR")
-            .env_remove("GIT_INDEX_FILE")
-            .env_remove("GIT_WORK_TREE")
-            .env_remove("GIT_OBJECT_DIRECTORY")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|e| {
-                AstToMermaidError::InvalidInput(format!("git cat-file --batch spawn: {e}"))
-            })?;
+            .stderr(Stdio::piped());
+        strip_git_env(&mut cmd);
+        let mut child = cmd.spawn().map_err(|e| {
+            AstToMermaidError::InvalidInput(format!("git cat-file --batch spawn: {e}"))
+        })?;
         let stdin = child
             .stdin
             .take()
@@ -264,10 +290,18 @@ impl BatchReader {
 
     /// Read the blob at `blob_sha` from the persistent batch stream.
     ///
+    /// `blob_sha` must be exactly 40 lowercase ASCII hex characters — the
+    /// canonical SHA-1 form git emits. The check runs before any byte
+    /// reaches git's stdin, so a caller that smuggles a `\n` or any other
+    /// `--batch` control sequence into the SHA cannot desync the protocol
+    /// or inject extra requests.
+    ///
     /// # Errors
-    /// Returns `InvalidInput` when the blob is missing, the header is
-    /// malformed, or the child died unexpectedly.
+    /// Returns `InvalidInput` when `blob_sha` is not 40 lowercase hex chars,
+    /// when the blob is missing, when the header is malformed, or when the
+    /// child died unexpectedly.
     pub fn read_blob(&mut self, blob_sha: &str) -> Result<Vec<u8>> {
+        validate_blob_sha(blob_sha)?;
         // Ask for the next blob. `--buffer` requires an explicit flush.
         self.stdin
             .write_all(blob_sha.as_bytes())
@@ -334,24 +368,82 @@ impl Drop for BatchReader {
 }
 
 fn run_git(cwd: &Path, args: &[&str]) -> Result<std::process::Output> {
-    // Strip ambient `GIT_*` env vars before invoking the subprocess. They
-    // override `-C` / `current_dir` and would silently retarget our
-    // operations at whatever repository the caller was already inside —
-    // most painfully when `a2m` is invoked from a pre-commit hook
-    // running inside `git commit` (the parent operation exports
-    // `GIT_DIR`, `GIT_INDEX_FILE`, …) but also any other nested call.
-    Command::new("git")
-        .arg("-C")
+    let mut cmd = Command::new("git");
+    cmd.arg("-C")
         .arg(cwd)
         .args(args)
-        .env_remove("GIT_DIR")
-        .env_remove("GIT_INDEX_FILE")
-        .env_remove("GIT_WORK_TREE")
-        .env_remove("GIT_OBJECT_DIRECTORY")
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
+        .stderr(Stdio::piped());
+    strip_git_env(&mut cmd);
+    cmd.output()
         .map_err(|e| AstToMermaidError::InvalidInput(format!("git spawn ({args:?}): {e}")))
+}
+
+/// Strip ambient `GIT_*` env vars before invoking a git subprocess.
+///
+/// `GIT_DIR` / `GIT_INDEX_FILE` / `GIT_WORK_TREE` / `GIT_OBJECT_DIRECTORY`
+/// override `-C` / `current_dir` and would silently retarget operations
+/// at whatever repository the caller was already inside — most painfully
+/// when `a2m` runs from a pre-commit hook (the parent `git commit` exports
+/// these), but any nested invocation is at risk.
+///
+/// The other vars are about *how* git authenticates, configures itself,
+/// and resolves objects:
+///
+/// - `GIT_SSH_COMMAND` / `GIT_ASKPASS` / `SSH_ASKPASS` — credential helpers
+///   that could be made to spawn an attacker binary if a ref ever fed back
+///   into a fetch path.
+/// - `GIT_CONFIG`, `GIT_CONFIG_COUNT`, `GIT_CONFIG_PARAMETERS`,
+///   `GIT_CONFIG_GLOBAL`, `GIT_CONFIG_SYSTEM`, `GIT_CONFIG_NOSYSTEM`,
+///   plus the indexed `GIT_CONFIG_KEY_<n>` / `GIT_CONFIG_VALUE_<n>` pairs
+///   (enumerated by walking `std::env::vars_os` and matching the prefix
+///   since `Command::env_remove` doesn't take a wildcard) — these can
+///   inject arbitrary git config (`core.sshCommand`, `protocol.ext.allow`,
+///   …) into the child.
+/// - `GIT_ALTERNATE_OBJECT_DIRECTORIES` — extra object stores git will
+///   read from; an attacker who controls this can shadow blobs with their
+///   own content.
+fn strip_git_env(cmd: &mut Command) {
+    for var in [
+        "GIT_DIR",
+        "GIT_INDEX_FILE",
+        "GIT_WORK_TREE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_SSH_COMMAND",
+        "GIT_ASKPASS",
+        "SSH_ASKPASS",
+        "GIT_CONFIG",
+        "GIT_CONFIG_COUNT",
+        "GIT_CONFIG_PARAMETERS",
+        "GIT_CONFIG_GLOBAL",
+        "GIT_CONFIG_SYSTEM",
+        "GIT_CONFIG_NOSYSTEM",
+    ] {
+        cmd.env_remove(var);
+    }
+    // Wildcard-equivalent: the indexed `GIT_CONFIG_KEY_<n>` /
+    // `GIT_CONFIG_VALUE_<n>` pairs aren't enumerable by `env_remove`,
+    // so collect names from both the ambient process env and any vars
+    // the caller already set on the `Command`, and remove every match.
+    let is_config_pair = |name: &std::ffi::OsStr| {
+        let b = name.as_encoded_bytes();
+        b.starts_with(b"GIT_CONFIG_KEY_") || b.starts_with(b"GIT_CONFIG_VALUE_")
+    };
+    let mut to_remove: Vec<std::ffi::OsString> = Vec::new();
+    for (k, _) in std::env::vars_os() {
+        if is_config_pair(&k) {
+            to_remove.push(k);
+        }
+    }
+    for (k, _) in cmd.get_envs() {
+        if is_config_pair(k) {
+            to_remove.push(k.to_owned());
+        }
+    }
+    for k in &to_remove {
+        cmd.env_remove(k);
+    }
 }
 
 #[cfg(test)]
@@ -637,6 +729,128 @@ mod tests {
         // Stream is still usable: a real sha after a missing one must succeed.
         let content = reader.read_blob(&blob).unwrap();
         assert_eq!(content, b"fn x(){}\n");
+    }
+
+    #[test]
+    fn validate_blob_sha_accepts_canonical_form() {
+        assert!(validate_blob_sha("0000000000000000000000000000000000000000").is_ok());
+        assert!(validate_blob_sha("abcdef0123456789abcdef0123456789abcdef01").is_ok());
+    }
+
+    #[test]
+    fn validate_blob_sha_rejects_wrong_length() {
+        assert!(validate_blob_sha("").is_err());
+        assert!(validate_blob_sha("abc").is_err());
+        assert!(validate_blob_sha(&"a".repeat(39)).is_err());
+        assert!(validate_blob_sha(&"a".repeat(41)).is_err());
+    }
+
+    #[test]
+    fn validate_blob_sha_rejects_non_hex() {
+        // Uppercase is rejected (git emits lowercase) and so is anything outside 0-9a-f.
+        assert!(validate_blob_sha(&"A".repeat(40)).is_err());
+        assert!(validate_blob_sha(&"g".repeat(40)).is_err());
+        // Embedded newline — the protocol-injection vector this guard exists for.
+        let mut s = "a".repeat(39);
+        s.push('\n');
+        assert!(validate_blob_sha(&s).is_err());
+    }
+
+    #[test]
+    fn batch_reader_read_blob_rejects_non_hex_before_write() {
+        // The reader must refuse a malformed sha *before* writing to git's
+        // stdin: anything we send becomes a fresh request line, so a sha
+        // containing `\n` would let a caller inject extra requests and
+        // desync the response stream.
+        let tmp = tempdir().unwrap();
+        let (blob, _) = init_repo(tmp.path(), "f.rs", "fn x(){}\n");
+        let mut reader = BatchReader::spawn(tmp.path()).unwrap();
+        let err = reader.read_blob("not-hex").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("blob sha"),
+            "expected blob-sha rejection, got: {msg}"
+        );
+        // After rejection, the stream must still be usable for a real read.
+        let content = reader.read_blob(&blob).unwrap();
+        assert_eq!(content, b"fn x(){}\n");
+    }
+
+    #[test]
+    fn batch_reader_read_blob_rejects_newline_injection() {
+        // SHA followed by `\n<another sha>` would have been two requests;
+        // validation must catch the newline before any byte hits stdin.
+        let tmp = tempdir().unwrap();
+        let (blob, _) = init_repo(tmp.path(), "f.rs", "fn x(){}\n");
+        let mut reader = BatchReader::spawn(tmp.path()).unwrap();
+        let payload = format!("{blob}\n{blob}");
+        let err = reader.read_blob(&payload).unwrap_err();
+        assert!(
+            err.to_string().contains("blob sha"),
+            "expected rejection on newline-bearing sha, got: {err}"
+        );
+        // Stream still functional for the canonical sha.
+        let got = reader.read_blob(&blob).unwrap();
+        assert_eq!(got, b"fn x(){}\n");
+    }
+
+    #[test]
+    fn strip_git_env_removes_known_git_vars() {
+        // Drive `Command` through `strip_git_env` and observe the resulting
+        // child process's environment. We pipe through `/usr/bin/env` (or
+        // the closest moral equivalent on this platform) and check that the
+        // sensitive `GIT_*` vars set by the parent never make it across.
+        let mut cmd = Command::new("/usr/bin/env");
+        // Inject every var the strip helper is supposed to remove. We set
+        // them via `Command::env` rather than the process env so the test
+        // can't poison sibling tests running in parallel.
+        for (k, v) in [
+            ("GIT_DIR", "/tmp/leak-git-dir"),
+            ("GIT_INDEX_FILE", "/tmp/leak-git-index"),
+            ("GIT_WORK_TREE", "/tmp/leak-git-worktree"),
+            ("GIT_OBJECT_DIRECTORY", "/tmp/leak-git-objects"),
+            ("GIT_ALTERNATE_OBJECT_DIRECTORIES", "/tmp/leak-git-alt"),
+            ("GIT_SSH_COMMAND", "/tmp/leak-ssh-evil"),
+            ("GIT_ASKPASS", "/tmp/leak-askpass"),
+            ("SSH_ASKPASS", "/tmp/leak-ssh-askpass"),
+            ("GIT_CONFIG", "/tmp/leak-git-config"),
+            ("GIT_CONFIG_COUNT", "1"),
+            ("GIT_CONFIG_KEY_0", "core.sshCommand"),
+            ("GIT_CONFIG_VALUE_0", "/tmp/leak-key-value"),
+            ("GIT_CONFIG_PARAMETERS", "leak-config-params"),
+            ("GIT_CONFIG_GLOBAL", "/tmp/leak-config-global"),
+            ("GIT_CONFIG_SYSTEM", "/tmp/leak-config-system"),
+            ("GIT_CONFIG_NOSYSTEM", "1"),
+        ] {
+            cmd.env(k, v);
+        }
+        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+        strip_git_env(&mut cmd);
+        let Ok(out) = cmd.output() else {
+            // /usr/bin/env may be missing — best-effort test.
+            return;
+        };
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        for marker in [
+            "leak-git-dir",
+            "leak-git-index",
+            "leak-git-worktree",
+            "leak-git-objects",
+            "leak-git-alt",
+            "leak-ssh-evil",
+            "leak-askpass",
+            "leak-ssh-askpass",
+            "leak-git-config",
+            "leak-key-value",
+            "leak-config-params",
+            "leak-config-global",
+            "leak-config-system",
+        ] {
+            assert!(
+                !stdout.contains(marker),
+                "marker {marker:?} survived strip_git_env; child env was:\n{stdout}",
+            );
+        }
     }
 
     #[test]
