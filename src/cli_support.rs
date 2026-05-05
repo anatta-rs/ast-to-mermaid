@@ -5,7 +5,7 @@
 //! a thin clap parser.
 
 use crate::artifacts::write_artifacts;
-use crate::cache::{Cache, GcOptions, atomic_rename};
+use crate::cache::{Cache, GcOptions, write_bundle_atomic};
 use crate::diff::{compute_diff, load_bundle_entities, render_mermaid};
 use crate::pipeline::{
     AnalyzeOptions, analyze, bundle, snapshot_id, walk_for_languages_with_exclude,
@@ -562,38 +562,6 @@ fn ensure_indexed(
     let (artifacts, _report) = bundle(path, &opts)?;
     write_bundle_atomic(&artifacts, &cache.bundle_dir(&sha))?;
     Ok(sha)
-}
-
-/// Write a bundle to its final location via tempdir + atomic rename so
-/// concurrent runs on the same ref never see a partial bundle. If `final_dir`
-/// already exists, it's wiped first (caller checked `has_bundle` if it cared
-/// about idempotence).
-fn write_bundle_atomic(
-    artifacts: &crate::artifacts::ArtifactSet,
-    final_dir: &Path,
-) -> Result<(), crate::error::AstToMermaidError> {
-    let parent = final_dir.parent().ok_or_else(|| {
-        crate::error::AstToMermaidError::InvalidInput(format!(
-            "bundle final dir has no parent: {}",
-            final_dir.display()
-        ))
-    })?;
-    std::fs::create_dir_all(parent)?;
-    let pid = std::process::id();
-    let stem = final_dir
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("bundle");
-    let tmp_dir = parent.join(format!(".{stem}.tmp.{pid}"));
-    if tmp_dir.exists() {
-        std::fs::remove_dir_all(&tmp_dir)?;
-    }
-    write_artifacts(artifacts, &tmp_dir)?;
-    if final_dir.exists() {
-        std::fs::remove_dir_all(final_dir)?;
-    }
-    atomic_rename(&tmp_dir, final_dir)?;
-    Ok(())
 }
 
 /// CLI args for the `gc` subcommand.
