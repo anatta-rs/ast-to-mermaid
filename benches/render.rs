@@ -1,0 +1,65 @@
+//! Benchmarks for the project-level renderer.
+//!
+//! Builds a synthetic 10k-function fixture spread across several crates and
+//! measures `render::project::render` end-to-end. Before C2 the loop was
+//! O(F·E); after C2 it's O(F·avg_degree) thanks to forward adjacency. The
+//! acceptance criterion in issue #67 is ≥10× speedup on this fixture.
+
+use ast_to_mermaid::graph::Store;
+use ast_to_mermaid::model::{CodeAtom, Edge, EdgeKind, EntityId};
+use ast_to_mermaid::{Level, render};
+use criterion::{Criterion, black_box, criterion_group, criterion_main};
+
+const FUNCTIONS: usize = 10_000;
+const CRATES: usize = 10;
+const CALLS_PER_FN: usize = 5;
+
+fn fn_atom(file_path: &str, name: &str) -> CodeAtom {
+    CodeAtom {
+        id: EntityId::new(format!("code:{file_path}::function::{name}")),
+        kind: "function".to_owned(),
+        name: name.to_owned(),
+        file_path: file_path.to_owned(),
+        line_start: 1,
+        line_end: 10,
+        doc: String::new(),
+        signature: String::new(),
+        content_hash: "h".to_owned(),
+        calls: Vec::new(),
+        method_calls: Vec::new(),
+        parent: None,
+    }
+}
+
+fn build_store() -> Store {
+    let store = Store::new();
+    let mut ids: Vec<EntityId> = Vec::with_capacity(FUNCTIONS);
+    for i in 0..FUNCTIONS {
+        let crate_idx = i % CRATES;
+        let file_path = format!("crates/c{crate_idx}/src/lib.rs");
+        let atom = fn_atom(&file_path, &format!("f{i}"));
+        ids.push(atom.id.clone());
+        store.add_atom(atom);
+    }
+    // Spread edges deterministically. Multiplicative-hash target index so
+    // most calls land in *other* crates.
+    for (i, from) in ids.iter().enumerate() {
+        for k in 0..CALLS_PER_FN {
+            let target = i.wrapping_mul(2_654_435_761).wrapping_add(k) % FUNCTIONS;
+            store.add_edge(Edge::new(from.clone(), ids[target].clone(), EdgeKind::Calls));
+        }
+    }
+    store
+}
+
+fn bench_project(c: &mut Criterion) {
+    let store = build_store();
+    c.bench_function("project", |b| {
+        b.iter(|| {
+            black_box(render(Level::Project, black_box(&store), None).expect("render"));
+        });
+    });
+}
+
+criterion_group!(benches, bench_project);
+criterion_main!(benches);
