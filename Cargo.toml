@@ -38,10 +38,15 @@ tempfile = "3"
 
 [dev-dependencies]
 pretty_assertions = "1"
+criterion = "0.5"
 
 [[bin]]
 name = "a2m"
 path = "src/bin/a2m.rs"
+
+[[bench]]
+name = "store"
+harness = false
 
 [lints.rust]
 unsafe_code = "deny"
