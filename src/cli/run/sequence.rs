@@ -111,11 +111,11 @@ fn run_sequence_all(candidates: &[(String, Vec<u8>)], out: Option<&Path>) -> Exi
         return ExitCode::Failure;
     }
 
-    // Pass 1: parse each file exactly once, enumerate functions on the
-    // resulting tree, then `extract_all` to collect every diagram in a
-    // single AST traversal. Pre-v0.6.0 this re-parsed each file 1+N
-    // times (once for `list_functions`, once per function for `extract`).
-    let mut entries: Vec<(String, String, String, sequence::SequenceDiagram)> = Vec::new();
+    // Parse each file exactly once, enumerate functions on the resulting
+    // tree, then `extract_all` to collect every diagram in a single AST
+    // traversal. Pre-v0.6.0 this re-parsed each file 1+N times (once for
+    // `list_functions`, once per function for `extract`).
+    let mut written = 0usize;
     let mut skipped = 0usize;
     for (file_rel, content) in candidates {
         let text = match std::str::from_utf8(content) {
@@ -146,46 +146,15 @@ fn run_sequence_all(candidates: &[(String, Vec<u8>)], out: Option<&Path>) -> Exi
                 skipped += 1;
                 continue;
             }
-            let base = sequence_filename(file_rel, &name);
-            entries.push((file_rel.clone(), name, base, diagram));
+            let final_name = build_sequence_path(file_rel, &name);
+            let target_path = out_dir.join(&final_name);
+            let rendered = sequence::render(&diagram);
+            if let Err(e) = std::fs::write(&target_path, rendered) {
+                eprintln!("sequence: write {}: {e}", target_path.display());
+                return ExitCode::Failure;
+            }
+            written += 1;
         }
-    }
-
-    // Detect pre-collisions on case-insensitive filesystems (macOS APFS
-    // default, Windows NTFS) before any file is written.
-    let mut lower_counts: std::collections::HashMap<String, usize> =
-        std::collections::HashMap::new();
-    for (_, _, base, _) in &entries {
-        *lower_counts.entry(base.to_ascii_lowercase()).or_insert(0) += 1;
-    }
-
-    // Pass 2: render + write. Bases that case-fold to the same lowercase
-    // as another candidate get a `_H<hash>` suffix from
-    // [`crate::artifacts::hash_disambig`] so all members survive on disk.
-    let mut written = 0usize;
-    for (file_rel, name, base, diagram) in &entries {
-        let collides = lower_counts
-            .get(&base.to_ascii_lowercase())
-            .copied()
-            .unwrap_or(0)
-            > 1;
-        let final_name = if collides {
-            let stem = base.strip_suffix(".mmd").unwrap_or(base);
-            let key = format!("{file_rel}::{name}");
-            format!(
-                "{stem}_H{hash}.mmd",
-                hash = crate::artifacts::hash_disambig(&key)
-            )
-        } else {
-            base.clone()
-        };
-        let target_path = out_dir.join(&final_name);
-        let rendered = sequence::render(diagram);
-        if let Err(e) = std::fs::write(&target_path, rendered) {
-            eprintln!("sequence: write {}: {e}", target_path.display());
-            return ExitCode::Failure;
-        }
-        written += 1;
     }
     eprintln!(
         "sequence --all: {written} diagrams written to {} ({skipped} skipped: empty / parse fail)",
@@ -194,33 +163,15 @@ fn run_sequence_all(candidates: &[(String, Vec<u8>)], out: Option<&Path>) -> Exi
     ExitCode::Success
 }
 
-/// Build a collision-resistant filename from `(file_rel, qualified_name)`:
-/// `cli_support__run_diff.mmd`, `cache__Cache__open.mmd`, etc.
-fn sequence_filename(file_rel: &str, qualified_name: &str) -> String {
-    let stem = Path::new(file_rel)
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("file");
-    let parent = Path::new(file_rel)
-        .parent()
-        .and_then(|p| p.to_str())
-        .unwrap_or("");
-    let prefix = if parent.is_empty() {
-        stem.to_owned()
-    } else {
-        format!("{}_{stem}", parent.replace(['/', '\\'], "_"))
-    };
-    let safe_name: String = qualified_name
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '_' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    format!("{prefix}__{safe_name}.mmd")
+/// Build the on-disk filename for a `(file_rel, qualified_name)` sequence
+/// diagram by funneling through the canonical [`crate::artifacts::filename_id`].
+/// That helper handles the alphanumeric+`._-` allow-list and applies a
+/// `_H<hash>` suffix when the input has uppercase bytes, so case-only
+/// siblings (`Foo`/`foo`/`FOO`) map to distinct files on case-insensitive
+/// filesystems without any caller-side collision detection.
+fn build_sequence_path(file_rel: &str, qualified_name: &str) -> String {
+    let key = format!("{file_rel}::{qualified_name}");
+    format!("{}.mmd", crate::artifacts::filename_id(&key))
 }
 
 /// Collect `(display_path, content)` pairs for every Rust source file under
@@ -373,8 +324,11 @@ mod tests {
             entries.iter().any(|n| n.ends_with("__a.mmd")),
             "got: {entries:?}"
         );
+        // `S::m` is qualified — `filename_id` lowercases the whole id when
+        // any byte is uppercase and appends `_H<hash>`, so the on-disk
+        // marker is `s__m_H` (not `S__m`).
         assert!(
-            entries.iter().any(|n| n.contains("S__m")),
+            entries.iter().any(|n| n.contains("s__m_H")),
             "got: {entries:?}"
         );
         // Empty function `b` must NOT produce a file.
@@ -434,14 +388,41 @@ mod tests {
     }
 
     #[test]
-    fn sequence_filename_qualifies_methods() {
-        let f = sequence_filename("src/cache.rs", "Cache::open");
+    fn build_sequence_path_funnels_through_filename_id() {
+        // `Cache::open` has uppercase, so the canonical `filename_id`
+        // lowercases the whole id and appends `_H<hash>` — caller no
+        // longer hand-rolls a sanitizer.
+        let f = build_sequence_path("src/cache.rs", "Cache::open");
+        let expected = format!(
+            "{}.mmd",
+            crate::artifacts::filename_id("src/cache.rs::Cache::open")
+        );
+        assert_eq!(f, expected);
         assert!(f.contains("cache"), "got: {f}");
-        assert!(f.contains("Cache__open"), "got: {f}");
+        assert!(f.contains("__cache__open_H"), "got: {f}");
         assert!(
             Path::new(&f)
                 .extension()
                 .is_some_and(|e| e.eq_ignore_ascii_case("mmd"))
         );
+    }
+
+    #[test]
+    fn build_sequence_path_disambiguates_case_collisions() {
+        // `Foo`/`foo`/`FOO` would clobber each other on case-insensitive
+        // filesystems, but `filename_id`'s `_H<hash>` suffix on
+        // any-uppercase ids gives all three distinct on-disk names.
+        let foo_upper = build_sequence_path("lib.rs", "Foo");
+        let foo_lower = build_sequence_path("lib.rs", "foo");
+        let foo_screaming = build_sequence_path("lib.rs", "FOO");
+        let mut names = [&foo_upper, &foo_lower, &foo_screaming];
+        names.sort();
+        assert_ne!(names[0], names[1], "got: {names:?}");
+        assert_ne!(names[1], names[2], "got: {names:?}");
+        // And after case-folding (the actual case-insensitive-FS check).
+        let mut lowered: Vec<String> = names.iter().map(|n| n.to_ascii_lowercase()).collect();
+        lowered.sort();
+        lowered.dedup();
+        assert_eq!(lowered.len(), 3, "case-fold collision: {lowered:?}");
     }
 }
