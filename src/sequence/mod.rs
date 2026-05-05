@@ -84,6 +84,11 @@ pub enum Step {
         label: String,
         /// Steps inside the loop body.
         body: Vec<Step>,
+        /// Cached at extract time: `true` when `body` contains at least
+        /// one renderable step (recursively). The renderer skips empty
+        /// loops; this avoids the O(N²) re-walk of the body per nested
+        /// `Loop`/`Alt`.
+        has_visible: bool,
     },
     /// `alt … else … end` block (if / match).
     Alt {
@@ -93,7 +98,31 @@ pub enum Step {
         then: Vec<Step>,
         /// Optional `else` branch — if `None`, no `else` clause is emitted.
         else_: Option<Vec<Step>>,
+        /// Cached at extract time: `true` when `then` contains a
+        /// renderable step.
+        then_has_visible: bool,
+        /// Cached at extract time: `true` when `else_` is `Some` and
+        /// contains a renderable step.
+        else_has_visible: bool,
     },
+}
+
+impl Step {
+    /// `true` when this step would render at least one line. `Call` and
+    /// `Note` are always visible; `Loop`/`Alt` defer to the cached flag
+    /// computed at extract time.
+    #[must_use]
+    pub fn has_visible(&self) -> bool {
+        match self {
+            Step::Call { .. } | Step::Note { .. } => true,
+            Step::Loop { has_visible, .. } => *has_visible,
+            Step::Alt {
+                then_has_visible,
+                else_has_visible,
+                ..
+            } => *then_has_visible || *else_has_visible,
+        }
+    }
 }
 
 /// Synthetic participant id for the function-under-analysis itself.
@@ -133,12 +162,17 @@ pub fn parse_source_once(content: &[u8], file_path: &str) -> Result<Tree> {
 /// Names that don't resolve are simply absent from the map — no error.
 /// `tree` must come from [`parse_source_once`] over `source`'s bytes;
 /// behaviour is undefined if it doesn't.
+///
+/// Performance: walks `tree` once, building a `qualified-name → function-
+/// node` map, then resolves each target via O(1) lookup — replacing the
+/// prior O(M·N) per-target tree re-walk.
 #[must_use]
 pub fn extract_all(tree: &Tree, source: &str, targets: &[&str]) -> SequenceMap {
     let root = tree.root_node();
+    let fn_index = build_fn_index(root, source);
     let mut out = SequenceMap::with_capacity(targets.len());
     for &target in targets {
-        let Some((fn_node, container)) = find_target(root, source, target) else {
+        let Some((fn_node, container)) = fn_index.get(target).cloned() else {
             continue;
         };
         let title = signature(&fn_node, source).map_or_else(|| target.to_owned(), str::to_owned);
@@ -155,6 +189,51 @@ pub fn extract_all(tree: &Tree, source: &str, targets: &[&str]) -> SequenceMap {
                 steps,
             },
         );
+    }
+    out
+}
+
+/// Build a `qualified-name → (function_item node, container)` index for
+/// every `function_item` reachable from `root`, in a single DFS pass.
+///
+/// First-occurrence wins, matching the prior single-target search. Each
+/// function is keyed on its bare `name`, and additionally on
+/// `Owner::name` when nested inside an `impl Owner` block. The returned
+/// `Node`s borrow from `tree` via `'tree` so callers can dispatch the
+/// body walk without re-finding.
+fn build_fn_index<'tree>(
+    root: Node<'tree>,
+    source: &str,
+) -> HashMap<String, (Node<'tree>, Option<String>)> {
+    let mut out: HashMap<String, (Node<'tree>, Option<String>)> = HashMap::new();
+    let mut stack: Vec<(Node<'tree>, Option<String>)> = vec![(root, None)];
+    while let Some((node, container)) = stack.pop() {
+        if node.kind() == "function_item"
+            && let Some(name_node) = node.child_by_field_name("name")
+            && let Ok(name) = name_node.utf8_text(source.as_bytes())
+        {
+            // Free function: key on `name`. Method inside `impl Owner`:
+            // also insert `Owner::name`. Both forms are accepted by
+            // [`extract`] and must resolve to the same node.
+            out.entry(name.to_owned())
+                .or_insert_with(|| (node, container.clone()));
+            if let Some(ref c) = container {
+                out.entry(format!("{c}::{name}"))
+                    .or_insert_with(|| (node, container.clone()));
+            }
+        }
+        let next_container = if node.kind() == "impl_item" {
+            node.child_by_field_name("type")
+                .and_then(|n| n.utf8_text(source.as_bytes()).ok())
+                .map(str::to_owned)
+                .or_else(|| container.clone())
+        } else {
+            container.clone()
+        };
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            stack.push((child, next_container.clone()));
+        }
     }
     out
 }
@@ -242,47 +321,6 @@ pub fn list_functions_in_tree(tree: &Tree, source: &str) -> Vec<String> {
         }
     }
     out
-}
-
-/// Locate `target_fn` in the file. Returns `(function_item node, optional
-/// container_name)` where container is the impl-owner type (e.g. `Foo` for
-/// methods of `impl Foo`) or `None` for free functions.
-fn find_target<'tree>(
-    root: Node<'tree>,
-    source: &str,
-    target_fn: &str,
-) -> Option<(Node<'tree>, Option<String>)> {
-    // Support `Type::method` form by splitting on the first `::`.
-    let (qualifier, bare) = target_fn
-        .split_once("::")
-        .map_or((None, target_fn), |(q, b)| (Some(q), b));
-
-    let mut stack: Vec<(Node<'tree>, Option<String>)> = vec![(root, None)];
-    while let Some((node, container)) = stack.pop() {
-        if node.kind() == "function_item"
-            && let Some(name_node) = node.child_by_field_name("name")
-            && let Ok(name) = name_node.utf8_text(source.as_bytes())
-            && name == bare
-            && qualifier.is_none_or(|q| container.as_deref() == Some(q))
-        {
-            return Some((node, container));
-        }
-        let next_container = if node.kind() == "impl_item" {
-            // The receiver type for `impl Trait for Foo` is `Foo`; for
-            // inherent `impl Foo` it's `Foo` too.
-            node.child_by_field_name("type")
-                .and_then(|n| n.utf8_text(source.as_bytes()).ok())
-                .map(str::to_owned)
-                .or(container)
-        } else {
-            container.clone()
-        };
-        let mut cursor = node.walk();
-        for child in node.children(&mut cursor) {
-            stack.push((child, next_container.clone()));
-        }
-    }
-    None
 }
 
 /// First non-brace line of the function text, used as the diagram title.

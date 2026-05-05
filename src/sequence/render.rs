@@ -5,6 +5,29 @@ use super::{Participant, SELF_ID, SequenceDiagram, Step};
 use crate::limits::max_ast_depth;
 use crate::render::util::escape_label_sequence;
 use std::fmt::Write;
+use std::sync::OnceLock;
+
+/// Indent strings memoised by depth, to spare the renderer a fresh
+/// `String::repeat` allocation per step. Capped at the configured
+/// [`max_ast_depth`]; deeper requests fall through to a one-shot
+/// allocation (off the hot path — `write_step` short-circuits at the
+/// same cap with a `…depth limit…` note before recursing further).
+fn indent(depth: usize) -> &'static str {
+    static TABLE: OnceLock<Vec<&'static str>> = OnceLock::new();
+    let table = TABLE.get_or_init(|| {
+        let cap = max_ast_depth() + 1;
+        let mut v = Vec::with_capacity(cap);
+        for d in 0..cap {
+            // Box::leak gives us a `&'static str` that lives for the
+            // process lifetime. Bounded allocation: at most `cap`
+            // entries (≤ 257 by default), so the leak is one-time.
+            let s: Box<str> = "    ".repeat(d).into_boxed_str();
+            v.push(Box::leak(s) as &'static str);
+        }
+        v
+    });
+    table.get(depth).copied().unwrap_or("")
+}
 
 /// Render a [`SequenceDiagram`] as Mermaid `sequenceDiagram` source.
 ///
@@ -13,6 +36,9 @@ use std::fmt::Write;
 /// `->>` arrows for calls. `.await` shows on the arrow label as ` (await)`.
 #[must_use]
 pub fn render(diagram: &SequenceDiagram) -> String {
+    // Resolve the depth cap once per render so the recursive
+    // `write_step` doesn't re-read `A2M_MAX_AST_DEPTH` per call.
+    let max_depth = max_ast_depth();
     let mut out = String::new();
     out.push_str("sequenceDiagram\n");
     let _ = writeln!(out, "    autonumber");
@@ -23,7 +49,7 @@ pub fn render(diagram: &SequenceDiagram) -> String {
         write_participant(&mut out, p);
     }
     for step in &diagram.steps {
-        write_step(&mut out, step, 1);
+        write_step(&mut out, step, 1, max_depth);
     }
     out
 }
@@ -33,16 +59,16 @@ fn write_participant(out: &mut String, p: &Participant) {
     let _ = writeln!(out, "    participant {} as {}", p.id, label);
 }
 
-fn write_step(out: &mut String, step: &Step, depth: usize) {
-    let indent = "    ".repeat(depth);
-    if depth >= max_ast_depth() {
+fn write_step(out: &mut String, step: &Step, depth: usize, max_depth: usize) {
+    let indent = indent(depth);
+    if depth >= max_depth {
         // Adversarial / pathologically nested IR (e.g. a degenerate
         // diff that produced thousands of nested alt blocks): emit a
         // visible `…depth limit…` note and stop recursing instead of
         // blowing the renderer's call stack.
         tracing::warn!(
             depth,
-            limit = max_ast_depth(),
+            limit = max_depth,
             "ast depth limit hit in sequence renderer",
         );
         let _ = writeln!(
@@ -80,54 +106,49 @@ fn write_step(out: &mut String, step: &Step, depth: usize) {
                 escape_label_sequence(text)
             );
         }
-        Step::Loop { label, body } => {
+        Step::Loop {
+            label,
+            body,
+            has_visible,
+        } => {
             // Mermaid renders `loop X\nend` (empty body) as a tiny stub
             // that overlaps neighbour blocks. Drop empties — the
             // condition is captured by the source code already.
-            if !has_visible_steps(body) {
+            // `has_visible` is computed at extract time so this is O(1).
+            if !*has_visible {
                 return;
             }
             let _ = writeln!(out, "{indent}loop {}", escape_label_sequence(label));
             for s in body {
-                write_step(out, s, depth + 1);
+                write_step(out, s, depth + 1, max_depth);
             }
             let _ = writeln!(out, "{indent}end");
         }
-        Step::Alt { cond, then, else_ } => {
-            let then_visible = has_visible_steps(then);
-            let else_visible = else_.as_deref().is_some_and(has_visible_steps);
-            if !then_visible && !else_visible {
+        Step::Alt {
+            cond,
+            then,
+            else_,
+            then_has_visible,
+            else_has_visible,
+        } => {
+            if !*then_has_visible && !*else_has_visible {
                 return;
             }
             let _ = writeln!(out, "{indent}alt {}", escape_label_sequence(cond));
             for s in then {
-                write_step(out, s, depth + 1);
+                write_step(out, s, depth + 1, max_depth);
             }
             if let Some(else_steps) = else_
-                && else_visible
+                && *else_has_visible
             {
                 let _ = writeln!(out, "{indent}else");
                 for s in else_steps {
-                    write_step(out, s, depth + 1);
+                    write_step(out, s, depth + 1, max_depth);
                 }
             }
             let _ = writeln!(out, "{indent}end");
         }
     }
-}
-
-/// `true` if the step list contains at least one visible step (i.e. a
-/// `Call`/`Note` or a non-empty nested control block). Used to skip
-/// empty `loop` / `alt` wrappers that would otherwise render as a
-/// useless header + closing `end`.
-fn has_visible_steps(steps: &[Step]) -> bool {
-    steps.iter().any(|s| match s {
-        Step::Call { .. } | Step::Note { .. } => true,
-        Step::Loop { body, .. } => has_visible_steps(body),
-        Step::Alt { then, else_, .. } => {
-            has_visible_steps(then) || else_.as_deref().is_some_and(has_visible_steps)
-        }
-    })
 }
 
 fn strip_newlines(s: &str) -> String {
@@ -193,6 +214,7 @@ mod tests {
                 label: "open".into(),
                 is_await: false,
             }],
+            has_visible: true,
         }];
         let s = render(&d);
         assert!(s.contains("loop for x in xs"));
@@ -217,6 +239,8 @@ mod tests {
                 label: "no".into(),
                 is_await: false,
             }]),
+            then_has_visible: true,
+            else_has_visible: true,
         }];
         let s = render(&d);
         assert!(s.contains("alt if cond"));
@@ -267,6 +291,8 @@ mod tests {
                 is_await: false,
             }],
             else_: None,
+            then_has_visible: true,
+            else_has_visible: false,
         }];
         let s = render(&d);
         assert!(!s.contains("<= cap"), "raw `<` leaked:\n{s}");
@@ -279,6 +305,7 @@ mod tests {
         d.steps = vec![Step::Loop {
             label: "for x in xs".into(),
             body: vec![],
+            has_visible: false,
         }];
         let s = render(&d);
         assert!(!s.contains("loop for x in xs"), "empty loop leaked:\n{s}");
@@ -292,6 +319,8 @@ mod tests {
             cond: "if cond".into(),
             then: vec![],
             else_: Some(vec![]),
+            then_has_visible: false,
+            else_has_visible: false,
         }];
         let s = render(&d);
         assert!(!s.contains("alt if cond"), "empty alt leaked:\n{s}");
@@ -312,6 +341,8 @@ mod tests {
                 is_await: false,
             }],
             else_: Some(vec![]),
+            then_has_visible: true,
+            else_has_visible: false,
         }];
         let s = render(&d);
         assert!(s.contains("alt if cond"), "{s}");
