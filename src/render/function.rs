@@ -4,33 +4,37 @@
 //! callees (outgoing).
 
 use crate::error::Result;
-use crate::graph::Store;
 use crate::model::EntityId;
 use crate::render::AdjMaps;
 use crate::render::lookup::resolve_function;
+use crate::render::snapshot::AtomSnapshot;
 use crate::render::util::{escape_label_flowchart, sanitize_id};
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
-/// Render the function-zoom view of `target` against `store`.
+/// Render the function-zoom view of `target` against `snapshot`.
 ///
 /// `adj` supplies the shared forward + reverse `Calls` adjacency — the only
 /// graph data this view needs once `resolve_function` has located the
 /// center.
 ///
+/// `snapshot` is the borrowed `id → &CodeAtom` view: each direct caller /
+/// callee lookup is an O(1) `HashMap` probe with no `RwLock` traffic and
+/// no [`crate::model::CodeAtom`] clones.
+///
 /// # Errors
 ///
 /// Same as [`crate::render::lookup::resolve_function`].
-pub fn render(store: &Store, adj: &AdjMaps, target: &str) -> Result<String> {
-    let center_id = resolve_function(store, target)?;
-    let center_atom = store
-        .get_atom(&center_id)
+pub fn render(adj: &AdjMaps, snapshot: &AtomSnapshot<'_>, target: &str) -> Result<String> {
+    let center_id = resolve_function(snapshot, target)?;
+    let center_atom = snapshot
+        .get(&center_id)
         .expect("resolve_function vouched the id exists");
 
     let mut who_calls: BTreeMap<String, String> = BTreeMap::new(); // id → name
     for caller_arc in adj.callers(&center_id) {
         let caller_id: &EntityId = caller_arc;
-        if let Some(atom) = store.get_atom(caller_id) {
+        if let Some(atom) = snapshot.get(caller_id) {
             who_calls.insert(caller_id.as_str().to_owned(), atom.name.clone());
         }
     }
@@ -38,7 +42,7 @@ pub fn render(store: &Store, adj: &AdjMaps, target: &str) -> Result<String> {
     let mut whom_called: BTreeMap<String, String> = BTreeMap::new(); // id → name
     for callee_arc in adj.callees(&center_id) {
         let callee_id: &EntityId = callee_arc;
-        if let Some(atom) = store.get_atom(callee_id) {
+        if let Some(atom) = snapshot.get(callee_id) {
             whom_called.insert(callee_id.as_str().to_owned(), atom.name.clone());
         }
     }
@@ -73,6 +77,14 @@ mod tests {
     use crate::graph::Store;
     use crate::model::{CodeAtom, Edge, EdgeKind, EntityId};
 
+    fn run(store: &Store, target: &str) -> Result<String> {
+        let adj = AdjMaps::build(store);
+        store.with_atoms(|atoms| {
+            let snap = AtomSnapshot::build(atoms);
+            render(&adj, &snap, target)
+        })
+    }
+
     fn function_atom(file_path: &str, name: &str) -> CodeAtom {
         CodeAtom {
             id: EntityId::new(format!("code:{file_path}::function::{name}")),
@@ -93,14 +105,14 @@ mod tests {
     #[test]
     fn missing_target_errors() {
         let store = Store::new();
-        let err = render(&store, &AdjMaps::build(&store), "ghost").expect_err("must error");
+        let err = run(&store, "ghost").expect_err("must error");
         assert!(matches!(err, AstToMermaidError::InvalidInput(_)));
     }
 
     #[test]
     fn empty_target_errors() {
         let store = Store::new();
-        let err = render(&store, &AdjMaps::build(&store), "").expect_err("must error");
+        let err = run(&store, "").expect_err("must error");
         assert!(matches!(err, AstToMermaidError::InvalidInput(_)));
     }
 
@@ -108,7 +120,7 @@ mod tests {
     fn isolated_function_renders_only_target() {
         let store = Store::new();
         store.add_atom(function_atom("src/lib.rs", "foo"));
-        let out = render(&store, &AdjMaps::build(&store), "foo").expect("render");
+        let out = run(&store, "foo").expect("render");
         assert!(out.contains("fn foo (target)"));
         assert_eq!(out.matches("-->").count(), 0);
     }
@@ -126,7 +138,7 @@ mod tests {
             store.add_edge(Edge::new(cid, target_id.clone(), EdgeKind::Calls));
         }
 
-        let out = render(&store, &AdjMaps::build(&store), "target").expect("render");
+        let out = run(&store, "target").expect("render");
         assert!(out.contains("caller_one"));
         assert!(out.contains("caller_two"));
         assert_eq!(out.matches("--> ").count(), 2);
@@ -145,7 +157,7 @@ mod tests {
             store.add_edge(Edge::new(target_id.clone(), cid, EdgeKind::Calls));
         }
 
-        let out = render(&store, &AdjMaps::build(&store), "target").expect("render");
+        let out = run(&store, "target").expect("render");
         assert!(out.contains("helper_one"));
         assert!(out.contains("helper_two"));
         assert_eq!(out.matches("--> ").count(), 2);
@@ -160,7 +172,7 @@ mod tests {
         let n = EntityId::new("code:src/b.rs::function::noise");
         store.add_edge(Edge::new(t, n, EdgeKind::Uses));
 
-        let out = render(&store, &AdjMaps::build(&store), "target").expect("render");
+        let out = run(&store, "target").expect("render");
         assert!(!out.contains("noise"));
     }
 }

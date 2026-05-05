@@ -11,7 +11,7 @@
 
 use ast_to_mermaid::graph::Store;
 use ast_to_mermaid::model::{CodeAtom, Edge, EdgeKind, EntityId};
-use ast_to_mermaid::render::AdjMaps;
+use ast_to_mermaid::render::{AdjMaps, AtomSnapshot};
 use ast_to_mermaid::{Level, render};
 use criterion::{Criterion, black_box, criterion_group, criterion_main};
 
@@ -121,9 +121,13 @@ fn bench_project(c: &mut Criterion) {
     let adj = AdjMaps::build(&store);
     c.bench_function("project", |b| {
         b.iter(|| {
-            black_box(
-                render(Level::Project, black_box(&store), black_box(&adj), None).expect("render"),
-            );
+            store.with_atoms(|atoms| {
+                let snap = AtomSnapshot::build(atoms);
+                black_box(
+                    render(Level::Project, black_box(&adj), black_box(&snap), None)
+                        .expect("render"),
+                );
+            });
         });
     });
 }
@@ -133,9 +137,13 @@ fn bench_overview(c: &mut Criterion) {
     let adj = AdjMaps::build(&store);
     c.bench_function("overview", |b| {
         b.iter(|| {
-            black_box(
-                render(Level::Overview, black_box(&store), black_box(&adj), None).expect("render"),
-            );
+            store.with_atoms(|atoms| {
+                let snap = AtomSnapshot::build(atoms);
+                black_box(
+                    render(Level::Overview, black_box(&adj), black_box(&snap), None)
+                        .expect("render"),
+                );
+            });
         });
     });
 }
