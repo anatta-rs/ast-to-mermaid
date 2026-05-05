@@ -57,19 +57,20 @@ pub fn render(store: &Store, target: &str, hops: u8) -> Result<String> {
     let mut mermaid = String::from("graph BT\n");
     let target_node_id = sanitize_id(target_id.as_str());
     let target_label = escape_label(&format!("fn {} (impacted)", target_atom.name));
-    writeln!(mermaid, "    {target_node_id}((\"{target_label}\"))").expect("writing");
+    writeln!(mermaid, "    {target_node_id}((\"{target_label}\"))")
+        .expect("string write is infallible");
     for (id, name) in &nodes {
         if id == target_id.as_str() {
             continue;
         }
         let nid = sanitize_id(id);
         let label = escape_label(name);
-        writeln!(mermaid, "    {nid}[\"{label}\"]").expect("writing");
+        writeln!(mermaid, "    {nid}[\"{label}\"]").expect("string write is infallible");
     }
     for (from, to) in &edges {
         let fid = sanitize_id(from);
         let tid = sanitize_id(to);
-        writeln!(mermaid, "    {fid} --> {tid}").expect("writing");
+        writeln!(mermaid, "    {fid} --> {tid}").expect("string write is infallible");
     }
     Ok(mermaid)
 }

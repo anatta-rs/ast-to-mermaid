@@ -120,13 +120,14 @@ pub fn render(store: &Store) -> String {
     for (path, (name, counts)) in &modules_map {
         let id = sanitize_id(path);
         let label = escape_label(&counts.label(name));
-        writeln!(mermaid, "    {id}[\"{label}\"]").expect("writing to String");
+        writeln!(mermaid, "    {id}[\"{label}\"]").expect("string write is infallible");
     }
     for ((from, to), n) in &edges {
         let from_id = sanitize_id(from);
         let to_id = sanitize_id(to);
         if from_id != to_id {
-            writeln!(mermaid, "    {from_id} -->|\"{n}\"| {to_id}").expect("writing to String");
+            writeln!(mermaid, "    {from_id} -->|\"{n}\"| {to_id}")
+                .expect("string write is infallible");
         }
     }
     mermaid

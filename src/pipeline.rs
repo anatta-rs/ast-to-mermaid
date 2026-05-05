@@ -185,8 +185,10 @@ pub struct ParseReport {
 /// an in-memory graph, resolving cross-module calls, and rendering the
 /// requested Mermaid level.
 ///
-/// Walks `root` skipping common heavy directories (`target`, `node_modules`,
-/// `.git`). Files whose extension is not recognized are silently ignored.
+/// Walks `root` skipping the [`DEFAULT_EXCLUDED_DIRS`] set plus any directory
+/// whose name starts with `.`. Extra exclusions can be added via
+/// [`AnalyzeOptions::exclude`]. Files whose extension is not recognized are
+/// silently ignored.
 ///
 /// # Errors
 ///
@@ -403,8 +405,8 @@ pub fn bundle(root: &Path, opts: &AnalyzeOptions) -> Result<(ArtifactSet, Analyz
 }
 
 /// Walk `root` recursively and return `(path, language)` pairs for every
-/// supported source file. Skips heavy/uninteresting dirs (`target`,
-/// `node_modules`, `.git`, hidden dirs starting with `.`).
+/// supported source file. Skips every directory listed in
+/// [`DEFAULT_EXCLUDED_DIRS`] plus any directory whose name starts with `.`.
 ///
 /// # Errors
 ///
