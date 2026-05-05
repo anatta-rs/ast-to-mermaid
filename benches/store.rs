@@ -14,7 +14,7 @@ const EDGES: usize = 1_000_000;
 
 fn build_store() -> (Store, Vec<EntityId>) {
     let store = Store::new();
-    let ids: Vec<EntityId> = (0..ATOMS).map(|i| EntityId::new(&format!("n{i}"))).collect();
+    let ids: Vec<EntityId> = (0..ATOMS).map(|i| EntityId::new(format!("n{i}"))).collect();
     // Spread edges deterministically: edge i goes from ids[i % ATOMS]
     // to ids[(i * 2654435761) % ATOMS] (Knuth multiplicative hash) so
     // every atom has roughly EDGES/ATOMS = 10 outgoing edges.
@@ -81,11 +81,19 @@ fn bench_has_call_edge(c: &mut Criterion) {
     });
 }
 
-criterion_group!(
-    benches,
-    bench_edges_from,
-    bench_edges_to,
-    bench_call_edges_from,
-    bench_has_call_edge
-);
-criterion_main!(benches);
+#[allow(missing_docs)]
+mod bench_group {
+    use super::{
+        bench_call_edges_from, bench_edges_from, bench_edges_to, bench_has_call_edge,
+        criterion_group,
+    };
+    criterion_group!(
+        benches,
+        bench_edges_from,
+        bench_edges_to,
+        bench_call_edges_from,
+        bench_has_call_edge
+    );
+}
+
+criterion_main!(bench_group::benches);
