@@ -24,19 +24,30 @@ pub(crate) fn parse_size(s: &str) -> crate::error::Result<u64> {
             "empty value".into(),
         ));
     }
-    let (num, mult) = match s.chars().last() {
-        Some('K' | 'k') => (&s[..s.len() - 1], 1024_u64),
-        Some('M' | 'm') => (&s[..s.len() - 1], 1024_u64 * 1024),
-        Some('G' | 'g') => (&s[..s.len() - 1], 1024_u64 * 1024 * 1024),
-        _ => (s, 1_u64),
-    };
-    num.parse::<u64>()
-        .map_err(|e| {
-            crate::error::AstToMermaidError::InvalidInput(format!(
-                "expected `<num>[K|M|G]`, got `{s}`: {e}"
-            ))
-        })
-        .map(|n| n * mult)
+    for (suffix, mul) in [
+        ("K", 1_u64 << 10),
+        ("k", 1_u64 << 10),
+        ("M", 1_u64 << 20),
+        ("m", 1_u64 << 20),
+        ("G", 1_u64 << 30),
+        ("g", 1_u64 << 30),
+    ] {
+        if let Some(head) = s.strip_suffix(suffix) {
+            let n = head.parse::<u64>().map_err(|e| {
+                crate::error::AstToMermaidError::InvalidInput(format!(
+                    "expected `<num>[K|M|G]`, got `{s}`: {e}"
+                ))
+            })?;
+            return n.checked_mul(mul).ok_or_else(|| {
+                crate::error::AstToMermaidError::InvalidInput("size overflow".into())
+            });
+        }
+    }
+    s.parse::<u64>().map_err(|e| {
+        crate::error::AstToMermaidError::InvalidInput(format!(
+            "expected `<num>[K|M|G]`, got `{s}`: {e}"
+        ))
+    })
 }
 
 pub(crate) fn parse_duration(s: &str) -> crate::error::Result<Duration> {
@@ -46,21 +57,32 @@ pub(crate) fn parse_duration(s: &str) -> crate::error::Result<Duration> {
             "empty value".into(),
         ));
     }
-    let (num, secs) = match s.chars().last() {
-        Some('s') => (&s[..s.len() - 1], 1_u64),
-        Some('m') => (&s[..s.len() - 1], 60),
-        Some('h') => (&s[..s.len() - 1], 60 * 60),
-        Some('d') => (&s[..s.len() - 1], 24 * 60 * 60),
-        Some('w') => (&s[..s.len() - 1], 7 * 24 * 60 * 60),
-        _ => (s, 1),
-    };
-    num.parse::<u64>()
-        .map_err(|e| {
-            crate::error::AstToMermaidError::InvalidInput(format!(
-                "expected `<num>[s|m|h|d|w]`, got `{s}`: {e}"
-            ))
-        })
-        .map(|n| Duration::from_secs(n * secs))
+    for (suffix, secs) in [
+        ("s", 1_u64),
+        ("m", 60),
+        ("h", 60 * 60),
+        ("d", 24 * 60 * 60),
+        ("w", 7 * 24 * 60 * 60),
+    ] {
+        if let Some(head) = s.strip_suffix(suffix) {
+            let n = head.parse::<u64>().map_err(|e| {
+                crate::error::AstToMermaidError::InvalidInput(format!(
+                    "expected `<num>[s|m|h|d|w]`, got `{s}`: {e}"
+                ))
+            })?;
+            return n
+                .checked_mul(secs)
+                .ok_or_else(|| {
+                    crate::error::AstToMermaidError::InvalidInput("duration overflow".into())
+                })
+                .map(Duration::from_secs);
+        }
+    }
+    s.parse::<u64>().map(Duration::from_secs).map_err(|e| {
+        crate::error::AstToMermaidError::InvalidInput(format!(
+            "expected `<num>[s|m|h|d|w]`, got `{s}`: {e}"
+        ))
+    })
 }
 
 /// Build the parser-ignored summary line appended to stdout when
@@ -123,6 +145,19 @@ mod tests {
     }
 
     #[test]
+    fn parse_size_non_ascii_suffix_errors_without_panic() {
+        let err = parse_size("5€").unwrap_err().to_string();
+        assert!(err.contains("expected"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_size_overflow_errors() {
+        // u64::MAX / (1<<30) ≈ 1.7e10, so 1e11 G overflows.
+        let err = parse_size("99999999999G").unwrap_err().to_string();
+        assert!(err.contains("size overflow"), "got: {err}");
+    }
+
+    #[test]
     fn parse_duration_units() {
         assert_eq!(parse_duration("30s").unwrap(), Duration::from_secs(30));
         assert_eq!(parse_duration("2m").unwrap(), Duration::from_secs(120));
@@ -146,6 +181,20 @@ mod tests {
     fn parse_duration_non_numeric_errors() {
         let err = parse_duration("xs").unwrap_err().to_string();
         assert!(err.contains("expected"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_duration_non_ascii_suffix_errors_without_panic() {
+        let err = parse_duration("5€").unwrap_err().to_string();
+        assert!(err.contains("expected"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_duration_overflow_errors() {
+        let err = parse_duration("999999999999999999w")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("duration overflow"), "got: {err}");
     }
 
     #[test]
