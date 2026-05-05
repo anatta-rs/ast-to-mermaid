@@ -8,7 +8,7 @@ use crate::cache::Cache;
 use crate::error::{AstToMermaidError, Result};
 use crate::git_source;
 use crate::graph::Store;
-use crate::parser::{CodeParser, Language, git_blob_sha1};
+use crate::parser::{CodeParser, Language, ParseFailure, ParseUnit, git_blob_sha1};
 use crate::render::{Level, render};
 use crate::resolve::{resolve_cross_module_calls, resolve_implements_edges};
 use std::path::{Path, PathBuf};
@@ -161,6 +161,23 @@ pub struct AnalyzeReport {
     pub atoms_indexed: usize,
     /// Cross-module call edges added by the resolver.
     pub edges_resolved: usize,
+    /// Files we tried to parse but skipped because their parse failed. The
+    /// pipeline now logs a `tracing::warn!` and continues per-file instead
+    /// of aborting on the first failure, so callers see the full list here.
+    pub failures: Vec<ParseFailure>,
+}
+
+/// Summary of one [`parse_phase`] invocation: how many files survived
+/// parsing, how many atoms they produced, and the per-file failures we
+/// caught instead of bubbling up.
+#[derive(Debug, Clone, Default)]
+pub struct ParseReport {
+    /// Files that produced a [`ParseUnit`] (cache hit or fresh parse).
+    pub files_parsed: usize,
+    /// Total atoms indexed across all successful files.
+    pub atoms_indexed: usize,
+    /// Per-file parse failures — one entry per skipped file.
+    pub failures: Vec<ParseFailure>,
 }
 
 /// Recursively analyze `root`, parsing every supported source file, building
@@ -172,8 +189,10 @@ pub struct AnalyzeReport {
 ///
 /// # Errors
 ///
-/// Returns the first error from filesystem walk, parsing, or renderer.
-/// Individual files that fail to parse are propagated.
+/// Returns errors from the filesystem walk or the renderer. Per-file parse
+/// failures are no longer fatal — they land in [`AnalyzeReport::failures`]
+/// and a `tracing::warn!` line is emitted for each, while parsing of the
+/// remaining files continues.
 pub fn analyze(root: &Path, opts: &AnalyzeOptions) -> Result<AnalyzeReport> {
     // FS-mode requires the path to exist. In git-ref mode the path can be a
     // subdir hint that was deleted on HEAD but present in the ref; defer the
@@ -188,19 +207,24 @@ pub fn analyze(root: &Path, opts: &AnalyzeOptions) -> Result<AnalyzeReport> {
     let inputs = collect_inputs(root, opts)?;
     let store = Store::new();
 
-    let (files_parsed, atoms_indexed) = parse_phase(&inputs, &store, opts.cache.as_deref())?;
-    let edges_resolved = resolve_phase(&store, atoms_indexed);
+    let parse_report = parse_phase(&inputs, &store, opts.cache.as_deref());
+    let edges_resolved = resolve_phase(&store, parse_report.atoms_indexed);
     let mermaid = render(opts.level, &store, opts.target.as_deref())?;
 
     Ok(AnalyzeReport {
         mermaid,
-        files_parsed,
-        atoms_indexed,
+        files_parsed: parse_report.files_parsed,
+        atoms_indexed: parse_report.atoms_indexed,
         edges_resolved,
+        failures: parse_report.failures,
     })
 }
 
 /// Run the parse pass over `inputs`, threading each one into `store`.
+///
+/// Per-file parse errors are caught: we emit a `tracing::warn!`, append a
+/// [`ParseFailure`] to the returned [`ParseReport`], and move on. A single
+/// malformed file no longer aborts the whole run.
 ///
 /// When `cache` is `Some`, each input's `blob_sha` is checked against the
 /// atom cache first:
@@ -212,61 +236,79 @@ pub fn analyze(root: &Path, opts: &AnalyzeOptions) -> Result<AnalyzeReport> {
 ///
 /// Cache hit/miss counts are emitted on completion as a `tracing::info!`
 /// line so users see the cache effectiveness via `--trace=info`.
-fn parse_phase(
-    inputs: &[ParseInput],
-    store: &Store,
-    cache: Option<&Cache>,
-) -> Result<(usize, usize)> {
+fn parse_phase(inputs: &[ParseInput], store: &Store, cache: Option<&Cache>) -> ParseReport {
     let span = tracing::info_span!("parse_phase", files = inputs.len());
     let _enter = span.enter();
     let started = std::time::Instant::now();
 
-    let mut atoms_indexed = 0;
-    let mut files_parsed = 0;
+    let mut report = ParseReport::default();
     let mut hits = 0usize;
     let mut misses = 0usize;
 
     for input in inputs {
-        if let Some(c) = cache
-            && let Some(unit) = c.get_unit(&input.blob_sha)
-        {
-            atoms_indexed += unit.atom_count();
-            unit.apply_to(store);
-            hits += 1;
-            files_parsed += 1;
-            continue;
+        match parse_one_file(input, cache) {
+            Ok((unit, was_hit)) => {
+                report.atoms_indexed += unit.atom_count();
+                unit.apply_to(store);
+                if was_hit {
+                    hits += 1;
+                } else {
+                    misses += 1;
+                }
+                report.files_parsed += 1;
+            }
+            Err(e) => {
+                let reason = format!("{e}");
+                tracing::warn!(path = %input.display_path, "parse failed: {reason}");
+                report.failures.push(ParseFailure {
+                    path: input.display_path.clone(),
+                    reason,
+                });
+            }
         }
-
-        let parser = match input.language {
-            Language::Rust => CodeParser::rust(),
-            Language::Python => CodeParser::python(),
-        };
-        let unit = parser
-            .parse(&input.content, &input.display_path)
-            .map_err(|e| {
-                AstToMermaidError::InvalidInput(format!("parse {}: {e}", input.display_path))
-            })?;
-        atoms_indexed += unit.atom_count();
-        unit.apply_to(store);
-        if let Some(c) = cache
-            && let Err(e) = c.put_unit(&input.blob_sha, &unit)
-        {
-            tracing::warn!(blob_sha = %input.blob_sha, "cache.put_unit failed: {e}");
-        }
-        misses += 1;
-        files_parsed += 1;
     }
 
     let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
     tracing::info!(
-        parsed = files_parsed,
-        atoms = atoms_indexed,
+        parsed = report.files_parsed,
+        atoms = report.atoms_indexed,
+        failed = report.failures.len(),
         hits,
         misses,
         elapsed_ms,
         "parse_phase done",
     );
-    Ok((files_parsed, atoms_indexed))
+    report
+}
+
+/// Parse a single input, consulting `cache` first. The returned `bool` is
+/// `true` when the result came from the cache (counted as a hit by the
+/// caller), `false` when tree-sitter actually ran. Any error returned here
+/// is surfaced by [`parse_phase`] as a [`ParseFailure`] rather than aborting
+/// the whole run.
+fn parse_one_file(input: &ParseInput, cache: Option<&Cache>) -> Result<(ParseUnit, bool)> {
+    if let Some(c) = cache
+        && let Some(unit) = c.get_unit(&input.blob_sha)
+    {
+        return Ok((unit, true));
+    }
+
+    let parser = match input.language {
+        Language::Rust => CodeParser::rust(),
+        Language::Python => CodeParser::python(),
+    };
+    let unit = parser
+        .parse(&input.content, &input.display_path)
+        .map_err(|e| {
+            AstToMermaidError::InvalidInput(format!("parse {}: {e}", input.display_path))
+        })?;
+
+    if let Some(c) = cache
+        && let Err(e) = c.put_unit(&input.blob_sha, &unit)
+    {
+        tracing::warn!(blob_sha = %input.blob_sha, "cache.put_unit failed: {e}");
+    }
+    Ok((unit, false))
 }
 
 /// Run the cross-module resolver (Calls + Implements edges). Wrapped in
@@ -302,8 +344,9 @@ fn resolve_phase(store: &Store, atoms: usize) -> usize {
 ///
 /// # Errors
 ///
-/// Returns the first error from filesystem walk, parsing, or
-/// resolver. Individual files that fail to parse are propagated.
+/// Returns errors from the filesystem walk or resolver. Per-file parse
+/// failures land in [`AnalyzeReport::failures`] instead of aborting the
+/// run — see [`analyze`] for the same trade-off.
 pub fn bundle(root: &Path, opts: &AnalyzeOptions) -> Result<(ArtifactSet, AnalyzeReport)> {
     if opts.git_ref.is_none() && !root.exists() {
         return Err(AstToMermaidError::InvalidInput(format!(
@@ -315,8 +358,8 @@ pub fn bundle(root: &Path, opts: &AnalyzeOptions) -> Result<(ArtifactSet, Analyz
     let inputs = collect_inputs(root, opts)?;
     let store = Store::new();
 
-    let (files_parsed, atoms_indexed) = parse_phase(&inputs, &store, opts.cache.as_deref())?;
-    let edges_resolved = resolve_phase(&store, atoms_indexed);
+    let parse_report = parse_phase(&inputs, &store, opts.cache.as_deref());
+    let edges_resolved = resolve_phase(&store, parse_report.atoms_indexed);
 
     let source_root = match opts.git_ref.as_deref() {
         Some(ref_name) => format!("{}@{ref_name}", root.display()),
@@ -339,9 +382,10 @@ pub fn bundle(root: &Path, opts: &AnalyzeOptions) -> Result<(ArtifactSet, Analyz
         // The "rendered" mermaid for a bundle is the project view —
         // matches what `analyze --level project` would have returned.
         mermaid: artifacts.overview_mmd.clone(),
-        files_parsed,
-        atoms_indexed,
+        files_parsed: parse_report.files_parsed,
+        atoms_indexed: parse_report.atoms_indexed,
         edges_resolved,
+        failures: parse_report.failures,
     };
     Ok((artifacts, report))
 }
@@ -676,12 +720,44 @@ mod tests {
     }
 
     #[test]
-    fn analyze_propagates_invalid_utf8() {
+    fn analyze_skips_invalid_utf8_into_failures() {
+        // Behaviour change (issue #73): a single broken file used to abort
+        // the run via `?`. It must now be caught and surfaced via
+        // `AnalyzeReport::failures` instead.
         let tmp = tempdir().expect("tmp");
-        let path = tmp.path().join("bad.rs");
-        fs::write(&path, [0xff, 0xfe, 0xfd]).expect("write");
-        let err = analyze(tmp.path(), &AnalyzeOptions::default()).expect_err("must reject");
-        assert!(matches!(err, AstToMermaidError::InvalidInput(_)));
+        fs::write(tmp.path().join("bad.rs"), [0xff, 0xfe, 0xfd]).expect("write");
+        let report = analyze(tmp.path(), &AnalyzeOptions::default()).expect("must not abort");
+        assert_eq!(report.files_parsed, 0);
+        assert_eq!(report.failures.len(), 1);
+        assert!(report.failures[0].path.ends_with("bad.rs"));
+    }
+
+    #[test]
+    fn parse_phase_skips_broken_file() {
+        // A directory mixing one valid and one broken Rust file must:
+        // - return Ok (no abort),
+        // - parse the valid file (files_parsed = 1, ≥ 1 atom),
+        // - record the broken file in `failures`.
+        let tmp = tempdir().expect("tmp");
+        let root = tmp.path();
+        write(root, "src/lib.rs", "fn ok() {}\n");
+        // Invalid UTF-8 — trips `CodeParser::parse`'s utf-8 check, which is
+        // the cleanest deterministic parse failure across grammar versions.
+        fs::write(root.join("src/broken.rs"), [0xff, 0xfe, 0xfd]).expect("write");
+
+        let report = analyze(root, &AnalyzeOptions::default()).expect("must not abort");
+        assert_eq!(report.files_parsed, 1, "valid file still parsed");
+        assert!(report.atoms_indexed >= 1);
+        assert_eq!(report.failures.len(), 1);
+        assert!(
+            report.failures[0].path.ends_with("broken.rs"),
+            "got: {}",
+            report.failures[0].path
+        );
+        assert!(
+            !report.failures[0].reason.is_empty(),
+            "reason must be populated"
+        );
     }
 
     #[test]
@@ -788,6 +864,7 @@ mod tests {
             files_parsed: 2,
             atoms_indexed: 4,
             edges_resolved: 1,
+            failures: Vec::new(),
         };
         let c = r.clone();
         assert_eq!(r, c);

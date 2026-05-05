@@ -22,6 +22,23 @@ mod queries;
 
 // ── Parse output ─────────────────────────────────────────────────────────────
 
+/// Per-file failure recorded during the parse phase. The pipeline catches
+/// each file's error, appends a [`ParseFailure`], and continues — so a
+/// single malformed file no longer aborts the whole run.
+///
+/// Currently only the path + a one-line reason are surfaced; the slot is
+/// reserved so future iterations can fold in line/col when the underlying
+/// parser supplies them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParseFailure {
+    /// Display path of the file we failed on (relative-to-root,
+    /// slash-joined — same shape as the path stored on every atom).
+    pub path: String,
+    /// Human-readable failure reason, typically the wrapped parser error
+    /// message.
+    pub reason: String,
+}
+
 /// Output of parsing one file: the atoms (module + items + lifted impl
 /// methods) and the intra-file edges (Contains, intra-file Calls). Cross-
 /// module edges are added later by the resolver.
