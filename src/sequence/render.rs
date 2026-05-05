@@ -1,5 +1,6 @@
 //! [`SequenceDiagram`] → Mermaid `sequenceDiagram` text.
 
+use super::visit::{DEPTH_LIMIT_LABEL, max_ast_depth};
 use super::{Participant, SELF_ID, SequenceDiagram, Step};
 use std::fmt::Write;
 
@@ -32,6 +33,23 @@ fn write_participant(out: &mut String, p: &Participant) {
 
 fn write_step(out: &mut String, step: &Step, depth: usize) {
     let indent = "    ".repeat(depth);
+    if depth >= max_ast_depth() {
+        // Adversarial / pathologically nested IR (e.g. a degenerate
+        // diff that produced thousands of nested alt blocks): emit a
+        // visible `…depth limit…` note and stop recursing instead of
+        // blowing the renderer's call stack.
+        tracing::warn!(
+            depth,
+            limit = max_ast_depth(),
+            "ast depth limit hit in sequence renderer",
+        );
+        let _ = writeln!(
+            out,
+            "{indent}Note over {SELF_ID}: {}",
+            escape_label(DEPTH_LIMIT_LABEL),
+        );
+        return;
+    }
     match step {
         Step::Call {
             from,

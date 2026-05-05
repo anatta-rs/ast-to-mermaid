@@ -6,6 +6,39 @@ use super::{Participant, SELF_ID, Step};
 use std::collections::HashSet;
 use tree_sitter::Node;
 
+/// Default AST recursion depth limit shared by every recursive AST
+/// visitor in this crate ([`State::walk_expr`], [`field_receiver_root`],
+/// [`super::render::write_step`], and the parser's `flatten_use`).
+///
+/// The guard turns a deeply nested adversarial source file into a
+/// degraded-but-finite diagram instead of a stack-overflow crash.
+/// Override at runtime with the `A2M_MAX_AST_DEPTH` env var; see
+/// [`max_ast_depth`].
+pub const MAX_AST_DEPTH: usize = 256;
+
+/// Resolved AST recursion depth limit. Returns the parsed value of
+/// `A2M_MAX_AST_DEPTH` when it is set to a positive integer, otherwise
+/// falls back to [`MAX_AST_DEPTH`]. Read fresh on every call so a test
+/// (or operator) can change the limit per run without restart.
+#[must_use]
+pub fn max_ast_depth() -> usize {
+    resolve_max_ast_depth(std::env::var("A2M_MAX_AST_DEPTH").ok().as_deref())
+}
+
+/// Pure resolver behind [`max_ast_depth`]: takes the raw env value (or
+/// `None`) and returns the depth limit. Split out so unit tests can
+/// exercise the override logic without mutating process env.
+fn resolve_max_ast_depth(raw: Option<&str>) -> usize {
+    raw.and_then(|v| v.parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(MAX_AST_DEPTH)
+}
+
+/// Marker text emitted into the diagram (sequence note / mermaid note)
+/// when a visitor short-circuits at the depth cap. Kept as a single
+/// shared string so the diff/CI snapshots can match on it verbatim.
+pub(super) const DEPTH_LIMIT_LABEL: &str = "…depth limit…";
+
 /// Mutable visitor state — collects participants in first-appearance order
 /// and the flat step list (control-flow blocks recurse into their own).
 pub(super) struct State {
@@ -20,6 +53,13 @@ pub(super) struct State {
     /// Receiver type of the enclosing `impl` block, if any. Used to alias
     /// `Self::method()` calls onto the impl owner.
     container: Option<String>,
+    /// Resolved [`max_ast_depth`] captured once per [`State`] so the
+    /// limit is consistent across all walkers driving this diagram.
+    max_depth: usize,
+    /// `true` once the depth cap has been hit and the marker note has
+    /// been pushed — guards against emitting one note per cut point on
+    /// a fan-out tree.
+    depth_limited: bool,
 }
 
 impl State {
@@ -32,6 +72,8 @@ impl State {
             participants: Vec::new(),
             seen: HashSet::new(),
             container: container.map(str::to_owned),
+            max_depth: max_ast_depth(),
+            depth_limited: false,
         };
         s.register(SELF_ID, container.unwrap_or("self"));
         s
@@ -42,17 +84,31 @@ impl State {
         (self.participants, self.steps)
     }
 
-    /// Walk a `block` node, dispatching each statement.
+    /// Walk a `block` node, dispatching each statement. Top-level entry
+    /// from [`super::extract_all`] — recursion depth starts at 0.
     pub fn walk_block(&mut self, block: &Node, source: &str) {
+        self.walk_block_at(block, source, 0);
+    }
+
+    /// Depth-aware variant of [`Self::walk_block`]. Every recursive
+    /// re-entry threads `depth + 1` so [`Self::guard`] can short-circuit
+    /// before the call stack runs out.
+    fn walk_block_at(&mut self, block: &Node, source: &str, depth: usize) {
+        if self.guard(depth) {
+            return;
+        }
         let mut cursor = block.walk();
         for child in block.children(&mut cursor) {
-            self.walk_stmt(&child, source);
+            self.walk_stmt(&child, source, depth + 1);
         }
     }
 
     /// Walk a single statement-level node. Drops trivia (`{`, `}`, `;`,
     /// comments). Calls inside expressions are extracted via [`Self::walk_expr`].
-    fn walk_stmt(&mut self, node: &Node, source: &str) {
+    fn walk_stmt(&mut self, node: &Node, source: &str, depth: usize) {
+        if self.guard(depth) {
+            return;
+        }
         match node.kind() {
             "expression_statement" | "let_declaration" => {
                 let mut cursor = node.walk();
@@ -60,25 +116,33 @@ impl State {
                     if is_trivia(&child) {
                         continue;
                     }
-                    self.walk_expr(&child, source);
+                    self.walk_expr(&child, source, depth + 1);
                 }
             }
             // Bare expressions can appear at the tail of a block (no `;`).
             _ if is_trivia(node) => {}
-            _ => self.walk_expr(node, source),
+            _ => self.walk_expr(node, source, depth + 1),
         }
     }
 
     /// Walk an expression node, emitting steps for calls and lifting
     /// control-flow into [`Step::Loop`] / [`Step::Alt`] blocks.
+    ///
+    /// Returns early once `depth >= self.max_depth`, emitting a single
+    /// `…depth limit…` marker via [`Self::guard`] so adversarially deep
+    /// input degrades to a finite diagram instead of overflowing the
+    /// stack.
     #[allow(clippy::too_many_lines)]
-    fn walk_expr(&mut self, node: &Node, source: &str) {
+    fn walk_expr(&mut self, node: &Node, source: &str, depth: usize) {
+        if self.guard(depth) {
+            return;
+        }
         match node.kind() {
             "call_expression" => {
-                self.handle_call(node, source, false);
+                self.handle_call(node, source, false, depth + 1);
             }
             "macro_invocation" => {
-                self.handle_macro(node, source);
+                self.handle_macro(node, source, depth + 1);
             }
             "await_expression" => {
                 // tree-sitter-rust's `await_expression` is `<expr> . await`
@@ -90,31 +154,31 @@ impl State {
                     .find(|c| !matches!(c.kind(), "." | "await"));
                 if let Some(value) = inner {
                     if value.kind() == "call_expression" {
-                        self.handle_call(&value, source, true);
+                        self.handle_call(&value, source, true, depth + 1);
                     } else {
-                        self.walk_expr(&value, source);
+                        self.walk_expr(&value, source, depth + 1);
                     }
                 }
             }
             "for_expression" => {
                 let label = format!("for {}", short_text(node, "value", source));
-                self.lift_loop(node, source, &label);
+                self.lift_loop(node, source, &label, depth + 1);
             }
             "while_expression" => {
                 let label = format!("while {}", short_text(node, "condition", source));
-                self.lift_loop(node, source, &label);
+                self.lift_loop(node, source, &label, depth + 1);
             }
             "loop_expression" => {
-                self.lift_loop(node, source, "loop");
+                self.lift_loop(node, source, "loop", depth + 1);
             }
             "if_expression" => {
-                self.lift_if(node, source);
+                self.lift_if(node, source, depth + 1);
             }
             "match_expression" => {
-                self.lift_match(node, source);
+                self.lift_match(node, source, depth + 1);
             }
             "block" => {
-                self.walk_block(node, source);
+                self.walk_block_at(node, source, depth + 1);
             }
             // Anything else: descend so nested calls (e.g. `Some(foo())`)
             // are still picked up. We only descend into children, not the
@@ -122,7 +186,7 @@ impl State {
             _ => {
                 let mut cursor = node.walk();
                 for child in node.children(&mut cursor) {
-                    self.walk_expr(&child, source);
+                    self.walk_expr(&child, source, depth + 1);
                 }
             }
         }
@@ -138,7 +202,7 @@ impl State {
     /// `unimplemented!`, `matches!`) are skipped — they're noise on a
     /// sequence diagram. We still descend into their token tree so any
     /// nested real call survives.
-    fn handle_macro(&mut self, node: &Node, source: &str) {
+    fn handle_macro(&mut self, node: &Node, source: &str, depth: usize) {
         let macro_node = node.child_by_field_name("macro");
         let label = macro_node
             .and_then(|n| node_text(&n, source))
@@ -157,7 +221,7 @@ impl State {
         let mut cursor = node.walk();
         for child in node.children(&mut cursor) {
             if !is_trivia(&child) && Some(child) != macro_node {
-                self.walk_expr(&child, source);
+                self.walk_expr(&child, source, depth);
             }
         }
     }
@@ -168,7 +232,7 @@ impl State {
     /// Bare-name calls to enum-variant constructors (`Some`, `None`,
     /// `Ok`, `Err`) are skipped — they parse as `call_expression` but
     /// represent type construction, not flow.
-    fn handle_call(&mut self, node: &Node, source: &str, is_await: bool) {
+    fn handle_call(&mut self, node: &Node, source: &str, is_await: bool, depth: usize) {
         if let Some(callee) = node.child_by_field_name("function") {
             let (to_id, to_label, method) = self.classify_callee(&callee, source);
             let is_bare_constructor = callee.kind() == "identifier"
@@ -189,7 +253,7 @@ impl State {
         if let Some(args) = node.child_by_field_name("arguments") {
             let mut cursor = args.walk();
             for child in args.children(&mut cursor) {
-                self.walk_expr(&child, source);
+                self.walk_expr(&child, source, depth);
             }
         }
     }
@@ -250,11 +314,11 @@ impl State {
         std::mem::replace(&mut self.steps, saved)
     }
 
-    fn lift_loop(&mut self, node: &Node, source: &str, label: &str) {
+    fn lift_loop(&mut self, node: &Node, source: &str, label: &str, depth: usize) {
         let body_node = node.child_by_field_name("body");
         let body = self.walk_into(|s| {
             if let Some(b) = body_node {
-                s.walk_block(&b, source);
+                s.walk_block_at(&b, source, depth);
             }
         });
         self.steps.push(Step::Loop {
@@ -263,12 +327,12 @@ impl State {
         });
     }
 
-    fn lift_if(&mut self, node: &Node, source: &str) {
+    fn lift_if(&mut self, node: &Node, source: &str, depth: usize) {
         let cond = format!("if {}", short_text(node, "condition", source));
         let then_node = node.child_by_field_name("consequence");
         let then = self.walk_into(|s| {
             if let Some(b) = then_node {
-                s.walk_block(&b, source);
+                s.walk_block_at(&b, source, depth);
             }
         });
         let else_node = node.child_by_field_name("alternative");
@@ -276,7 +340,7 @@ impl State {
             self.walk_into(|s| {
                 // `alternative` may wrap an `else_clause` or be a chained
                 // `if_expression`. Descend uniformly.
-                s.walk_expr(&alt, source);
+                s.walk_expr(&alt, source, depth);
             })
         });
         self.steps.push(Step::Alt {
@@ -286,7 +350,7 @@ impl State {
         });
     }
 
-    fn lift_match(&mut self, node: &Node, source: &str) {
+    fn lift_match(&mut self, node: &Node, source: &str, depth: usize) {
         let scrutinee = short_text(node, "value", source);
         let cond = format!("match {scrutinee}");
         // tree-sitter-rust's match_arm has a named `value` field for the
@@ -300,7 +364,7 @@ impl State {
                         continue;
                     }
                     if let Some(value) = child.child_by_field_name("value") {
-                        s.walk_expr(&value, source);
+                        s.walk_expr(&value, source, depth);
                     }
                 }
             }
@@ -324,6 +388,31 @@ impl State {
             });
         }
     }
+
+    /// Depth-limit gate for every recursive walker.
+    ///
+    /// Returns `true` when `depth >= self.max_depth` — the caller must
+    /// then short-circuit. The first cut also pushes a single
+    /// [`Step::Note`] (deduped via `self.depth_limited`) so the rendered
+    /// diagram carries a visible `…depth limit…` marker rather than
+    /// silently losing the deep tail.
+    fn guard(&mut self, depth: usize) -> bool {
+        if depth < self.max_depth {
+            return false;
+        }
+        if !self.depth_limited {
+            self.depth_limited = true;
+            tracing::warn!(
+                limit = self.max_depth,
+                "ast depth limit hit while walking sequence body",
+            );
+            self.steps.push(Step::Note {
+                over: SELF_ID.to_owned(),
+                text: DEPTH_LIMIT_LABEL.to_owned(),
+            });
+        }
+        true
+    }
 }
 
 fn is_trivia(node: &Node) -> bool {
@@ -343,9 +432,15 @@ fn node_text<'a>(node: &Node, source: &'a str) -> Option<&'a str> {
 /// `macro_invocation` so chains like `writeln!(...).expect(...)` resolve
 /// to the macro name instead of swallowing the whole macro body. For
 /// `scoped_identifier` (`Type::method`) the head segment wins.
+///
+/// Bounded by [`max_ast_depth`]: once that many descent steps elapse
+/// (an adversarial deeply nested chain) we stop walking and return the
+/// best-effort raw text of the current node so the caller still
+/// produces a finite label.
 fn field_receiver_root<'a>(node: &Node, source: &'a str) -> Option<&'a str> {
+    let limit = max_ast_depth();
     let mut current = *node;
-    loop {
+    for _ in 0..limit {
         match current.kind() {
             "field_expression" => {
                 current = current.child_by_field_name("value")?;
@@ -387,6 +482,11 @@ fn field_receiver_root<'a>(node: &Node, source: &'a str) -> Option<&'a str> {
             _ => return node_text(&current, source),
         }
     }
+    tracing::warn!(
+        limit,
+        "ast depth limit hit in field_receiver_root; returning best-effort label",
+    );
+    node_text(&current, source)
 }
 
 /// Short, single-line text of a child field — truncated for diagram
@@ -489,5 +589,23 @@ mod tests {
     #[test]
     fn sanitize_id_empty_falls_back() {
         assert_eq!(sanitize_id(""), "p");
+    }
+
+    #[test]
+    fn resolve_max_ast_depth_respects_env_override() {
+        // Pure resolver: a positive integer in the env wins over the
+        // default. This is the exact path `max_ast_depth()` runs after
+        // reading `A2M_MAX_AST_DEPTH`.
+        assert_eq!(resolve_max_ast_depth(Some("8")), 8);
+        assert_eq!(resolve_max_ast_depth(Some("1024")), 1024);
+    }
+
+    #[test]
+    fn resolve_max_ast_depth_falls_back_on_garbage() {
+        assert_eq!(resolve_max_ast_depth(Some("0")), MAX_AST_DEPTH);
+        assert_eq!(resolve_max_ast_depth(Some("-3")), MAX_AST_DEPTH);
+        assert_eq!(resolve_max_ast_depth(Some("not-a-number")), MAX_AST_DEPTH);
+        assert_eq!(resolve_max_ast_depth(Some("")), MAX_AST_DEPTH);
+        assert_eq!(resolve_max_ast_depth(None), MAX_AST_DEPTH);
     }
 }
