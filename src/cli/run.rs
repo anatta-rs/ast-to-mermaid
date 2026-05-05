@@ -1,21 +1,22 @@
-//! Shared CLI infrastructure for the unified `a2m` binary.
-//!
-//! The crate ships one binary (`a2m`) with seven subcommands. Per-subcommand
-//! arg structs and dispatch helpers live here so the binary file itself stays
-//! a thin clap parser.
+//! Subcommand entry points for the unified `a2m` binary. Each `run_*`
+//! function takes the corresponding [`crate::cli::flags`] arg struct and
+//! returns an [`ExitCode`].
 
 use crate::artifacts::write_artifacts;
 use crate::cache::{Cache, GcOptions, write_bundle_atomic};
+use crate::cli::flags::{
+    AnalyzeFlags, AnalyzeFormat, BundleFlags, DiffFlags, DiffFormat, ExitCode, GcFlags, IndexFlags,
+    SequenceFlags, WalkFlags,
+};
+use crate::cli::format::{format_summary_comment, parse_csv_exclude, parse_duration, parse_size};
 use crate::diff::{compute_diff, load_bundle_entities, render_mermaid};
 use crate::pipeline::{
     AnalyzeOptions, analyze, bundle, snapshot_id, walk_for_languages_with_exclude,
 };
 use crate::render::{Level, mermaid_to_dot};
 use crate::sequence;
-use std::path::{Path, PathBuf};
-use std::process;
+use std::path::Path;
 use std::sync::Arc;
-use std::time::Duration;
 
 /// Open the default cache (`<git-toplevel>/.a2m/cache`) for transparent
 /// atom-level caching on the analyze/bundle subcommands. Returns `None` if
@@ -45,87 +46,6 @@ fn check_ref_arg(subcommand: &str, value: Option<&str>) -> Result<(), ExitCode> 
             Err(ExitCode::UsageError)
         }
     }
-}
-
-/// Parse a CSV `--exclude` flag value into a list of directory basenames:
-/// split on `,`, trim whitespace, drop empty entries. Shared across the
-/// analyze / walk / bundle / sequence subcommands.
-fn parse_csv_exclude(s: &str) -> Vec<String> {
-    s.split(',')
-        .map(str::trim)
-        .filter(|p| !p.is_empty())
-        .map(str::to_owned)
-        .collect()
-}
-
-/// Exit code returned by CLI functions, convertible into [`process::ExitCode`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ExitCode {
-    /// Command succeeded.
-    Success,
-    /// Command failed at runtime (e.g. parse error, IO error).
-    Failure,
-    /// User error (unknown subcommand, bad flags).
-    UsageError,
-}
-
-impl From<ExitCode> for process::ExitCode {
-    fn from(c: ExitCode) -> Self {
-        match c {
-            ExitCode::Success => Self::SUCCESS,
-            ExitCode::Failure => Self::FAILURE,
-            ExitCode::UsageError => Self::from(2),
-        }
-    }
-}
-
-/// Output format for the analyze-flavoured subcommands. `Mermaid` is the
-/// default and what the renderers natively emit; `Dot` post-processes that
-/// into Graphviz DOT for graphs too large for browser-based mermaid
-/// rendering (GitHub caps at 500 edges).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
-pub enum AnalyzeFormat {
-    /// Mermaid (default — renders in GitHub markdown, mermaid.live, etc.).
-    #[default]
-    Mermaid,
-    /// Graphviz DOT — pipe to `dot -Tsvg` for huge graphs (10k+ nodes).
-    Dot,
-}
-
-/// Shared CLI args for the analyze-flavoured subcommands
-/// (`project`, `overview`, `module`, `function`, `impact`).
-#[derive(Debug, Clone, clap::Args)]
-pub struct AnalyzeFlags {
-    /// Path to a source root (file or directory).
-    pub path: PathBuf,
-
-    /// Required for `module` / `function` / `impact` levels: the target
-    /// module path or symbol name. Ignored by `project` / `overview`.
-    #[arg(short, long)]
-    pub target: Option<String>,
-
-    /// Extra directory basenames to skip during walk (comma-separated).
-    /// Always combined with the built-in skip set (`target`,
-    /// `node_modules`, `.git`, hidden dirs).
-    #[arg(short = 'x', long, default_value = "")]
-    pub exclude: String,
-
-    /// Write output to this file instead of stdout.
-    #[arg(short, long)]
-    pub out: Option<PathBuf>,
-
-    /// Read source from a git ref (e.g. `main`, `v0.1.0`, `HEAD~3`)
-    /// instead of the working tree. The path argument becomes a
-    /// subdirectory hint within that ref's tree.
-    #[arg(long, value_name = "GIT-REF")]
-    pub r#ref: Option<String>,
-
-    /// Output format. `mermaid` (default) renders natively in GitHub
-    /// markdown / mermaid.live up to ~500 edges. `dot` emits Graphviz DOT
-    /// for graphs too large for those renderers — pipe to
-    /// `dot -Tsvg > graph.svg`.
-    #[arg(long, value_enum, default_value_t = AnalyzeFormat::Mermaid)]
-    pub format: AnalyzeFormat,
 }
 
 /// Run the analyze pipeline for `level`, writing the resulting Mermaid to
@@ -201,34 +121,17 @@ pub fn run_analyze(level: Level, flags: &AnalyzeFlags) -> ExitCode {
         // a TTY and gets swept into the copy-paste, breaking the parser.
         // Inline it as a parser-ignored comment instead.
         print!("{rendered}");
-        let comment_prefix = match flags.format {
-            AnalyzeFormat::Mermaid => "%%",
-            AnalyzeFormat::Dot => "//",
-        };
         println!(
-            "{comment_prefix} analyzed {} files, {} atoms, {} cross-module edges",
-            report.files_parsed, report.atoms_indexed, report.edges_resolved,
+            "{}",
+            format_summary_comment(
+                flags.format,
+                report.files_parsed,
+                report.atoms_indexed,
+                report.edges_resolved,
+            )
         );
     }
     ExitCode::Success
-}
-
-/// CLI args for the `walk` subcommand.
-#[derive(Debug, Clone, clap::Args)]
-pub struct WalkFlags {
-    /// Path to a source root.
-    pub path: PathBuf,
-
-    /// Extra directory basenames to skip (comma-separated). Always combined
-    /// with the built-in skip set (`target`, `node_modules`, `.git`,
-    /// hidden dirs).
-    #[arg(short = 'x', long, default_value = "")]
-    pub exclude: String,
-
-    /// Read source from a git ref instead of the working tree. With `--ref`,
-    /// `walk` lists `git ls-tree` paths (filtered to supported languages).
-    #[arg(long, value_name = "GIT-REF")]
-    pub r#ref: Option<String>,
 }
 
 /// Run the file-walker subcommand: print one line per source file, format
@@ -287,71 +190,6 @@ fn run_walk_ref(start: &std::path::Path, git_ref: &str) -> ExitCode {
         println!("{}\t{}", lang.name(), entry.path);
     }
     ExitCode::Success
-}
-
-/// Shared CLI args for cache-touching subcommands (`index`, `diff`).
-#[derive(Debug, Clone, Default, clap::Args)]
-pub struct CacheArgs {
-    /// Override the cache root (default: `<git-toplevel>/.a2m/cache`).
-    /// Useful for CI (per-job dirs), shared caches, or XDG opt-in.
-    #[arg(long, value_name = "DIR", global = true)]
-    pub cache_dir: Option<PathBuf>,
-
-    /// Bypass the persistent cache entirely. Bundles are materialized in
-    /// a tempdir for the duration of the command and cleaned up at exit.
-    /// Useful for cold-path benchmarks or to verify the persistent cache
-    /// isn't lying. Cannot share data across runs.
-    #[arg(long, global = true)]
-    pub no_cache: bool,
-}
-
-impl CacheArgs {
-    /// Resolve the effective cache root for `path`, honoring overrides.
-    /// Returns `(root, ephemeral_handle)` — keep `ephemeral_handle` alive
-    /// for the duration of the command; dropping it deletes the tempdir.
-    ///
-    /// # Errors
-    /// Propagates I/O errors from tempdir creation when `no_cache` is set.
-    pub fn resolve(
-        &self,
-        path: &Path,
-    ) -> Result<(PathBuf, Option<tempfile::TempDir>), crate::error::AstToMermaidError> {
-        if self.no_cache {
-            let dir = tempfile::Builder::new().prefix("a2m-no-cache-").tempdir()?;
-            return Ok((dir.path().to_path_buf(), Some(dir)));
-        }
-        let root = self.cache_dir.clone().unwrap_or_else(|| {
-            let toplevel =
-                crate::git_source::show_toplevel(path).unwrap_or_else(|_| path.to_path_buf());
-            Cache::default_root(&toplevel)
-        });
-        Ok((root, None))
-    }
-}
-
-/// CLI args for the `index` subcommand.
-#[derive(Debug, Clone, clap::Args)]
-pub struct IndexFlags {
-    /// Path to a source root. Used as a subdir hint when `--ref` is set.
-    pub path: PathBuf,
-
-    /// Read source from a git ref. Without this, the working tree is
-    /// indexed under a synthetic `wt-<digest>` snapshot id.
-    #[arg(long, value_name = "GIT-REF")]
-    pub r#ref: Option<String>,
-
-    /// Re-materialize the bundle even if a cached one exists.
-    #[arg(long)]
-    pub force: bool,
-
-    /// Also emit `sequences/<id>.mmd` for every Rust function whose body
-    /// has at least one step. Off by default; roughly doubles wall-time.
-    #[arg(long)]
-    pub with_sequences: bool,
-
-    /// Shared cache flags (`--cache-dir`, `--no-cache`).
-    #[command(flatten)]
-    pub cache: CacheArgs,
 }
 
 /// Run the `index` subcommand: materialize a bundle for a ref (or the
@@ -424,35 +262,6 @@ pub fn run_index(flags: &IndexFlags) -> ExitCode {
         report.edges_resolved,
     );
     ExitCode::Success
-}
-
-/// CLI args for the `diff` subcommand.
-#[derive(Debug, Clone, clap::Args)]
-pub struct DiffFlags {
-    /// `<ref-a>..<ref-b>` — set-diff bundle(a) → bundle(b). Mirrors
-    /// `git diff a..b` syntax.
-    pub range: String,
-
-    /// Path inside the repo (subdir hint). Default = current directory.
-    #[arg(long, default_value = ".")]
-    pub path: PathBuf,
-
-    /// Output format.
-    #[arg(long, value_enum, default_value_t = DiffFormat::Mermaid)]
-    pub format: DiffFormat,
-
-    /// Shared cache flags (`--cache-dir`, `--no-cache`).
-    #[command(flatten)]
-    pub cache: CacheArgs,
-}
-
-/// Output format for `a2m diff`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
-pub enum DiffFormat {
-    /// Annotated Mermaid graph (human-readable).
-    Mermaid,
-    /// Structured JSON delta (machine-readable).
-    Json,
 }
 
 /// Run the `diff` subcommand: compute the structural diff between two
@@ -565,32 +374,6 @@ fn ensure_indexed(
     Ok(sha)
 }
 
-/// CLI args for the `gc` subcommand.
-#[derive(Debug, Clone, clap::Args)]
-pub struct GcFlags {
-    /// Path inside the repo. Used only to locate the cache root via
-    /// `git rev-parse --show-toplevel`.
-    #[arg(long, default_value = ".")]
-    pub path: PathBuf,
-
-    /// Soft cap in bytes (suffixes: `K`, `M`, `G`). Default 1G.
-    #[arg(long, value_name = "SIZE", default_value = "1G")]
-    pub max_size: String,
-
-    /// Evict entries older than this duration (e.g. `30d`, `2w`, `12h`).
-    /// No default — when unset, eviction is purely size-based.
-    #[arg(long, value_name = "DURATION")]
-    pub older_than: Option<String>,
-
-    /// Compute what would be removed, but don't touch the filesystem.
-    #[arg(long)]
-    pub dry_run: bool,
-
-    /// Shared cache flags (`--cache-dir`, `--no-cache`).
-    #[command(flatten)]
-    pub cache: CacheArgs,
-}
-
 /// Run the `gc` subcommand: evict old / oversized cache entries.
 #[must_use]
 pub fn run_gc(flags: &GcFlags) -> ExitCode {
@@ -656,80 +439,6 @@ pub fn run_gc(flags: &GcFlags) -> ExitCode {
     ExitCode::Success
 }
 
-fn parse_size(s: &str) -> crate::error::Result<u64> {
-    let s = s.trim();
-    if s.is_empty() {
-        return Err(crate::error::AstToMermaidError::InvalidInput(
-            "empty value".into(),
-        ));
-    }
-    let (num, mult) = match s.chars().last() {
-        Some('K' | 'k') => (&s[..s.len() - 1], 1024_u64),
-        Some('M' | 'm') => (&s[..s.len() - 1], 1024_u64 * 1024),
-        Some('G' | 'g') => (&s[..s.len() - 1], 1024_u64 * 1024 * 1024),
-        _ => (s, 1_u64),
-    };
-    num.parse::<u64>()
-        .map_err(|e| {
-            crate::error::AstToMermaidError::InvalidInput(format!(
-                "expected `<num>[K|M|G]`, got `{s}`: {e}"
-            ))
-        })
-        .map(|n| n * mult)
-}
-
-fn parse_duration(s: &str) -> crate::error::Result<Duration> {
-    let s = s.trim();
-    if s.is_empty() {
-        return Err(crate::error::AstToMermaidError::InvalidInput(
-            "empty value".into(),
-        ));
-    }
-    let (num, secs) = match s.chars().last() {
-        Some('s') => (&s[..s.len() - 1], 1_u64),
-        Some('m') => (&s[..s.len() - 1], 60),
-        Some('h') => (&s[..s.len() - 1], 60 * 60),
-        Some('d') => (&s[..s.len() - 1], 24 * 60 * 60),
-        Some('w') => (&s[..s.len() - 1], 7 * 24 * 60 * 60),
-        _ => (s, 1),
-    };
-    num.parse::<u64>()
-        .map_err(|e| {
-            crate::error::AstToMermaidError::InvalidInput(format!(
-                "expected `<num>[s|m|h|d|w]`, got `{s}`: {e}"
-            ))
-        })
-        .map(|n| Duration::from_secs(n * secs))
-}
-
-/// CLI args for the `bundle` subcommand.
-#[derive(Debug, Clone, clap::Args)]
-pub struct BundleFlags {
-    /// Path to a source root (file or directory).
-    pub path: PathBuf,
-
-    /// Output directory for the bundle (`overview.mmd`, `index.json`,
-    /// `entities/<id>.mmd`, `entities/<id>.meta.json`, and optionally
-    /// `sequences/<id>.mmd` when `--with-sequences` is set).
-    #[arg(short, long)]
-    pub out: PathBuf,
-
-    /// Extra directory basenames to skip (comma-separated). Always combined
-    /// with the built-in skip set.
-    #[arg(short = 'x', long, default_value = "")]
-    pub exclude: String,
-
-    /// Read source from a git ref (e.g. `main`, `v0.1.0`, `HEAD~3`)
-    /// instead of the working tree.
-    #[arg(long, value_name = "GIT-REF")]
-    pub r#ref: Option<String>,
-
-    /// Also emit `sequences/<id>.mmd` for every Rust function whose body
-    /// has at least one step. Off by default; roughly doubles wall-time.
-    #[arg(long)]
-    pub with_sequences: bool,
-}
-
 /// Run the artifact-bundle subcommand: parse → resolve → emit a directory
 /// of per-entity Mermaid + metadata files plus a top-level `index.json`.
 #[must_use]
@@ -779,39 +488,6 @@ pub fn run_bundle(flags: &BundleFlags) -> ExitCode {
     );
 
     ExitCode::Success
-}
-
-/// CLI args for the `sequence` subcommand.
-#[derive(Debug, Clone, clap::Args)]
-pub struct SequenceFlags {
-    /// Path to a source root (file or directory).
-    pub path: PathBuf,
-
-    /// Function to render. Plain `name` for a free function,
-    /// `Type::method` to disambiguate by impl owner. Required unless
-    /// `--all` is set.
-    #[arg(short, long, conflicts_with = "all")]
-    pub target: Option<String>,
-
-    /// Render every function in the source tree. One `.mmd` file is
-    /// written per function; requires `--out <DIR>`.
-    #[arg(long, conflicts_with = "target")]
-    pub all: bool,
-
-    /// Extra directory basenames to skip during the walk
-    /// (comma-separated). Combined with the built-in skip set.
-    #[arg(short = 'x', long, default_value = "")]
-    pub exclude: String,
-
-    /// In single-target mode: file to write Mermaid output to (default
-    /// stdout). In `--all` mode: directory that receives one `.mmd` per
-    /// function.
-    #[arg(short, long)]
-    pub out: Option<PathBuf>,
-
-    /// Read source from a git ref instead of the working tree.
-    #[arg(long, value_name = "GIT-REF")]
-    pub r#ref: Option<String>,
 }
 
 /// Run the `sequence` subcommand. Two modes:
@@ -1053,14 +729,8 @@ fn collect_rust_sources(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn parse_csv_exclude_trims_and_drops_empties() {
-        assert_eq!(parse_csv_exclude("a,, b ,c"), vec!["a", "b", "c"]);
-        assert!(parse_csv_exclude("").is_empty());
-        assert!(parse_csv_exclude(" , , ").is_empty());
-        assert_eq!(parse_csv_exclude("target"), vec!["target"]);
-    }
+    use crate::cli::flags::{CacheArgs, DiffFormat};
+    use std::path::PathBuf;
 
     #[test]
     fn module_level_without_target_returns_usage_error() {
@@ -1088,13 +758,6 @@ mod tests {
         };
         let code = run_analyze(Level::Project, &flags);
         assert_eq!(code, ExitCode::Failure);
-    }
-
-    #[test]
-    fn exit_code_converts_to_process_exit_code() {
-        let _ = process::ExitCode::from(ExitCode::Success);
-        let _ = process::ExitCode::from(ExitCode::Failure);
-        let _ = process::ExitCode::from(ExitCode::UsageError);
     }
 
     #[test]
@@ -1290,99 +953,6 @@ mod tests {
         std::fs::write(&path, content).unwrap();
         git(dir, &["add", file_rel]);
         git(dir, &["commit", "-q", "-m", "init"]);
-    }
-
-    // --- parse_size --------------------------------------------------------
-
-    #[test]
-    fn parse_size_plain_bytes() {
-        assert_eq!(parse_size("42").unwrap(), 42);
-    }
-
-    #[test]
-    fn parse_size_suffixes_kilo_mega_giga() {
-        assert_eq!(parse_size("2K").unwrap(), 2 * 1024);
-        assert_eq!(parse_size("3m").unwrap(), 3 * 1024 * 1024);
-        assert_eq!(parse_size("1G").unwrap(), 1024 * 1024 * 1024);
-        // Mixed-case suffixes accepted.
-        assert_eq!(parse_size("4k").unwrap(), 4 * 1024);
-    }
-
-    #[test]
-    fn parse_size_empty_errors() {
-        let err = parse_size("   ").unwrap_err().to_string();
-        assert!(err.contains("empty"), "got: {err}");
-    }
-
-    #[test]
-    fn parse_size_non_numeric_errors() {
-        let err = parse_size("abc").unwrap_err().to_string();
-        assert!(err.contains("expected"), "got: {err}");
-    }
-
-    // --- parse_duration ----------------------------------------------------
-
-    #[test]
-    fn parse_duration_units() {
-        assert_eq!(parse_duration("30s").unwrap(), Duration::from_secs(30));
-        assert_eq!(parse_duration("2m").unwrap(), Duration::from_secs(120));
-        assert_eq!(parse_duration("1h").unwrap(), Duration::from_secs(3600));
-        assert_eq!(parse_duration("1d").unwrap(), Duration::from_secs(86400));
-        assert_eq!(parse_duration("1w").unwrap(), Duration::from_secs(604_800));
-        // No suffix => seconds.
-        assert_eq!(parse_duration("7").unwrap(), Duration::from_secs(7));
-    }
-
-    #[test]
-    fn parse_duration_empty_errors() {
-        assert!(
-            parse_duration("")
-                .unwrap_err()
-                .to_string()
-                .contains("empty")
-        );
-    }
-
-    #[test]
-    fn parse_duration_non_numeric_errors() {
-        let err = parse_duration("xs").unwrap_err().to_string();
-        assert!(err.contains("expected"), "got: {err}");
-    }
-
-    // --- CacheArgs::resolve ------------------------------------------------
-
-    #[test]
-    fn cache_args_resolve_no_cache_returns_tempdir_handle() {
-        let args = CacheArgs {
-            cache_dir: None,
-            no_cache: true,
-        };
-        let (root, handle) = args.resolve(Path::new("/tmp")).expect("resolve no_cache");
-        assert!(handle.is_some(), "no_cache must keep a tempdir alive");
-        assert!(root.exists(), "tempdir root must exist while handle held");
-    }
-
-    #[test]
-    fn cache_args_resolve_explicit_cache_dir_wins() {
-        let tmp = tempfile::tempdir().expect("tmp");
-        let explicit = tmp.path().join("explicit-cache");
-        let args = CacheArgs {
-            cache_dir: Some(explicit.clone()),
-            no_cache: false,
-        };
-        let (root, handle) = args.resolve(Path::new("/tmp")).expect("resolve");
-        assert_eq!(root, explicit);
-        assert!(handle.is_none(), "explicit cache_dir is persistent");
-    }
-
-    #[test]
-    fn cache_args_resolve_default_outside_git_falls_back_to_path() {
-        let tmp = tempfile::tempdir().expect("tmp");
-        let args = CacheArgs::default();
-        let (root, handle) = args.resolve(tmp.path()).expect("resolve");
-        // Outside a git repo, default_root is built from `path` itself.
-        assert_eq!(root, Cache::default_root(tmp.path()));
-        assert!(handle.is_none());
     }
 
     // --- run_walk_ref ------------------------------------------------------
