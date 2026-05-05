@@ -14,7 +14,7 @@
 #![warn(missing_docs)]
 #![deny(unsafe_code)]
 
-use ast_to_mermaid::cli_support::{
+use ast_to_mermaid::cli::{
     AnalyzeFlags, BundleFlags, DiffFlags, ExitCode, GcFlags, IndexFlags, SequenceFlags, WalkFlags,
     run_analyze, run_bundle, run_diff, run_gc, run_index, run_sequence, run_walk,
 };

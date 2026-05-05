@@ -21,7 +21,7 @@
 
 pub mod artifacts;
 pub mod cache;
-pub mod cli_support;
+pub mod cli;
 pub mod diff;
 pub mod error;
 pub mod git_source;
@@ -33,6 +33,7 @@ pub mod render;
 pub mod resolve;
 pub mod sequence;
 
+pub use cli::*;
 pub use error::{AstToMermaidError, Result};
 pub use graph::Store;
 pub use model::{AtomKind, CodeAtom, Edge, EdgeKind, EntityId};
