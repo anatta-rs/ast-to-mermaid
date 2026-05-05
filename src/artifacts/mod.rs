@@ -130,6 +130,12 @@ pub fn emit_artifacts_with_sequences(
 /// Extract `sequenceDiagram` artifacts for every function entity whose
 /// `file_path` resolves in `sequence_sources` and whose body has at
 /// least one step.
+///
+/// Each source file is parsed exactly once: we group function entities by
+/// file, drive [`sequence::parse_source_once`] + [`sequence::extract_all`]
+/// once per file, then walk entities in their original order to preserve
+/// the output Vec layout (callers depend on it for stable on-disk
+/// ordering).
 fn build_sequences(
     entities: &[EntityArtifact],
     sequence_sources: &[(String, Vec<u8>)],
@@ -142,7 +148,10 @@ fn build_sequences(
         .map(|(p, c)| (p.as_str(), c.as_slice()))
         .collect();
 
-    let mut out = Vec::new();
+    // Pass 1: collect target function names per file (preserving original
+    // entity order so the resulting maps are independent of HashMap
+    // iteration order).
+    let mut targets_by_file: HashMap<&str, Vec<String>> = HashMap::new();
     for entity in entities {
         if entity.kind.as_str() != "function" {
             continue;
@@ -153,13 +162,50 @@ fn build_sequences(
         // `file` looks like `src/foo.rs:10-42` — split on the trailing
         // `:line-line` we appended in `entity_meta`.
         let file_path = file.rsplit_once(':').map_or(file, |(p, _)| p);
-        let Some(content) = by_path.get(file_path).copied() else {
+        if !by_path.contains_key(file_path) {
+            continue;
+        }
+        let Some(qualified) = qualified_fn_name(entity.id.as_str()) else {
+            continue;
+        };
+        targets_by_file
+            .entry(file_path)
+            .or_default()
+            .push(qualified);
+    }
+
+    // Pass 2: parse each file exactly once and bulk-extract every target.
+    let mut sequences_by_file: HashMap<&str, sequence::SequenceMap> = HashMap::new();
+    for (file_path, targets) in &targets_by_file {
+        let content = by_path[*file_path];
+        let Ok(text) = std::str::from_utf8(content) else {
+            continue;
+        };
+        let Ok(tree) = sequence::parse_source_once(content, file_path) else {
+            continue;
+        };
+        let target_refs: Vec<&str> = targets.iter().map(String::as_str).collect();
+        sequences_by_file.insert(file_path, sequence::extract_all(&tree, text, &target_refs));
+    }
+
+    // Pass 3: assemble artifacts in original entity order, looking up
+    // each diagram in the per-file map.
+    let mut out = Vec::new();
+    for entity in entities {
+        if entity.kind.as_str() != "function" {
+            continue;
+        }
+        let Some(file) = entity.meta.get("file").and_then(Value::as_str) else {
+            continue;
+        };
+        let file_path = file.rsplit_once(':').map_or(file, |(p, _)| p);
+        let Some(map) = sequences_by_file.get(file_path) else {
             continue;
         };
         let Some(qualified) = qualified_fn_name(entity.id.as_str()) else {
             continue;
         };
-        let Ok(diagram) = sequence::extract(content, file_path, &qualified) else {
+        let Some(diagram) = map.get(&qualified) else {
             continue;
         };
         if diagram.steps.is_empty() {
@@ -167,7 +213,7 @@ fn build_sequences(
         }
         out.push(SequenceArtifact {
             entity_id: entity.id.clone(),
-            mmd: sequence::render(&diagram),
+            mmd: sequence::render(diagram),
         });
     }
     out
