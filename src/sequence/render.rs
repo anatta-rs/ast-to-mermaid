@@ -1,7 +1,8 @@
 //! [`SequenceDiagram`] → Mermaid `sequenceDiagram` text.
 
-use super::visit::{DEPTH_LIMIT_LABEL, max_ast_depth};
+use super::visit::DEPTH_LIMIT_LABEL;
 use super::{Participant, SELF_ID, SequenceDiagram, Step};
+use crate::limits::max_ast_depth;
 use crate::render::util::escape_label_sequence;
 use std::fmt::Write;
 

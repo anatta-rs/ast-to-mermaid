@@ -3,37 +3,10 @@
 //! depth-first, left-to-right.
 
 use super::{Participant, SELF_ID, Step};
+use crate::limits::max_ast_depth;
 use crate::render::util::sanitize_id;
 use std::collections::HashSet;
 use tree_sitter::Node;
-
-/// Default AST recursion depth limit shared by every recursive AST
-/// visitor in this crate ([`State::walk_expr`], [`field_receiver_root`],
-/// [`super::render::write_step`], and the parser's `flatten_use`).
-///
-/// The guard turns a deeply nested adversarial source file into a
-/// degraded-but-finite diagram instead of a stack-overflow crash.
-/// Override at runtime with the `A2M_MAX_AST_DEPTH` env var; see
-/// [`max_ast_depth`].
-pub const MAX_AST_DEPTH: usize = 256;
-
-/// Resolved AST recursion depth limit. Returns the parsed value of
-/// `A2M_MAX_AST_DEPTH` when it is set to a positive integer, otherwise
-/// falls back to [`MAX_AST_DEPTH`]. Read fresh on every call so a test
-/// (or operator) can change the limit per run without restart.
-#[must_use]
-pub fn max_ast_depth() -> usize {
-    resolve_max_ast_depth(std::env::var("A2M_MAX_AST_DEPTH").ok().as_deref())
-}
-
-/// Pure resolver behind [`max_ast_depth`]: takes the raw env value (or
-/// `None`) and returns the depth limit. Split out so unit tests can
-/// exercise the override logic without mutating process env.
-fn resolve_max_ast_depth(raw: Option<&str>) -> usize {
-    raw.and_then(|v| v.parse::<usize>().ok())
-        .filter(|n| *n > 0)
-        .unwrap_or(MAX_AST_DEPTH)
-}
 
 /// Marker text emitted into the diagram (sequence note / mermaid note)
 /// when a visitor short-circuits at the depth cap. Kept as a single
@@ -546,27 +519,4 @@ fn is_skipped_macro(name: &str) -> bool {
 /// because they parse as `call_expression` but carry no flow meaning.
 fn is_skipped_constructor(name: &str) -> bool {
     matches!(name, "Some" | "None" | "Ok" | "Err")
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn resolve_max_ast_depth_respects_env_override() {
-        // Pure resolver: a positive integer in the env wins over the
-        // default. This is the exact path `max_ast_depth()` runs after
-        // reading `A2M_MAX_AST_DEPTH`.
-        assert_eq!(resolve_max_ast_depth(Some("8")), 8);
-        assert_eq!(resolve_max_ast_depth(Some("1024")), 1024);
-    }
-
-    #[test]
-    fn resolve_max_ast_depth_falls_back_on_garbage() {
-        assert_eq!(resolve_max_ast_depth(Some("0")), MAX_AST_DEPTH);
-        assert_eq!(resolve_max_ast_depth(Some("-3")), MAX_AST_DEPTH);
-        assert_eq!(resolve_max_ast_depth(Some("not-a-number")), MAX_AST_DEPTH);
-        assert_eq!(resolve_max_ast_depth(Some("")), MAX_AST_DEPTH);
-        assert_eq!(resolve_max_ast_depth(None), MAX_AST_DEPTH);
-    }
 }
