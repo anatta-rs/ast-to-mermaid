@@ -5,7 +5,7 @@
 //! flat repos (no `crates/` prefix), the leading path segment is used.
 
 use crate::graph::Store;
-use crate::model::EdgeKind;
+use crate::model::EntityId;
 use crate::render::util::{crate_name, escape_label, mermaid_id};
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write as _;
@@ -13,13 +13,13 @@ use std::fmt::Write as _;
 const KINDS: &[&str] = &["module", "function", "struct", "trait", "impl", "enum"];
 
 #[derive(Default, Debug, Clone, PartialEq, Eq)]
-struct CrateCounts {
+struct CrateMeta {
     modules: usize,
     functions: usize,
     structs: usize,
 }
 
-impl CrateCounts {
+impl CrateMeta {
     fn bump(&mut self, kind: &str) {
         match kind {
             "module" => self.modules += 1,
@@ -45,42 +45,34 @@ impl CrateCounts {
 pub fn render(store: &Store) -> String {
     let atoms = store.atoms_by_kinds(KINDS);
 
-    // Build crate-count map.
-    let mut counts: BTreeMap<String, CrateCounts> = BTreeMap::new();
+    // Build crate-count map and an id→crate map in a single pass over
+    // `atoms`. The id map lets the edge loop resolve a callee's crate
+    // without reaching back into the store, avoiding per-edge atom clones.
+    let mut counts: BTreeMap<String, CrateMeta> = BTreeMap::new();
+    let mut id_to_crate: HashMap<&EntityId, &str> = HashMap::with_capacity(atoms.len());
     for atom in &atoms {
-        let c = crate_name(&atom.file_path).to_owned();
-        if !c.is_empty() {
-            counts.entry(c).or_default().bump(&atom.kind);
+        let c = crate_name(&atom.file_path);
+        if c.is_empty() {
+            continue;
         }
+        counts.entry(c.to_owned()).or_default().bump(&atom.kind);
+        id_to_crate.insert(&atom.id, c);
     }
 
-    // Build a file_path → crate_name map for the edge pass.
-    let mut file_to_crate: HashMap<String, String> = HashMap::new();
-    for atom in &atoms {
-        let c = crate_name(&atom.file_path).to_owned();
-        if !c.is_empty() {
-            file_to_crate.insert(atom.file_path.clone(), c);
-        }
-    }
-
-    // Cross-crate call edges.
+    // Cross-crate call edges. Forward adjacency via `call_edges_from`
+    // makes this O(F·avg_degree); the callee crate comes from the local
+    // id map, so no `Atom` or `Edge` is cloned in the hot loop.
     let mut edges: BTreeMap<(String, String), usize> = BTreeMap::new();
-    let functions = store.atoms_by_kind("function");
-    for caller in &functions {
-        let Some(caller_crate) = file_to_crate.get(&caller.file_path) else {
+    for caller in atoms.iter().filter(|a| a.kind == "function") {
+        let Some(&caller_crate) = id_to_crate.get(&caller.id) else {
             continue;
         };
-        let calls_out = store.edges_from(&caller.id);
-        for edge in calls_out {
-            if edge.kind != EdgeKind::Calls {
-                continue;
-            }
-            if let Some(callee) = store.get_atom(&edge.to)
-                && let Some(callee_crate) = file_to_crate.get(&callee.file_path)
+        for callee_id in store.call_edges_from(&caller.id) {
+            if let Some(&callee_crate) = id_to_crate.get(&callee_id)
                 && callee_crate != caller_crate
             {
                 *edges
-                    .entry((caller_crate.clone(), callee_crate.clone()))
+                    .entry((caller_crate.to_owned(), callee_crate.to_owned()))
                     .or_default() += 1;
             }
         }
@@ -280,7 +272,7 @@ mod tests {
 
     #[test]
     fn crate_counts_default_and_bump() {
-        let mut c = CrateCounts::default();
+        let mut c = CrateMeta::default();
         assert_eq!(c.functions, 0);
         c.bump("function");
         c.bump("function");

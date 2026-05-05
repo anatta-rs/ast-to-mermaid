@@ -48,6 +48,10 @@ path = "src/bin/a2m.rs"
 name = "store"
 harness = false
 
+[[bench]]
+name = "render"
+harness = false
+
 [lints.rust]
 unsafe_code = "deny"
 missing_docs = "warn"
