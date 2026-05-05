@@ -26,6 +26,7 @@ pub mod diff;
 pub mod error;
 pub mod git_source;
 pub mod graph;
+pub mod limits;
 pub mod model;
 pub mod parser;
 pub mod pipeline;

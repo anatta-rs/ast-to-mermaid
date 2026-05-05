@@ -6,7 +6,7 @@ use tree_sitter::{Node, QueryCursor, StreamingIterator};
 
 use super::ExtractedCalls;
 use super::queries;
-use crate::sequence::max_ast_depth;
+use crate::limits::max_ast_depth;
 
 // ── Use-import extraction ─────────────────────────────────────────────────────
 

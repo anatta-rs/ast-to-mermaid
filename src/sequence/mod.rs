@@ -31,7 +31,6 @@ mod render;
 mod visit;
 
 pub use render::render;
-pub use visit::{MAX_AST_DEPTH, max_ast_depth};
 
 /// Map from qualified target name (`name` or `Owner::name`) to the
 /// extracted [`SequenceDiagram`]. Returned by [`extract_all`].
@@ -477,8 +476,9 @@ mod tests {
 
     /// Reproduces issue #75: a 1000-deep call chain must not stack-overflow
     /// the AST walker. The depth guard caps recursion at
-    /// [`MAX_AST_DEPTH`] and emits exactly one `…depth limit…` marker
-    /// note so the diagram still renders deterministically.
+    /// [`crate::limits::MAX_AST_DEPTH`] and emits exactly one
+    /// `…depth limit…` marker note so the diagram still renders
+    /// deterministically.
     #[test]
     fn depth_limit_one_thousand_deep_call_chain() {
         let mut src = String::from("fn deep() {\n    ");
@@ -515,26 +515,5 @@ mod tests {
             mermaid.contains("depth limit"),
             "rendered output must surface the depth-limit marker:\n{mermaid}",
         );
-    }
-
-    #[test]
-    fn max_ast_depth_default_constant_value() {
-        // The default cap stays put at 256 — bumped only by an
-        // intentional code change. Test guards against accidental drift.
-        assert_eq!(MAX_AST_DEPTH, 256);
-    }
-
-    #[test]
-    fn max_ast_depth_resolver_treats_invalid_env_as_default() {
-        // The public `max_ast_depth()` reads the env each call; with no
-        // override set it must equal `MAX_AST_DEPTH`. We cannot mutate
-        // env safely under `deny(unsafe_code)`, so the override path is
-        // verified end-to-end by the binary `a2m` (see test plan in
-        // issue #75) and locally by callers that feed an explicit
-        // `A2M_MAX_AST_DEPTH` to a subprocess.
-        let key = "A2M_MAX_AST_DEPTH";
-        if std::env::var(key).is_err() {
-            assert_eq!(max_ast_depth(), MAX_AST_DEPTH);
-        }
     }
 }
