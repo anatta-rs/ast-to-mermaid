@@ -532,11 +532,25 @@ fn run_sequence_single(
     out: Option<&Path>,
     path: &Path,
 ) -> ExitCode {
+    // Parse each file at most once: a single `parse_source_once` feeds
+    // both `list_functions_in_tree` (does the file declare `target`?)
+    // and `extract_all` (extract the diagram on the same tree). Once a
+    // match is found we break — files past it are never parsed.
     let mut diagram = None;
     for (file_rel, content) in candidates {
-        if let Ok(d) = sequence::extract(content, file_rel, target) {
-            diagram = Some((file_rel.clone(), d));
-            break;
+        let Ok(text) = std::str::from_utf8(content) else {
+            continue;
+        };
+        let Ok(tree) = sequence::parse_source_once(content, file_rel) else {
+            continue;
+        };
+        let names = sequence::list_functions_in_tree(&tree, text);
+        if names.iter().any(|n| n == target) {
+            let mut map = sequence::extract_all(&tree, text, &[target]);
+            if let Some(d) = map.remove(target) {
+                diagram = Some((file_rel.clone(), d));
+                break;
+            }
         }
     }
     let Some((file_rel, diagram)) = diagram else {
@@ -576,48 +590,59 @@ fn run_sequence_all(candidates: &[(String, Vec<u8>)], out: Option<&Path>) -> Exi
         return ExitCode::Failure;
     }
 
-    // Pass 1: enumerate every (file, function name) candidate and its
-    // would-be filename, so we can spot pre-collisions on
-    // case-insensitive filesystems (macOS APFS default, Windows NTFS)
-    // before any file is written.
-    let mut entries: Vec<(usize, String, String)> = Vec::new();
+    // Pass 1: parse each file exactly once, enumerate functions on the
+    // resulting tree, then `extract_all` to collect every diagram in a
+    // single AST traversal. Pre-v0.6.0 this re-parsed each file 1+N
+    // times (once for `list_functions`, once per function for `extract`).
+    let mut entries: Vec<(String, String, String, sequence::SequenceDiagram)> = Vec::new();
     let mut skipped = 0usize;
-    for (file_idx, (file_rel, content)) in candidates.iter().enumerate() {
-        let names = match sequence::list_functions(content) {
-            Ok(n) => n,
+    for (file_rel, content) in candidates {
+        let text = match std::str::from_utf8(content) {
+            Ok(s) => s,
             Err(e) => {
                 eprintln!("sequence: parse {file_rel}: {e}");
                 skipped += 1;
                 continue;
             }
         };
+        let tree = match sequence::parse_source_once(content, file_rel) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("sequence: parse {file_rel}: {e}");
+                skipped += 1;
+                continue;
+            }
+        };
+        let names = sequence::list_functions_in_tree(&tree, text);
+        let target_refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        let mut map = sequence::extract_all(&tree, text, &target_refs);
         for name in names {
+            let Some(diagram) = map.remove(&name) else {
+                skipped += 1;
+                continue;
+            };
+            if diagram.steps.is_empty() {
+                skipped += 1;
+                continue;
+            }
             let base = sequence_filename(file_rel, &name);
-            entries.push((file_idx, name, base));
+            entries.push((file_rel.clone(), name, base, diagram));
         }
     }
 
+    // Detect pre-collisions on case-insensitive filesystems (macOS APFS
+    // default, Windows NTFS) before any file is written.
     let mut lower_counts: std::collections::HashMap<String, usize> =
         std::collections::HashMap::new();
-    for (_, _, base) in &entries {
+    for (_, _, base, _) in &entries {
         *lower_counts.entry(base.to_ascii_lowercase()).or_insert(0) += 1;
     }
 
-    // Pass 2: extract + render + write. Bases that case-fold to the
-    // same lowercase as another candidate get a `_H<hash>` suffix from
-    // [`crate::artifacts::hash_disambig`] so all members survive on
-    // disk.
+    // Pass 2: render + write. Bases that case-fold to the same lowercase
+    // as another candidate get a `_H<hash>` suffix from
+    // [`crate::artifacts::hash_disambig`] so all members survive on disk.
     let mut written = 0usize;
-    for (file_idx, name, base) in &entries {
-        let (file_rel, content) = &candidates[*file_idx];
-        let Ok(diagram) = sequence::extract(content, file_rel, name) else {
-            skipped += 1;
-            continue;
-        };
-        if diagram.steps.is_empty() {
-            skipped += 1;
-            continue;
-        }
+    for (file_rel, name, base, diagram) in &entries {
         let collides = lower_counts
             .get(&base.to_ascii_lowercase())
             .copied()
@@ -634,7 +659,7 @@ fn run_sequence_all(candidates: &[(String, Vec<u8>)], out: Option<&Path>) -> Exi
             base.clone()
         };
         let target_path = out_dir.join(&final_name);
-        let rendered = sequence::render(&diagram);
+        let rendered = sequence::render(diagram);
         if let Err(e) = std::fs::write(&target_path, rendered) {
             eprintln!("sequence: write {}: {e}", target_path.display());
             return ExitCode::Failure;
@@ -688,6 +713,10 @@ fn collect_rust_sources(
     if let Some(git_ref) = git_ref {
         let toplevel = crate::git_source::show_toplevel(root)?;
         let entries = crate::git_source::ls_tree(&toplevel, git_ref)?;
+        // One persistent `git cat-file --batch` child amortises the
+        // subprocess fork across every blob — a per-blob spawn is ~50x
+        // slower on a 100-blob ref (50+s vs <1s).
+        let mut reader = crate::git_source::BatchReader::spawn(&toplevel)?;
         let mut out = Vec::new();
         for entry in entries {
             if !Path::new(&entry.path)
@@ -696,7 +725,7 @@ fn collect_rust_sources(
             {
                 continue;
             }
-            let content = crate::git_source::cat_file(&toplevel, &entry.blob_sha)?;
+            let content = reader.read_blob(&entry.blob_sha)?;
             out.push((entry.path, content));
         }
         Ok(out)

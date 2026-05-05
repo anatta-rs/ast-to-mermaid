@@ -203,20 +203,6 @@ fn parse_ls_tree_z(stdout: &[u8]) -> Vec<TreeEntry> {
     out
 }
 
-/// Read a blob's content by SHA via `git cat-file -p`.
-///
-/// Thin wrapper around [`BatchReader`] kept for API compatibility and for
-/// one-shot reads outside of [`collect_from_git_ref`]-style loops. Callers
-/// reading many blobs from the same repo should construct a [`BatchReader`]
-/// directly to amortise the subprocess fork+exec across the whole batch.
-///
-/// # Errors
-/// Returns `InvalidInput` when the blob is missing or unreadable.
-pub fn cat_file(repo_root: &Path, blob_sha: &str) -> Result<Vec<u8>> {
-    let mut reader = BatchReader::spawn(repo_root)?;
-    reader.read_blob(blob_sha)
-}
-
 /// Persistent `git cat-file --batch` child process for amortised blob reads.
 ///
 /// Spawns one subprocess and feeds SHAs to its stdin, reading the blob bytes
@@ -593,22 +579,6 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].path, "src/lib.rs");
         assert_eq!(entries[0].blob_sha, blob);
-    }
-
-    #[test]
-    fn cat_file_reads_blob_content() {
-        let tmp = tempdir().unwrap();
-        let (blob, _) = init_repo(tmp.path(), "src/lib.rs", "fn x(){}\n");
-        let content = cat_file(tmp.path(), &blob).unwrap();
-        assert_eq!(content, b"fn x(){}\n");
-    }
-
-    #[test]
-    fn cat_file_unknown_blob_errors() {
-        let tmp = tempdir().unwrap();
-        let _ = init_repo(tmp.path(), "f.rs", "fn x(){}");
-        let err = cat_file(tmp.path(), "0000000000000000000000000000000000000000").unwrap_err();
-        assert!(err.to_string().contains("git cat-file"));
     }
 
     #[test]

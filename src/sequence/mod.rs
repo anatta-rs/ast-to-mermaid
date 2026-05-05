@@ -194,20 +194,26 @@ pub fn extract(content: &[u8], file_path: &str, target_fn: &str) -> Result<Seque
 /// names: `name` for free functions, `Owner::name` for methods inside an
 /// `impl` block. Order is depth-first source order.
 ///
+/// Thin wrapper over [`parse_source_once`] + [`list_functions_in_tree`] for
+/// callers that hold only the source bytes. Callers that already have a
+/// [`Tree`] (e.g. from a prior `parse_source_once` for `extract_all`) should
+/// drive [`list_functions_in_tree`] directly to amortise the parse.
+///
 /// # Errors
 ///
 /// Same shapes as [`extract`] for UTF-8 / parse failures.
 pub fn list_functions(content: &[u8]) -> Result<Vec<String>> {
     let text = std::str::from_utf8(content)
         .map_err(|e| AstToMermaidError::InvalidInput(format!("invalid utf-8: {e}")))?;
-    let mut parser = TsParser::new();
-    parser
-        .set_language(&tree_sitter_rust::LANGUAGE.into())
-        .map_err(|e| AstToMermaidError::InvalidInput(format!("set_language: {e}")))?;
-    let tree = parser
-        .parse(content, None)
-        .ok_or_else(|| AstToMermaidError::InvalidInput("tree-sitter parse failed".into()))?;
+    let tree = parse_source_once(content, "<unknown>")?;
+    Ok(list_functions_in_tree(&tree, text))
+}
 
+/// List every function defined in `tree`, returning their qualified names.
+/// Walks the AST without re-parsing; `tree` must come from
+/// [`parse_source_once`] over `source`'s bytes.
+#[must_use]
+pub fn list_functions_in_tree(tree: &Tree, source: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let mut stack: Vec<(Node, Option<String>)> = vec![(tree.root_node(), None)];
     // Depth-first, but preserve source order: push children in reverse so
@@ -215,7 +221,7 @@ pub fn list_functions(content: &[u8]) -> Result<Vec<String>> {
     while let Some((node, container)) = stack.pop() {
         if node.kind() == "function_item"
             && let Some(name_node) = node.child_by_field_name("name")
-            && let Ok(name) = name_node.utf8_text(text.as_bytes())
+            && let Ok(name) = name_node.utf8_text(source.as_bytes())
         {
             let qualified = container
                 .as_deref()
@@ -224,7 +230,7 @@ pub fn list_functions(content: &[u8]) -> Result<Vec<String>> {
         }
         let next_container = if node.kind() == "impl_item" {
             node.child_by_field_name("type")
-                .and_then(|n| n.utf8_text(text.as_bytes()).ok())
+                .and_then(|n| n.utf8_text(source.as_bytes()).ok())
                 .map(str::to_owned)
                 .or(container)
         } else {
@@ -236,7 +242,7 @@ pub fn list_functions(content: &[u8]) -> Result<Vec<String>> {
             stack.push((child, next_container.clone()));
         }
     }
-    Ok(out)
+    out
 }
 
 /// Locate `target_fn` in the file. Returns `(function_item node, optional
