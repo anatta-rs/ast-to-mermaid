@@ -107,6 +107,11 @@ impl Cache {
         fs::create_dir_all(root.join("blobs"))?;
         fs::create_dir_all(root.join("refs"))?;
 
+        // Reject if a hostile checkout has planted symlinks anywhere inside
+        // the cache: subsequent destructive ops (`fs::remove_dir_all`) would
+        // follow them out of the workspace.
+        walk_safe(&root)?;
+
         let version_path = root.join("version");
         let want = cache_version();
         let stale = match fs::read_to_string(&version_path) {
@@ -117,7 +122,7 @@ impl Cache {
             for sub in ["blobs", "refs"] {
                 let p = root.join(sub);
                 if p.exists() {
-                    fs::remove_dir_all(&p)?;
+                    remove_dir_all_safe(&p)?;
                     fs::create_dir_all(&p)?;
                 }
             }
@@ -266,10 +271,17 @@ impl Cache {
 
         if !opts.dry_run {
             for e in &to_remove {
-                if e.path.is_dir() {
-                    std::fs::remove_dir_all(&e.path)?;
+                let meta = fs::symlink_metadata(&e.path)?;
+                if meta.file_type().is_symlink() {
+                    return Err(AstToMermaidError::InvalidInput(format!(
+                        "refusing to remove symlink in cache: {}",
+                        e.path.display()
+                    )));
+                }
+                if meta.is_dir() {
+                    remove_dir_all_safe(&e.path)?;
                 } else {
-                    std::fs::remove_file(&e.path)?;
+                    fs::remove_file(&e.path)?;
                 }
             }
         }
@@ -362,13 +374,30 @@ pub fn atomic_rename(from: &Path, to: &Path) -> Result<()> {
 }
 
 fn collect_gc_entries(dir: &Path, kind: GcKind, out: &mut Vec<GcEntry>) -> Result<()> {
-    if !dir.is_dir() {
+    let dir_meta = match fs::symlink_metadata(dir) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e.into()),
+    };
+    if dir_meta.file_type().is_symlink() {
+        return Err(AstToMermaidError::InvalidInput(format!(
+            "refusing to enumerate symlinked cache directory: {}",
+            dir.display()
+        )));
+    }
+    if !dir_meta.is_dir() {
         return Ok(());
     }
-    for entry in std::fs::read_dir(dir)? {
+    for entry in fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();
-        let meta = entry.metadata()?;
+        let meta = fs::symlink_metadata(&path)?;
+        if meta.file_type().is_symlink() {
+            return Err(AstToMermaidError::InvalidInput(format!(
+                "refusing to follow symlink in cache: {}",
+                path.display()
+            )));
+        }
         let mtime = meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
         let size = match kind {
             GcKind::Bundle if meta.is_dir() => dir_size_recursive(&path)?,
@@ -381,16 +410,179 @@ fn collect_gc_entries(dir: &Path, kind: GcKind, out: &mut Vec<GcEntry>) -> Resul
 
 fn dir_size_recursive(dir: &Path) -> Result<u64> {
     let mut total = 0;
-    for entry in std::fs::read_dir(dir)? {
+    for entry in fs::read_dir(dir)? {
         let entry = entry?;
-        let meta = entry.metadata()?;
+        let path = entry.path();
+        let meta = fs::symlink_metadata(&path)?;
+        if meta.file_type().is_symlink() {
+            return Err(AstToMermaidError::InvalidInput(format!(
+                "refusing to follow symlink in cache: {}",
+                path.display()
+            )));
+        }
         if meta.is_dir() {
-            total += dir_size_recursive(&entry.path())?;
+            total += dir_size_recursive(&path)?;
         } else {
             total += meta.len();
         }
     }
     Ok(total)
+}
+
+/// Recursively walk `root` without following symlinks. Visits every regular
+/// file and directory in the subtree (including `root` itself) and returns
+/// `(path, metadata)` pairs in pre-order. If any symlink is encountered at
+/// `root` or any descendant, returns
+/// [`AstToMermaidError::InvalidInput`] without yielding partial results.
+///
+/// Used as the read-side counterpart to [`remove_dir_all_safe`] when the
+/// cache code needs to traverse a tree it cannot trust to be free of
+/// attacker-planted symlinks.
+///
+/// # Errors
+/// Propagates I/O errors, and returns `InvalidInput` when a symlink is
+/// found anywhere in the tree.
+pub fn walk_safe(root: &Path) -> Result<Vec<(PathBuf, fs::Metadata)>> {
+    let mut out = Vec::new();
+    walk_safe_into(root, &mut out)?;
+    Ok(out)
+}
+
+fn walk_safe_into(path: &Path, out: &mut Vec<(PathBuf, fs::Metadata)>) -> Result<()> {
+    let meta = fs::symlink_metadata(path)?;
+    if meta.file_type().is_symlink() {
+        return Err(AstToMermaidError::InvalidInput(format!(
+            "refusing to follow symlink in cache: {}",
+            path.display()
+        )));
+    }
+    let is_dir = meta.is_dir();
+    out.push((path.to_path_buf(), meta));
+    if is_dir {
+        for entry in fs::read_dir(path)? {
+            let entry = entry?;
+            walk_safe_into(&entry.path(), out)?;
+        }
+    }
+    Ok(())
+}
+
+/// Recursively remove `path`, refusing to follow symlinks at any level.
+///
+/// Unlike [`std::fs::remove_dir_all`], which dereferences symlinked
+/// directories and deletes their targets, this helper checks every entry
+/// with [`fs::symlink_metadata`] and bails out with
+/// [`AstToMermaidError::InvalidInput`] on the first symlink found. The
+/// removal itself walks the tree manually using `remove_file` for
+/// non-directories and `remove_dir` after children are gone, so an
+/// attacker who plants a symlink mid-traversal cannot trick the helper
+/// into deleting outside the cache.
+///
+/// # Errors
+/// Propagates I/O errors, and returns `InvalidInput` when a symlink is
+/// found anywhere in the tree (including at `path` itself).
+pub fn remove_dir_all_safe(path: &Path) -> Result<()> {
+    let meta = fs::symlink_metadata(path)?;
+    if meta.file_type().is_symlink() {
+        return Err(AstToMermaidError::InvalidInput(format!(
+            "refusing to remove symlink: {}",
+            path.display()
+        )));
+    }
+    if !meta.is_dir() {
+        return Err(AstToMermaidError::InvalidInput(format!(
+            "remove_dir_all_safe: not a directory: {}",
+            path.display()
+        )));
+    }
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        let child = entry.path();
+        let child_meta = fs::symlink_metadata(&child)?;
+        if child_meta.file_type().is_symlink() {
+            return Err(AstToMermaidError::InvalidInput(format!(
+                "refusing to remove symlink in cache: {}",
+                child.display()
+            )));
+        }
+        if child_meta.is_dir() {
+            remove_dir_all_safe(&child)?;
+        } else {
+            fs::remove_file(&child)?;
+        }
+    }
+    fs::remove_dir(path)?;
+    Ok(())
+}
+
+/// Write a bundle to its final location via tempdir + atomic rename so
+/// concurrent runs on the same ref never see a partial bundle.
+///
+/// If `final_dir` already exists it is wiped first via
+/// [`remove_dir_all_safe`] — meaning the helper refuses to delete a
+/// symlink that hostile checkout planted at the bundle path. Likewise the
+/// scratch tmp dir is required to be a regular directory.
+///
+/// # Errors
+/// I/O errors, or `InvalidInput` when the destination (or any tmp/leftover
+/// scratch dir) is a symlink.
+pub fn write_bundle_atomic(
+    artifacts: &crate::artifacts::ArtifactSet,
+    final_dir: &Path,
+) -> Result<()> {
+    let parent = final_dir.parent().ok_or_else(|| {
+        AstToMermaidError::InvalidInput(format!(
+            "bundle final dir has no parent: {}",
+            final_dir.display()
+        ))
+    })?;
+    fs::create_dir_all(parent)?;
+    if let Ok(meta) = fs::symlink_metadata(parent)
+        && meta.file_type().is_symlink()
+    {
+        return Err(AstToMermaidError::InvalidInput(format!(
+            "refusing to write bundle into symlinked parent: {}",
+            parent.display()
+        )));
+    }
+    let pid = std::process::id();
+    let stem = final_dir
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("bundle");
+    let tmp_dir = parent.join(format!(".{stem}.tmp.{pid}"));
+    if let Ok(meta) = fs::symlink_metadata(&tmp_dir) {
+        if meta.file_type().is_symlink() {
+            return Err(AstToMermaidError::InvalidInput(format!(
+                "refusing to clobber symlinked tmp dir: {}",
+                tmp_dir.display()
+            )));
+        }
+        if meta.is_dir() {
+            remove_dir_all_safe(&tmp_dir)?;
+        } else {
+            fs::remove_file(&tmp_dir)?;
+        }
+    }
+    crate::artifacts::write_artifacts(artifacts, &tmp_dir)?;
+    if let Ok(meta) = fs::symlink_metadata(final_dir) {
+        if meta.file_type().is_symlink() {
+            return Err(AstToMermaidError::InvalidInput(format!(
+                "refusing to replace symlinked bundle dir: {}",
+                final_dir.display()
+            )));
+        }
+        if meta.is_dir() {
+            remove_dir_all_safe(final_dir)?;
+        } else {
+            return Err(AstToMermaidError::InvalidInput(format!(
+                "bundle path exists and is not a directory: {}",
+                final_dir.display()
+            )));
+        }
+    }
+    atomic_rename(&tmp_dir, final_dir)?;
+    Ok(())
 }
 
 #[cfg(test)]
