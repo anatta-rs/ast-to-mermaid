@@ -1,44 +1,14 @@
-//! End-to-end coverage for cross-module call resolution when several
-//! candidate functions share the same name.
-//!
-//! Reproduces the original bug: `pipeline::analyze` calls `render(...)` after
-//! `use crate::render::render;`, and `render::mod::render` itself dispatches
-//! to `project::render`, `overview::render`, etc. The resolver must
-//! disambiguate by leaning on the file-scope `use` imports (parser-side) and
-//! the qualifier prefix preserved in inline `module::fn(...)` calls
-//! (resolver-side).
+//! Rust-side cross-module call resolution: use-imports, qualified calls,
+//! receiver-method ghost-bind guards, twin-file false-cycle guards, and
+//! `Self::method` boundaries.
+
+mod common;
 
 use std::fs;
-use std::path::Path;
 
-use ast_to_mermaid::graph::Store;
-use ast_to_mermaid::model::{Edge, EdgeKind, EntityId};
-use ast_to_mermaid::parser::{CodeParser, Language};
-use ast_to_mermaid::pipeline::walk_for_languages;
-use ast_to_mermaid::resolve::resolve_cross_module_calls;
+use ast_to_mermaid::model::EntityId;
 
-fn build_store(root: &Path) -> Store {
-    let files = walk_for_languages(root).expect("walk");
-    let store = Store::new();
-    for (path, lang) in &files {
-        let bytes = fs::read(path).expect("read");
-        let parser = match lang {
-            Language::Rust => CodeParser::rust(),
-            Language::Python => CodeParser::python(),
-        };
-        let display = path
-            .strip_prefix(root)
-            .unwrap_or(path)
-            .display()
-            .to_string();
-        parser
-            .parse(&bytes, &display)
-            .expect("parse")
-            .apply_to(&store);
-    }
-    resolve_cross_module_calls(&store);
-    store
-}
+use common::build_store;
 
 #[test]
 fn use_import_resolves_to_mod_dot_rs_when_name_is_ambiguous() {
@@ -209,77 +179,6 @@ fn rust_receiver_call_does_not_ghost_bind_to_free_fn_with_common_name() {
     assert!(
         !store.has_call_edge(&caller, &target),
         "receiver-style `.build()` must not bind to free fn `build`"
-    );
-}
-
-#[test]
-fn python_caller_does_not_bind_to_rust_free_fn_with_same_name() {
-    // Real anatta-rs case: `anatta/llm-services/shared/benchmark.py::main`
-    // calls bare `print_summary(...)`; sigil-bench/src/metrics.rs has
-    // `pub fn print_summary`. They share neither namespace nor linkage.
-    // The resolver must filter candidates by language (file extension)
-    // so the .py caller can never resolve to a .rs target.
-    let tmp = tempfile::tempdir().expect("tmp");
-    let root = tmp.path();
-
-    fs::create_dir_all(root.join("py-tools")).expect("mkdir py");
-    fs::create_dir_all(root.join("rust-bench/src")).expect("mkdir rs");
-    fs::write(
-        root.join("py-tools/benchmark.py"),
-        "def main():\n\
-         \x20   print_summary([1, 2, 3])\n",
-    )
-    .expect("write py");
-    fs::write(
-        root.join("rust-bench/src/metrics.rs"),
-        "pub fn print_summary(xs: &[u32]) {}\n",
-    )
-    .expect("write rs");
-
-    let store = build_store(root);
-
-    let py_caller = EntityId::new("code:py-tools/benchmark.py::function::main");
-    let rs_target = EntityId::new("code:rust-bench/src/metrics.rs::function::print_summary");
-    assert!(store.get_atom(&py_caller).is_some());
-    assert!(store.get_atom(&rs_target).is_some());
-    assert!(
-        !store.has_call_edge(&py_caller, &rs_target),
-        ".py caller must not bind cross-language to .rs free fn"
-    );
-}
-
-#[test]
-fn rust_caller_does_not_bind_to_python_free_fn_with_same_name() {
-    // Symmetric: a Rust `bench main()` calling bare `load_dataset(...)`
-    // must not bind to `def load_dataset` in some Python module.
-    let tmp = tempfile::tempdir().expect("tmp");
-    let root = tmp.path();
-
-    fs::create_dir_all(root.join("rust-bench/src")).expect("mkdir rs");
-    fs::create_dir_all(root.join("py-tools")).expect("mkdir py");
-    fs::write(
-        root.join("rust-bench/src/synthetic_recall.rs"),
-        "fn main() { load_dataset(); }\n\
-         pub fn load_dataset() {}\n",
-    )
-    .expect("write rs");
-    fs::write(
-        root.join("py-tools/train.py"),
-        "def load_dataset():\n    return None\n",
-    )
-    .expect("write py");
-
-    let store = build_store(root);
-
-    let rs_caller = EntityId::new("code:rust-bench/src/synthetic_recall.rs::function::main");
-    let py_target = EntityId::new("code:py-tools/train.py::function::load_dataset");
-    let rs_target =
-        EntityId::new("code:rust-bench/src/synthetic_recall.rs::function::load_dataset");
-    // The Rust target IS the right one (intra-file call).
-    assert!(store.has_call_edge(&rs_caller, &rs_target));
-    assert!(
-        !store.has_call_edge(&rs_caller, &py_target),
-        ".rs caller must not bind cross-language to .py free fn"
     );
 }
 
@@ -498,120 +397,4 @@ fn rust_qualified_owner_method_call_links() {
     let caller = EntityId::new("code:src/cli.rs::function::caller");
     let target = EntityId::new("code:src/daemon.rs::function::DaemonHandle::send");
     assert!(store.has_call_edge(&caller, &target));
-}
-
-#[test]
-fn python_class_method_lifted_with_parent() {
-    // Python class methods become first-class function atoms with
-    // `parent = Some(class_name)` so cross-module qualifier-based
-    // resolution works the same way as Rust impl methods.
-    let tmp = tempfile::tempdir().expect("tmp");
-    let root = tmp.path();
-
-    fs::create_dir_all(root.join("pkg")).expect("mkdir");
-    fs::write(
-        root.join("pkg/foo.py"),
-        "class Foo:\n\
-         \x20   def method(self):\n\
-         \x20       pass\n",
-    )
-    .expect("write foo");
-
-    let store = build_store(root);
-
-    let method_id = EntityId::new("code:pkg/foo.py::function::Foo::method");
-    let atom = store
-        .get_atom(&method_id)
-        .expect("class method must be lifted");
-    assert_eq!(atom.kind, "function");
-    assert_eq!(atom.name, "method");
-    assert_eq!(atom.parent.as_deref(), Some("Foo"));
-}
-
-#[test]
-fn python_bare_receiver_call_does_not_ghost_bind_to_class_method() {
-    // Same shape as the Rust ghost-edge test, but in Python: caller writes
-    // `obj.fetch()` (no receiver type known). Some other module defines
-    // `class Service: def fetch(self): ...`. The resolver must not link.
-    let tmp = tempfile::tempdir().expect("tmp");
-    let root = tmp.path();
-
-    fs::create_dir_all(root.join("pkg")).expect("mkdir");
-    fs::write(
-        root.join("pkg/caller.py"),
-        "def runner(obj):\n\
-         \x20   obj.fetch()\n",
-    )
-    .expect("write caller");
-    fs::write(
-        root.join("pkg/service.py"),
-        "class Service:\n\
-         \x20   def fetch(self):\n\
-         \x20       return 1\n",
-    )
-    .expect("write service");
-
-    let store = build_store(root);
-
-    let runner = EntityId::new("code:pkg/caller.py::function::runner");
-    let target = EntityId::new("code:pkg/service.py::function::Service::fetch");
-    assert!(
-        store.get_atom(&target).is_some(),
-        "Service.fetch must be lifted as a method atom"
-    );
-    assert!(
-        !store.has_call_edge(&runner, &target),
-        "bare receiver `obj.fetch()` must not bind to Service::fetch"
-    );
-}
-
-#[test]
-fn reverse_call_paths_handles_high_fanin() {
-    // Pathological fan-in: 1 target, two layers of F callers each, with
-    // every layer-2 caller calling every layer-1 caller. The legacy
-    // path-cloning BFS enumerates `F^hops` simple paths and OOMs for
-    // F=1k; the predecessor-map rewrite visits `1 + 2F` distinct nodes
-    // and finishes in milliseconds.
-    //
-    // We use the Store API directly here — exercising the algorithmic
-    // change does not require parsing fixture files.
-    let store = Store::new();
-    let target = EntityId::new("target");
-    let f: usize = 1000;
-
-    let mut layer1: Vec<EntityId> = Vec::with_capacity(f);
-    for i in 0..f {
-        let id = EntityId::new(format!("l1_{i}"));
-        store.add_edge(Edge::new(id.clone(), target.clone(), EdgeKind::Calls));
-        layer1.push(id);
-    }
-    for i in 0..f {
-        let l2 = EntityId::new(format!("l2_{i}"));
-        for l1 in &layer1 {
-            store.add_edge(Edge::new(l2.clone(), l1.clone(), EdgeKind::Calls));
-        }
-    }
-
-    let started = std::time::Instant::now();
-    let (predecessors, reachable) = store.reverse_call_paths(&target, 3);
-    let elapsed = started.elapsed();
-
-    // 5 s ceiling instead of 1 s: the legacy path-cloning BFS would not
-    // finish on this fixture under any timeout (it OOMs the runner). The
-    // predecessor-map rewrite finishes in low single-digit seconds even on
-    // the slowest GH Actions runner — we only need to assert "completes in
-    // bounded time", not "fast on dev hardware".
-    assert!(
-        elapsed.as_secs_f64() < 5.0,
-        "reverse_call_paths(F={f}, hops=3) took {elapsed:?}; legacy code OOMs here"
-    );
-
-    // 1 target + F layer-1 callers + F layer-2 callers.
-    assert_eq!(reachable.len(), 1 + 2 * f);
-
-    // Every layer-1 caller has exactly one downstream entry (the target);
-    // every layer-2 caller has F downstream entries (every layer-1 node).
-    // Total predecessor entries = F + F*F.
-    let edge_count: usize = predecessors.values().map(Vec::len).sum();
-    assert_eq!(edge_count, f + f * f);
 }

@@ -8,6 +8,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Internal
+
+- *(ci)* Coverage gate temporarily lowered from 95% → 85% when the v0.2
+  git-aware bundle landed (CLI handlers `run_index` / `run_diff` /
+  `run_gc` plus the cache / diff / git_source modules merged with
+  partial coverage; CI measured 89.82%). Raising back to 90% / 95% is
+  tracked in [#89](https://github.com/anatta-rs/ast-to-mermaid/issues/89).
+
 ### Bug fixes
 
 - *(artifacts)* Filename collision-safe IDs on case-insensitive filesystems ([#82](https://github.com/anatta-rs/ast-to-mermaid/issues/82))

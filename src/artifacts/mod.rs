@@ -380,8 +380,8 @@ fn entity_mmd(atom: &CodeAtom, outgoing: &[EntityId], incoming: &[EntityId]) -> 
 
     let mut out = String::new();
     // Header comments.
-    writeln!(out, "%% id: {}", one_line(atom.id.as_str())).expect("write");
-    writeln!(out, "%% kind: {}", one_line(&atom.kind)).expect("write");
+    writeln!(out, "%% id: {}", one_line(atom.id.as_str())).expect("string write is infallible");
+    writeln!(out, "%% kind: {}", one_line(&atom.kind)).expect("string write is infallible");
     writeln!(
         out,
         "%% file: {}:{}-{}",
@@ -389,13 +389,15 @@ fn entity_mmd(atom: &CodeAtom, outgoing: &[EntityId], incoming: &[EntityId]) -> 
         atom.line_start,
         atom.line_end
     )
-    .expect("write");
-    writeln!(out, "%% content_hash: {}", one_line(&atom.content_hash)).expect("write");
+    .expect("string write is infallible");
+    writeln!(out, "%% content_hash: {}", one_line(&atom.content_hash))
+        .expect("string write is infallible");
     if !atom.signature.is_empty() {
-        writeln!(out, "%% signature: {}", one_line(&atom.signature)).expect("write");
+        writeln!(out, "%% signature: {}", one_line(&atom.signature))
+            .expect("string write is infallible");
     }
 
-    writeln!(out, "graph LR").expect("write");
+    writeln!(out, "graph LR").expect("string write is infallible");
 
     // classDef for known kinds.
     let (fill, stroke) = class_colors(&atom.kind);
@@ -404,14 +406,17 @@ fn entity_mmd(atom: &CodeAtom, outgoing: &[EntityId], incoming: &[EntityId]) -> 
         "  classDef {kind} fill:{fill},stroke:{stroke}",
         kind = atom.kind
     )
-    .expect("write");
+    .expect("string write is infallible");
     // Also add classDef for connected kinds.
-    writeln!(out, "  classDef function fill:#e1f5fe,stroke:#01579b").expect("write");
-    writeln!(out, "  classDef module fill:#f3e5f5,stroke:#4a148c").expect("write");
+    writeln!(out, "  classDef function fill:#e1f5fe,stroke:#01579b")
+        .expect("string write is infallible");
+    writeln!(out, "  classDef module fill:#f3e5f5,stroke:#4a148c")
+        .expect("string write is infallible");
 
     let self_id = mermaid_id_short(atom.id.as_str());
     let self_label = escape_label(&atom.name);
-    writeln!(out, "  {self_id}:::{}[{}]", atom.kind, self_label).expect("write");
+    writeln!(out, "  {self_id}:::{}[{}]", atom.kind, self_label)
+        .expect("string write is infallible");
 
     for callee_id in outgoing {
         let callee_name = callee_id
@@ -421,7 +426,8 @@ fn entity_mmd(atom: &CodeAtom, outgoing: &[EntityId], incoming: &[EntityId]) -> 
             .unwrap_or(callee_id.as_str());
         let label = escape_label(callee_name);
         let cid = mermaid_id_short(callee_id.as_str());
-        writeln!(out, "  {self_id} -- calls --> {cid}:::function[{label}]").expect("write");
+        writeln!(out, "  {self_id} -- calls --> {cid}:::function[{label}]")
+            .expect("string write is infallible");
     }
     for caller_id in incoming {
         let caller_name = caller_id
@@ -431,7 +437,8 @@ fn entity_mmd(atom: &CodeAtom, outgoing: &[EntityId], incoming: &[EntityId]) -> 
             .unwrap_or(caller_id.as_str());
         let label = escape_label(caller_name);
         let cid = mermaid_id_short(caller_id.as_str());
-        writeln!(out, "  {cid}:::function[{label}] -- calls --> {self_id}").expect("write");
+        writeln!(out, "  {cid}:::function[{label}] -- calls --> {self_id}")
+            .expect("string write is infallible");
     }
 
     out
@@ -845,7 +852,7 @@ mod tests {
         let artifacts = emit_artifacts(&store, "/src");
 
         let tmp = tempfile::tempdir().expect("tmp");
-        write_artifacts(&artifacts, tmp.path()).expect("write");
+        write_artifacts(&artifacts, tmp.path()).expect("string write is infallible");
 
         let entities_dir = tmp.path().join("entities");
         let mmd_files: Vec<String> = std::fs::read_dir(&entities_dir)
@@ -878,7 +885,7 @@ mod tests {
         let artifacts = emit_artifacts(&store, "/src");
 
         let tmp = tempfile::tempdir().expect("tmp");
-        write_artifacts(&artifacts, tmp.path()).expect("write");
+        write_artifacts(&artifacts, tmp.path()).expect("string write is infallible");
 
         assert!(tmp.path().join("overview.mmd").exists());
         assert!(tmp.path().join("index.json").exists());

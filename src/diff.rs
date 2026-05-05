@@ -283,7 +283,7 @@ pub fn compute_diff(
 /// turns a flat list into a blast-radius graph: you can see at a glance
 /// which new/modified function calls into which other change.
 ///
-/// `from_entities` carries the post-state edges used to build the graph
+/// `to_entities` carries the post-state edges used to build the graph
 /// (the `to` side's `edges_out`). Pass an empty slice for a node-only
 /// rendering.
 #[must_use]

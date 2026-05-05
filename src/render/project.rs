@@ -83,14 +83,14 @@ pub fn render(store: &Store) -> String {
     for (name, c) in &counts {
         let id = sanitize_id(name);
         let label = escape_label(&c.label(name));
-        writeln!(mermaid, "    {id}[\"{label}\"]").expect("writing to String");
+        writeln!(mermaid, "    {id}[\"{label}\"]").expect("string write is infallible");
     }
     for ((from, to), n) in &edges {
         let from_id = sanitize_id(from);
         let to_id = sanitize_id(to);
         if from_id != to_id {
             writeln!(mermaid, "    {from_id} -->|\"{n} calls\"| {to_id}")
-                .expect("writing to String");
+                .expect("string write is infallible");
         }
     }
     mermaid

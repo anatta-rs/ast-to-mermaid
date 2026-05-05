@@ -123,7 +123,7 @@ pub fn render(store: &Store, target: &str) -> Result<String> {
                 mermaid,
                 "        subgraph {impl_subgraph_id}[\"{impl_label}\"]"
             )
-            .expect("writing");
+            .expect("string write is infallible");
             let mut sorted_methods: Vec<(&EntityId, &String)> = methods.iter().collect();
             sorted_methods.sort_by_key(|(id, _)| id.as_str());
             for (mid, mkind) in sorted_methods {
@@ -131,16 +131,16 @@ pub fn render(store: &Store, target: &str) -> Result<String> {
                     let id = sanitize_id(mid.as_str());
                     let label = escape_label(&format!("{} {}", short_kind(mkind), matom.name));
                     let shape = node_shape(mkind, &id, &label);
-                    writeln!(mermaid, "            {shape}").expect("writing");
+                    writeln!(mermaid, "            {shape}").expect("string write is infallible");
                 }
             }
-            writeln!(mermaid, "        end").expect("writing");
+            writeln!(mermaid, "        end").expect("string write is infallible");
             continue;
         }
         let id = sanitize_id(item_id.as_str());
         let label = escape_label(&format!("{} {}", short_kind(kind), atom.name));
         let shape = node_shape(kind, &id, &label);
-        writeln!(mermaid, "        {shape}").expect("writing");
+        writeln!(mermaid, "        {shape}").expect("string write is infallible");
     }
     mermaid.push_str("    end\n");
 
@@ -155,19 +155,19 @@ pub fn render(store: &Store, target: &str) -> Result<String> {
         if external_seen.insert(ext_id.clone()) {
             let id = sanitize_id(ext_id.as_str());
             let label = escape_label(ext_name);
-            writeln!(mermaid, "    {id}([\"{label}\"])").expect("writing");
+            writeln!(mermaid, "    {id}([\"{label}\"])").expect("string write is infallible");
         }
     }
 
     for (inside, outside) in outgoing.keys() {
         let from_id = sanitize_id(inside.as_str());
         let to_id = sanitize_id(outside.as_str());
-        writeln!(mermaid, "    {from_id} --> {to_id}").expect("writing");
+        writeln!(mermaid, "    {from_id} --> {to_id}").expect("string write is infallible");
     }
     for (outside, inside) in incoming.keys() {
         let from_id = sanitize_id(outside.as_str());
         let to_id = sanitize_id(inside.as_str());
-        writeln!(mermaid, "    {from_id} --> {to_id}").expect("writing");
+        writeln!(mermaid, "    {from_id} --> {to_id}").expect("string write is infallible");
     }
 
     Ok(mermaid)

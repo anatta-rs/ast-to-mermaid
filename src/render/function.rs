@@ -47,19 +47,20 @@ pub fn render(store: &Store, target: &str) -> Result<String> {
     let target_label = escape_label(&format!("fn {} (target)", center_atom.name));
 
     let mut mermaid = String::from("graph TD\n");
-    writeln!(mermaid, "    {target_node_id}((\"{target_label}\"))").expect("writing");
+    writeln!(mermaid, "    {target_node_id}((\"{target_label}\"))")
+        .expect("string write is infallible");
 
     for (caller_id, caller_name) in &who_calls {
         let id = sanitize_id(caller_id);
         let label = escape_label(caller_name);
-        writeln!(mermaid, "    {id}[\"{label}\"]").expect("writing");
-        writeln!(mermaid, "    {id} --> {target_node_id}").expect("writing");
+        writeln!(mermaid, "    {id}[\"{label}\"]").expect("string write is infallible");
+        writeln!(mermaid, "    {id} --> {target_node_id}").expect("string write is infallible");
     }
     for (callee_id, callee_name) in &whom_called {
         let id = sanitize_id(callee_id);
         let label = escape_label(callee_name);
-        writeln!(mermaid, "    {id}[\"{label}\"]").expect("writing");
-        writeln!(mermaid, "    {target_node_id} --> {id}").expect("writing");
+        writeln!(mermaid, "    {id}[\"{label}\"]").expect("string write is infallible");
+        writeln!(mermaid, "    {target_node_id} --> {id}").expect("string write is infallible");
     }
 
     Ok(mermaid)
