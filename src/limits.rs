@@ -6,8 +6,6 @@
 //! Lifted out of [`crate::sequence`] so the parser layer no longer
 //! reaches up into the sequence layer for a depth-limit constant.
 
-#![warn(missing_docs)]
-
 /// Default AST recursion depth limit shared by every recursive AST
 /// visitor in this crate.
 ///

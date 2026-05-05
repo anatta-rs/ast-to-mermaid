@@ -278,8 +278,7 @@ pub(super) fn extract_calls(
                         out.calls.push(
                             imports
                                 .get(text)
-                                .cloned()
-                                .unwrap_or_else(|| text.to_owned()),
+                                .map_or_else(|| text.to_owned(), String::clone),
                         );
                     }
                     "scoped_identifier" => {
