@@ -135,98 +135,152 @@ pub const SKIP_CALLS: &[&str] = &[
 /// Walk the store, resolve cross-module calls, and add `calls` edges.
 ///
 /// Returns the number of new edges emitted.
+///
+/// Hot path runs entirely under one [`Store::with_atoms`] read guard with
+/// `Vec<&CodeAtom>` indexed by `usize` slot and a `HashSet<(usize, usize)>`
+/// existing-edge set. No per-candidate `EntityId` clones inside
+/// `filter_viable` — what used to be `O(N_fn)` full atom clones plus an
+/// `O(E)` edge clone per snapshot is now a single borrow each.
+#[allow(clippy::too_many_lines)]
 pub fn resolve_cross_module_calls(store: &Store) -> usize {
-    let functions = store.atoms_by_kind("function");
-    if functions.is_empty() {
-        return 0;
-    }
+    // Phase 1: snapshot the existing `Calls` edge set as cheap (id, id)
+    // clones. We translate to `(usize, usize)` slots inside `with_atoms`
+    // once we know the function-vec layout.
+    let existing_call_edges: Vec<(EntityId, EntityId)> = store.with_edges(|edges| {
+        edges
+            .iter()
+            .filter(|e| e.kind == EdgeKind::Calls)
+            .map(|e| (e.from.clone(), e.to.clone()))
+            .collect()
+    });
 
-    // Two indices: free fns by name (`parent == None`) and methods by
-    // `(parent, name)`. Splitting them is what makes bare-name calls
-    // (`obj.method()`) refuse to bind to lifted methods of unrelated
-    // types — the central fix this module exists to enforce.
-    let mut free_fns_by_name: HashMap<String, Vec<usize>> = HashMap::new();
-    let mut methods_by_owner_name: HashMap<(String, String), Vec<usize>> = HashMap::new();
-    for (idx, atom) in functions.iter().enumerate() {
-        match &atom.parent {
-            None => free_fns_by_name
-                .entry(atom.name.clone())
-                .or_default()
-                .push(idx),
-            Some(owner) => methods_by_owner_name
-                .entry((owner.clone(), atom.name.clone()))
-                .or_default()
-                .push(idx),
-        }
-    }
+    // Staged outputs: applied after the read guard drops.
+    let mut staged_edges: Vec<(EntityId, EntityId)> = Vec::new();
+    let mut new_extern_atoms: Vec<CodeAtom> = Vec::new();
 
-    // Snapshot existing calls edges to avoid duplicates.
-    let mut existing: HashSet<(EntityId, EntityId)> = HashSet::new();
-    for atom in &functions {
-        for target_id in store.call_edges_from(&atom.id) {
-            existing.insert((atom.id.clone(), target_id));
-        }
-    }
-
-    let skip_set: HashSet<&str> = SKIP_CALLS.iter().copied().collect();
-    let mut added = 0;
-    // Track synthesised extern atoms so we never emit duplicates: many
-    // callers will reference the same external symbol.
-    let mut extern_atoms: HashSet<EntityId> = HashSet::new();
-
-    for caller_idx in 0..functions.len() {
-        let caller = &functions[caller_idx];
-        if caller.calls.is_empty() {
-            continue;
+    store.with_atoms(|atoms| {
+        let functions: Vec<&CodeAtom> = atoms.iter().filter(|a| a.kind == "function").collect();
+        if functions.is_empty() {
+            return;
         }
 
-        let caller_id = caller.id.clone();
-        let caller_crate = crate_root(caller);
-        let caller_lang = lang_of(&caller.file_path);
+        // id → slot for the functions vec. `&EntityId` borrows from the
+        // atom slice held by the read guard for this closure's lifetime.
+        let id_to_slot: HashMap<&EntityId, usize> = functions
+            .iter()
+            .enumerate()
+            .map(|(i, a)| (&a.id, i))
+            .collect();
 
-        for call_name in &caller.calls {
-            let (path_prefix, fn_name) = split_call_name(call_name);
-            if skip_set.contains(fn_name) {
+        // Two indices: free fns by name (`parent == None`) and methods by
+        // `(parent, name)`. Splitting them is what makes bare-name calls
+        // (`obj.method()`) refuse to bind to lifted methods of unrelated
+        // types — the central fix this module exists to enforce. Keys are
+        // `&str` borrowed from the atoms — no `String` allocation here.
+        let mut free_fns_by_name: HashMap<&str, Vec<usize>> = HashMap::new();
+        let mut methods_by_owner_name: HashMap<(&str, &str), Vec<usize>> = HashMap::new();
+        for (idx, atom) in functions.iter().enumerate() {
+            match &atom.parent {
+                None => free_fns_by_name
+                    .entry(atom.name.as_str())
+                    .or_default()
+                    .push(idx),
+                Some(owner) => methods_by_owner_name
+                    .entry((owner.as_str(), atom.name.as_str()))
+                    .or_default()
+                    .push(idx),
+            }
+        }
+
+        // Translate the existing-edges snapshot. Function-to-function
+        // pairs become `(usize, usize)` for the hot-path lookup; edges
+        // whose target is not a function (typically caller → extern atom)
+        // stay keyed by `EntityId` for the rare extern-dedup path.
+        let mut existing_fn: HashSet<(usize, usize)> =
+            HashSet::with_capacity(existing_call_edges.len());
+        let mut existing_extern: HashSet<(EntityId, EntityId)> = HashSet::new();
+        for (from, to) in &existing_call_edges {
+            if let Some(&from_slot) = id_to_slot.get(from) {
+                if let Some(&to_slot) = id_to_slot.get(to) {
+                    existing_fn.insert((from_slot, to_slot));
+                } else {
+                    existing_extern.insert((from.clone(), to.clone()));
+                }
+            }
+        }
+
+        let skip_set: HashSet<&str> = SKIP_CALLS.iter().copied().collect();
+        // Dedup new extern atoms across callers in this resolve pass.
+        let mut new_extern_set: HashSet<EntityId> = HashSet::new();
+
+        for caller_idx in 0..functions.len() {
+            let caller = functions[caller_idx];
+            if caller.calls.is_empty() {
                 continue;
             }
 
-            let pick = pick_target(
-                fn_name,
-                path_prefix,
-                caller_idx,
-                caller_crate.as_deref(),
-                caller_lang,
-                &functions,
-                &free_fns_by_name,
-                &methods_by_owner_name,
-                &existing,
-                &caller_id,
-            );
+            let caller_crate = crate_root(caller);
+            let caller_lang = lang_of(&caller.file_path);
 
-            if let Some(target_idx) = pick.target {
-                let target_id = functions[target_idx].id.clone();
-                store.add_edge(Edge::new(
-                    caller_id.clone(),
-                    target_id.clone(),
-                    EdgeKind::Calls,
-                ));
-                existing.insert((caller_id.clone(), target_id));
-                added += 1;
-            } else if !pick.suppress_extern
-                && let Some(prefix) = path_prefix.filter(|p| is_external_qualifier(p))
-            {
-                added += emit_extern_call(
-                    store,
-                    prefix,
+            for call_name in &caller.calls {
+                let (path_prefix, fn_name) = split_call_name(call_name);
+                if skip_set.contains(fn_name) {
+                    continue;
+                }
+
+                let pick = pick_target(
                     fn_name,
-                    &caller_id,
-                    &mut extern_atoms,
-                    &mut existing,
+                    path_prefix,
+                    caller_idx,
+                    caller_crate.as_deref(),
+                    caller_lang,
+                    &functions,
+                    &free_fns_by_name,
+                    &methods_by_owner_name,
+                    &existing_fn,
                 );
+
+                if let Some(target_idx) = pick.target {
+                    staged_edges.push((caller.id.clone(), functions[target_idx].id.clone()));
+                    existing_fn.insert((caller_idx, target_idx));
+                } else if !pick.suppress_extern
+                    && let Some(prefix) = path_prefix.filter(|p| is_external_qualifier(p))
+                {
+                    let extern_id = EntityId::new(format!("extern:{prefix}::{fn_name}"));
+                    if existing_extern.contains(&(caller.id.clone(), extern_id.clone())) {
+                        continue;
+                    }
+                    if new_extern_set.insert(extern_id.clone()) {
+                        new_extern_atoms.push(CodeAtom {
+                            id: extern_id.clone(),
+                            kind: EXTERN_KIND.to_owned(),
+                            name: fn_name.to_owned(),
+                            file_path: String::new(),
+                            line_start: 0,
+                            line_end: 0,
+                            doc: String::new(),
+                            signature: format!("{prefix}::{fn_name}"),
+                            content_hash: String::new(),
+                            calls: Vec::new(),
+                            method_calls: Vec::new(),
+                            parent: None,
+                        });
+                    }
+                    staged_edges.push((caller.id.clone(), extern_id.clone()));
+                    existing_extern.insert((caller.id.clone(), extern_id));
+                }
             }
         }
-    }
+    });
 
+    // Phase 2: apply staged additions. The read guard has dropped.
+    for atom in new_extern_atoms {
+        store.add_atom(atom);
+    }
+    let added = staged_edges.len();
+    for (from, to) in staged_edges {
+        store.add_edge(Edge::new(from, to, EdgeKind::Calls));
+    }
     added
 }
 
@@ -272,11 +326,10 @@ fn pick_target(
     caller_idx: usize,
     caller_crate: Option<&str>,
     caller_lang: &str,
-    functions: &[CodeAtom],
-    free_fns_by_name: &HashMap<String, Vec<usize>>,
-    methods_by_owner_name: &HashMap<(String, String), Vec<usize>>,
-    existing: &HashSet<(EntityId, EntityId)>,
-    caller_id: &EntityId,
+    functions: &[&CodeAtom],
+    free_fns_by_name: &HashMap<&str, Vec<usize>>,
+    methods_by_owner_name: &HashMap<(&str, &str), Vec<usize>>,
+    existing: &HashSet<(usize, usize)>,
 ) -> Pick {
     let filter_viable = |cands: &[usize]| -> Vec<usize> {
         cands
@@ -287,9 +340,12 @@ fn pick_target(
                 // resolve to a Rust target by bare-name match (or vice
                 // versa). They share neither namespace nor linkage —
                 // any same-name hit is a coincidence.
+                //
+                // The existing-edge check is a `(usize, usize)` slot
+                // pair lookup — no `EntityId` clone per candidate.
                 idx != caller_idx
                     && lang_of(&functions[idx].file_path) == caller_lang
-                    && !existing.contains(&(caller_id.clone(), functions[idx].id.clone()))
+                    && !existing.contains(&(caller_idx, idx))
             })
             .collect()
     };
@@ -332,7 +388,7 @@ fn pick_target(
     {
         // 1) Try the method index — the qualifier may be a type/class
         //    name (e.g. `DaemonHandle::send`).
-        if let Some(cands) = methods_by_owner_name.get(&(last_seg.to_owned(), fn_name.to_owned())) {
+        if let Some(cands) = methods_by_owner_name.get(&(last_seg, fn_name)) {
             let viable = filter_viable(cands);
             if let Some(idx) = pick_unique_with_same_crate_pref(&viable, caller_crate, functions) {
                 return Pick::resolved(idx);
@@ -383,7 +439,7 @@ fn pick_target(
     }
     let viable: Vec<usize> = filter_viable(cands)
         .into_iter()
-        .filter(|&idx| crate_root(&functions[idx]).as_deref() == caller_crate)
+        .filter(|&idx| crate_root(functions[idx]).as_deref() == caller_crate)
         .collect();
     match pick_unique_with_same_crate_pref(&viable, caller_crate, functions) {
         Some(idx) => Pick::resolved(idx),
@@ -401,7 +457,7 @@ fn pick_target(
 fn pick_unique_with_same_crate_pref(
     candidates: &[usize],
     caller_crate: Option<&str>,
-    functions: &[CodeAtom],
+    functions: &[&CodeAtom],
 ) -> Option<usize> {
     if candidates.is_empty() {
         return None;
@@ -409,7 +465,7 @@ fn pick_unique_with_same_crate_pref(
     let same_crate: Vec<usize> = candidates
         .iter()
         .copied()
-        .filter(|&idx| crate_root(&functions[idx]).as_deref() == caller_crate)
+        .filter(|&idx| crate_root(functions[idx]).as_deref() == caller_crate)
         .collect();
     if same_crate.len() == 1 {
         return Some(same_crate[0]);
@@ -418,45 +474,6 @@ fn pick_unique_with_same_crate_pref(
         return Some(candidates[0]);
     }
     None
-}
-
-/// Emit a synthetic `extern` atom (deduped) plus a `Calls` edge from the
-/// caller to it. Returns the number of new edges added (0 or 1).
-fn emit_extern_call(
-    store: &Store,
-    prefix: &str,
-    fn_name: &str,
-    caller_id: &EntityId,
-    extern_atoms: &mut HashSet<EntityId>,
-    existing: &mut HashSet<(EntityId, EntityId)>,
-) -> usize {
-    let extern_id = EntityId::new(format!("extern:{prefix}::{fn_name}"));
-    if extern_atoms.insert(extern_id.clone()) {
-        store.add_atom(CodeAtom {
-            id: extern_id.clone(),
-            kind: EXTERN_KIND.to_owned(),
-            name: fn_name.to_owned(),
-            file_path: String::new(),
-            line_start: 0,
-            line_end: 0,
-            doc: String::new(),
-            signature: format!("{prefix}::{fn_name}"),
-            content_hash: String::new(),
-            calls: Vec::new(),
-            method_calls: Vec::new(),
-            parent: None,
-        });
-    }
-    if existing.contains(&(caller_id.clone(), extern_id.clone())) {
-        return 0;
-    }
-    store.add_edge(Edge::new(
-        caller_id.clone(),
-        extern_id.clone(),
-        EdgeKind::Calls,
-    ));
-    existing.insert((caller_id.clone(), extern_id));
-    1
 }
 
 /// Whether a call qualifier should be considered "external" (not a known
@@ -484,68 +501,70 @@ fn is_external_qualifier(prefix: &str) -> bool {
 ///
 /// Returns the number of new edges emitted.
 pub fn resolve_implements_edges(store: &Store) -> usize {
-    let impls = store.atoms_by_kind("impl");
-    if impls.is_empty() {
-        return 0;
-    }
-    let traits = store.atoms_by_kind("trait");
-    if traits.is_empty() {
-        return 0;
-    }
+    let mut staged: Vec<(EntityId, EntityId)> = Vec::new();
 
-    let mut trait_by_name: HashMap<String, Vec<usize>> = HashMap::new();
-    for (idx, atom) in traits.iter().enumerate() {
-        trait_by_name
-            .entry(atom.name.clone())
-            .or_default()
-            .push(idx);
-    }
-
-    let mut added = 0;
-    for impl_atom in &impls {
-        // `impl Trait for Type` produces name `"Trait for Type"`. Inherent
-        // impls produce just `"Type"` and have no trait part.
-        let Some((trait_part, _type_part)) = impl_atom.name.split_once(" for ") else {
-            continue;
-        };
-        // Strip generics off the trait part if present (e.g. `Foo<T>` → `Foo`).
-        let trait_no_generics = trait_part.split('<').next().unwrap_or(trait_part);
-        // For `fmt::Debug` we match on the last `::` segment: `Debug`.
-        let trait_short = trait_no_generics
-            .rsplit("::")
-            .next()
-            .unwrap_or(trait_no_generics)
-            .trim();
-        if trait_short.is_empty() {
-            continue;
+    store.with_atoms(|atoms| {
+        let impls: Vec<&CodeAtom> = atoms.iter().filter(|a| a.kind == "impl").collect();
+        if impls.is_empty() {
+            return;
+        }
+        let traits: Vec<&CodeAtom> = atoms.iter().filter(|a| a.kind == "trait").collect();
+        if traits.is_empty() {
+            return;
         }
 
-        let Some(candidates) = trait_by_name.get(trait_short) else {
-            continue;
-        };
-        let impl_crate = crate_root(impl_atom);
-        let same_crate: Vec<usize> = candidates
-            .iter()
-            .copied()
-            .filter(|&idx| crate_root(&traits[idx]) == impl_crate)
-            .collect();
-        let target_idx = if same_crate.len() == 1 {
-            Some(same_crate[0])
-        } else if candidates.len() == 1 && same_crate.is_empty() {
-            Some(candidates[0])
-        } else {
-            None
-        };
-        if let Some(idx) = target_idx {
-            store.add_edge(Edge::new(
-                impl_atom.id.clone(),
-                traits[idx].id.clone(),
-                EdgeKind::Implements,
-            ));
-            added += 1;
+        let mut trait_by_name: HashMap<&str, Vec<usize>> = HashMap::new();
+        for (idx, atom) in traits.iter().enumerate() {
+            trait_by_name
+                .entry(atom.name.as_str())
+                .or_default()
+                .push(idx);
         }
-    }
 
+        for impl_atom in &impls {
+            // `impl Trait for Type` produces name `"Trait for Type"`. Inherent
+            // impls produce just `"Type"` and have no trait part.
+            let Some((trait_part, _type_part)) = impl_atom.name.split_once(" for ") else {
+                continue;
+            };
+            // Strip generics off the trait part if present (e.g. `Foo<T>` → `Foo`).
+            let trait_no_generics = trait_part.split('<').next().unwrap_or(trait_part);
+            // For `fmt::Debug` we match on the last `::` segment: `Debug`.
+            let trait_short = trait_no_generics
+                .rsplit("::")
+                .next()
+                .unwrap_or(trait_no_generics)
+                .trim();
+            if trait_short.is_empty() {
+                continue;
+            }
+
+            let Some(candidates) = trait_by_name.get(trait_short) else {
+                continue;
+            };
+            let impl_crate = crate_root(impl_atom);
+            let same_crate: Vec<usize> = candidates
+                .iter()
+                .copied()
+                .filter(|&idx| crate_root(traits[idx]) == impl_crate)
+                .collect();
+            let target_idx = if same_crate.len() == 1 {
+                Some(same_crate[0])
+            } else if candidates.len() == 1 && same_crate.is_empty() {
+                Some(candidates[0])
+            } else {
+                None
+            };
+            if let Some(idx) = target_idx {
+                staged.push((impl_atom.id.clone(), traits[idx].id.clone()));
+            }
+        }
+    });
+
+    let added = staged.len();
+    for (from, to) in staged {
+        store.add_edge(Edge::new(from, to, EdgeKind::Implements));
+    }
     added
 }
 
@@ -1027,12 +1046,13 @@ mod tests {
         assert_eq!(added, 2, "two caller→extern edges");
 
         let extern_id = EntityId::new("extern:divan::main");
-        let extern_atoms: Vec<_> = store
-            .all_atoms()
-            .into_iter()
-            .filter(|a| a.kind == "extern" && a.id == extern_id)
-            .collect();
-        assert_eq!(extern_atoms.len(), 1, "extern atom must be deduped");
+        let extern_count = store.with_atoms(|atoms| {
+            atoms
+                .iter()
+                .filter(|a| a.kind == "extern" && a.id == extern_id)
+                .count()
+        });
+        assert_eq!(extern_count, 1, "extern atom must be deduped");
         let callers = store.call_edges_to(&extern_id);
         assert_eq!(callers.len(), 2);
     }
@@ -1058,11 +1078,9 @@ mod tests {
             )],
         );
         let _ = resolve_cross_module_calls(&store);
-        let externs: Vec<_> = store.atoms_by_kind("extern");
-        assert!(
-            externs.is_empty(),
-            "in-crate qualifiers must not extern: {externs:?}"
-        );
+        let extern_count =
+            store.with_atoms(|atoms| atoms.iter().filter(|a| a.kind == "extern").count());
+        assert_eq!(extern_count, 0, "in-crate qualifiers must not extern");
     }
 
     #[test]
@@ -1077,8 +1095,9 @@ mod tests {
             &[("caller", &["completely_unknown"])],
         );
         let _ = resolve_cross_module_calls(&store);
-        let externs: Vec<_> = store.atoms_by_kind("extern");
-        assert!(externs.is_empty());
+        let extern_count =
+            store.with_atoms(|atoms| atoms.iter().filter(|a| a.kind == "extern").count());
+        assert_eq!(extern_count, 0);
     }
 
     /// Helper: build a method atom (parent = Some(owner)). Methods get

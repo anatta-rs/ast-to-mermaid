@@ -40,9 +40,14 @@ pub struct Store {
     inner: RwLock<Inner>,
 }
 
+// Atoms live in a `Vec<CodeAtom>` so [`Store::with_atoms`] can hand callers
+// a `&[CodeAtom]` directly under the read guard — no per-call clone of the
+// atom set. `atom_idx` is the id → slot lookup that keeps `add_atom` upserts
+// O(1) and `get_atom` a single hash probe.
 #[derive(Default)]
 struct Inner {
-    atoms: HashMap<EntityId, CodeAtom>,
+    atoms: Vec<CodeAtom>,
+    atom_idx: HashMap<EntityId, usize>,
     edges: Vec<Edge>,
     forward_idx: HashMap<EntityId, Vec<usize>>,
     reverse_idx: HashMap<EntityId, Vec<usize>>,
@@ -99,7 +104,15 @@ impl Store {
 
     /// Insert or replace an atom (upsert semantics).
     pub fn add_atom(&self, atom: CodeAtom) {
-        self.write_or_recover().atoms.insert(atom.id.clone(), atom);
+        let mut guard = self.write_or_recover();
+        if let Some(&idx) = guard.atom_idx.get(&atom.id) {
+            guard.atoms[idx] = atom;
+        } else {
+            let idx = guard.atoms.len();
+            let id = atom.id.clone();
+            guard.atoms.push(atom);
+            guard.atom_idx.insert(id, idx);
+        }
     }
 
     /// Record a directed edge.
@@ -135,7 +148,8 @@ impl Store {
     /// Look up a single atom by id.
     #[must_use]
     pub fn get_atom(&self, id: &EntityId) -> Option<CodeAtom> {
-        self.read_or_recover().atoms.get(id).cloned()
+        let guard = self.read_or_recover();
+        guard.atom_idx.get(id).map(|&idx| guard.atoms[idx].clone())
     }
 
     /// Return all atoms whose `file_path` matches `path`.
@@ -144,7 +158,7 @@ impl Store {
         let guard = self.read_or_recover();
         let mut out: Vec<CodeAtom> = guard
             .atoms
-            .values()
+            .iter()
             .filter(|a| a.file_path == path)
             .cloned()
             .collect();
@@ -159,7 +173,7 @@ impl Store {
         let guard = self.read_or_recover();
         let mut out: Vec<CodeAtom> = guard
             .atoms
-            .values()
+            .iter()
             .filter(|a| a.kind == kind)
             .cloned()
             .collect();
@@ -174,7 +188,7 @@ impl Store {
         let guard = self.read_or_recover();
         let mut out: Vec<CodeAtom> = guard
             .atoms
-            .values()
+            .iter()
             .filter(|a| kinds.contains(&a.kind.as_str()))
             .cloned()
             .collect();
@@ -186,8 +200,59 @@ impl Store {
     #[must_use]
     pub fn all_atoms(&self) -> Vec<CodeAtom> {
         let guard = self.read_or_recover();
-        let mut out: Vec<CodeAtom> = guard.atoms.values().cloned().collect();
+        let mut out: Vec<CodeAtom> = guard.atoms.clone();
         out.sort_by_key(|a| a.id.clone());
+        out
+    }
+
+    /// Run `f` on the full atom slice under the read guard.
+    ///
+    /// The whole atom set is exposed as `&[CodeAtom]` — no clone, no
+    /// per-kind filter. Callers that need to walk every atom (or a large
+    /// subset of them) should prefer this over [`Store::all_atoms`] /
+    /// [`Store::atoms_by_kind`], both of which clone the matching atoms.
+    ///
+    /// The closure runs while the read lock is held; keep it CPU-bound (no
+    /// I/O) so concurrent readers are not stalled. Mutating store APIs
+    /// take a write lock, so they cannot be called from within `f` —
+    /// stage edits and apply them after this returns.
+    pub fn with_atoms<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(&[CodeAtom]) -> R,
+    {
+        let guard = self.read_or_recover();
+        f(&guard.atoms)
+    }
+
+    /// Run `f` on the full edge slice under the read guard.
+    ///
+    /// Same contract as [`Store::with_atoms`]. Callers building several
+    /// adjacency views in one sweep should prefer this over
+    /// [`Store::all_edges`], which clones the entire edge vector.
+    pub fn with_edges<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(&[Edge]) -> R,
+    {
+        let guard = self.read_or_recover();
+        f(&guard.edges)
+    }
+
+    /// Cheap variant of [`Store::atoms_by_kind`] that returns just the
+    /// matching `EntityId`s in id-sorted order.
+    ///
+    /// Use this when the caller needs ids for indexing or membership tests
+    /// but does not need the full atom payload — avoids the per-atom deep
+    /// clone of `name`, `file_path`, `signature`, `calls`, etc.
+    #[must_use]
+    pub fn atom_ids_by_kind(&self, kind: &str) -> Vec<EntityId> {
+        let guard = self.read_or_recover();
+        let mut out: Vec<EntityId> = guard
+            .atoms
+            .iter()
+            .filter(|a| a.kind == kind)
+            .map(|a| a.id.clone())
+            .collect();
+        out.sort();
         out
     }
 
