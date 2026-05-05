@@ -146,6 +146,13 @@ pub fn run_analyze(level: Level, flags: &AnalyzeFlags) -> ExitCode {
         AnalyzeFormat::Dot => mermaid_to_dot(&report.mermaid),
     };
 
+    if !report.failures.is_empty() {
+        eprintln!(
+            "skipped {} files (see --trace=warn for details)",
+            report.failures.len(),
+        );
+    }
+
     if let Some(path) = flags.out.as_deref() {
         if let Err(e) = std::fs::write(path, &rendered) {
             eprintln!("write {}: {e}", path.display());
@@ -739,6 +746,13 @@ pub fn run_bundle(flags: &BundleFlags) -> ExitCode {
     if let Err(e) = write_artifacts(&artifacts, &flags.out) {
         eprintln!("bundle: write {}: {e}", flags.out.display());
         return ExitCode::Failure;
+    }
+
+    if !report.failures.is_empty() {
+        eprintln!(
+            "skipped {} files (see --trace=warn for details)",
+            report.failures.len(),
+        );
     }
 
     eprintln!(
