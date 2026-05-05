@@ -25,6 +25,7 @@ use crate::render::{Level, render};
 use crate::sequence;
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 /// A per-entity artifact bundle.
 pub struct EntityArtifact {
@@ -77,13 +78,15 @@ pub fn emit_artifacts(store: &Store, source_root: &str) -> ArtifactSet {
 /// `sequence_sources` is a slice of `(file_display_path, content_bytes)`
 /// pairs covering the Rust files in the project — typically threaded
 /// through from [`crate::pipeline::bundle`] so the file contents are not
-/// re-read from disk. Only functions whose `file_path` matches one of
-/// those entries are eligible.
+/// re-read from disk. The bytes are held behind `Arc<[u8]>` so the bundle
+/// path can share them with the parse phase via a refcount bump rather
+/// than a deep copy. Only functions whose `file_path` matches one of those
+/// entries are eligible.
 #[must_use]
 pub fn emit_artifacts_with_sequences(
     store: &Store,
     source_root: &str,
-    sequence_sources: &[(String, Vec<u8>)],
+    sequence_sources: &[(String, Arc<[u8]>)],
 ) -> ArtifactSet {
     let overview_mmd = render(Level::Project, store, None).unwrap_or_default();
 
@@ -138,14 +141,14 @@ pub fn emit_artifacts_with_sequences(
 /// ordering).
 fn build_sequences(
     entities: &[EntityArtifact],
-    sequence_sources: &[(String, Vec<u8>)],
+    sequence_sources: &[(String, Arc<[u8]>)],
 ) -> Vec<SequenceArtifact> {
     if sequence_sources.is_empty() {
         return Vec::new();
     }
     let by_path: HashMap<&str, &[u8]> = sequence_sources
         .iter()
-        .map(|(p, c)| (p.as_str(), c.as_slice()))
+        .map(|(p, c)| (p.as_str(), &c[..]))
         .collect();
 
     // Pass 1: collect target function names per file (preserving original
