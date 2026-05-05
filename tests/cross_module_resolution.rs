@@ -31,7 +31,10 @@ fn build_store(root: &Path) -> Store {
             .unwrap_or(path)
             .display()
             .to_string();
-        parser.parse_into(&bytes, &display, &store).expect("parse");
+        parser
+            .parse(&bytes, &display)
+            .expect("parse")
+            .apply_to(&store);
     }
     resolve_cross_module_calls(&store);
     store

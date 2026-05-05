@@ -202,12 +202,6 @@ impl Language {
     }
 }
 
-impl PartialEq<Language> for &Language {
-    fn eq(&self, other: &Language) -> bool {
-        **self == *other
-    }
-}
-
 // ── Parser ────────────────────────────────────────────────────────────────────
 
 /// Source-code parser. Construct one per language; re-use across files.
@@ -390,18 +384,6 @@ impl CodeParser {
 
         Ok(ParseUnit { atoms, edges })
     }
-
-    /// Parse and write the result into `store`. Backward-compatible wrapper
-    /// over [`Self::parse`]; existing callers see no behaviour change.
-    ///
-    /// # Errors
-    /// Forwards errors from [`Self::parse`].
-    pub fn parse_into(&self, content: &[u8], file_path: &str, store: &Store) -> Result<usize> {
-        let unit = self.parse(content, file_path)?;
-        let count = unit.atom_count();
-        unit.apply_to(store);
-        Ok(count)
-    }
 }
 
 // ── Item extraction ───────────────────────────────────────────────────────────
@@ -477,7 +459,7 @@ fn extract_item(
 // ── Method descent (Rust impl + Python class) ────────────────────────────────
 
 /// Context bundle for [`extract_methods`] — the fields are the same
-/// per-file values [`CodeParser::parse_into`] threads through extraction.
+/// per-file values [`CodeParser::parse`] threads through extraction.
 #[derive(Clone, Copy)]
 struct MethodCtx<'a> {
     /// Atom whose body we descend into (Rust `impl_item` or Python class).
@@ -716,13 +698,6 @@ fn extract_calls(
     out
 }
 
-/// Look up a capture's index in a compiled query by its `@name`.
-/// Returns `None` if the query doesn't declare that capture (a programmer
-/// error caught at first run).
-pub(super) fn capture_index(query: &tree_sitter::Query, name: &str) -> Option<u32> {
-    query.capture_index_for_name(name)
-}
-
 // ── Utilities ─────────────────────────────────────────────────────────────────
 
 /// SHA-256 hex digest of `bytes`.
@@ -770,9 +745,8 @@ mod tests {
 
     #[test]
     fn invalid_utf8_errors() {
-        let store = Store::new();
         let err = CodeParser::rust()
-            .parse_into(&[0xff, 0xfe], "bad.rs", &store)
+            .parse(&[0xff, 0xfe], "bad.rs")
             .expect_err("must fail");
         assert!(matches!(err, AstToMermaidError::InvalidInput(_)));
     }
@@ -803,13 +777,6 @@ mod tests {
     fn language_name_returns_correct_tag() {
         assert_eq!(Language::Rust.name(), "rust");
         assert_eq!(Language::Python.name(), "python");
-    }
-
-    #[test]
-    fn language_equality_via_ref() {
-        let r = Language::Rust;
-        assert!(r == Language::Rust);
-        assert!(!(r == Language::Python));
     }
 
     #[test]
@@ -857,8 +824,9 @@ mod tests {
         src.extend_from_slice(b"/// hello\nfn main() {}\n");
         let store = Store::new();
         CodeParser::rust()
-            .parse_into(&src, "bom.rs", &store)
-            .expect("parse must succeed after BOM strip");
+            .parse(&src, "bom.rs")
+            .expect("parse must succeed after BOM strip")
+            .apply_to(&store);
         let id = EntityId::new("code:bom.rs::function::main");
         let atom = store.get_atom(&id).expect("function atom");
         assert!(atom.doc.contains("hello"), "doc={:?}", atom.doc);
@@ -870,8 +838,9 @@ mod tests {
         let src = b"/// docline\rfn cr_only() {}\r";
         let store = Store::new();
         CodeParser::rust()
-            .parse_into(src, "cr.rs", &store)
-            .expect("parse must succeed after CR-only normalisation");
+            .parse(src, "cr.rs")
+            .expect("parse must succeed after CR-only normalisation")
+            .apply_to(&store);
         let id = EntityId::new("code:cr.rs::function::cr_only");
         let atom = store.get_atom(&id).expect("function atom");
         assert!(atom.doc.contains("docline"), "doc={:?}", atom.doc);

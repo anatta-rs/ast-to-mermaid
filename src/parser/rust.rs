@@ -4,8 +4,8 @@
 use std::collections::HashMap;
 use tree_sitter::{Node, QueryCursor, StreamingIterator};
 
+use super::ExtractedCalls;
 use super::queries;
-use super::{ExtractedCalls, capture_index};
 use crate::sequence::max_ast_depth;
 
 // ── Use-import extraction ─────────────────────────────────────────────────────
@@ -258,8 +258,8 @@ pub(super) fn extract_calls(
     let query = &queries::RUST.calls;
     // Capture index → name lookup so we can route each match by
     // capture role (`@call.fn`, `@call.field`).
-    let cn_call_fn = capture_index(query, "call.fn");
-    let cn_call_field = capture_index(query, "call.field");
+    let cn_call_fn = query.capture_index_for_name("call.fn");
+    let cn_call_field = query.capture_index_for_name("call.field");
     let mut cursor = QueryCursor::new();
     let bytes = source.as_bytes();
     let mut matches = cursor.matches(query, *node, bytes);
@@ -329,8 +329,9 @@ mod tests {
         let store = Store::new();
         let src = b"pub fn hello() {}\npub fn world() { hello(); }\n";
         CodeParser::rust()
-            .parse_into(src, "src/lib.rs", &store)
-            .expect("parse");
+            .parse(src, "src/lib.rs")
+            .expect("parse")
+            .apply_to(&store);
         // module + 2 functions = 3 atoms
         assert_eq!(store.atom_count(), 3);
         // module contains 2 functions
@@ -344,8 +345,9 @@ mod tests {
         let store = Store::new();
         let src = b"fn a() { b(); }\nfn b() {}\n";
         CodeParser::rust()
-            .parse_into(src, "src/lib.rs", &store)
-            .expect("parse");
+            .parse(src, "src/lib.rs")
+            .expect("parse")
+            .apply_to(&store);
         let a = EntityId::new("code:src/lib.rs::function::a");
         let b = EntityId::new("code:src/lib.rs::function::b");
         assert!(store.has_call_edge(&a, &b));
@@ -356,8 +358,9 @@ mod tests {
         let store = Store::new();
         let src = b"pub struct Foo {}\npub trait Bar {}\n";
         CodeParser::rust()
-            .parse_into(src, "src/types.rs", &store)
-            .expect("parse");
+            .parse(src, "src/types.rs")
+            .expect("parse")
+            .apply_to(&store);
         assert!(!store.atoms_by_kind("struct").is_empty());
         assert!(!store.atoms_by_kind("trait").is_empty());
     }
@@ -373,8 +376,9 @@ static NAME: &str = \"x\";\n\
 macro_rules! say_hi { () => {} }\n\
 pub type Alias = u32;\n";
         CodeParser::rust()
-            .parse_into(src, "src/misc.rs", &store)
-            .expect("parse");
+            .parse(src, "src/misc.rs")
+            .expect("parse")
+            .apply_to(&store);
         assert!(!store.atoms_by_kind("enum").is_empty());
         assert!(!store.atoms_by_kind("impl").is_empty());
         assert!(!store.atoms_by_kind("const").is_empty());
@@ -388,8 +392,9 @@ pub type Alias = u32;\n";
         let store = Store::new();
         let src = b"/// Does something.\npub fn documented() {}\n";
         CodeParser::rust()
-            .parse_into(src, "src/lib.rs", &store)
-            .expect("parse");
+            .parse(src, "src/lib.rs")
+            .expect("parse")
+            .apply_to(&store);
         let id = EntityId::new("code:src/lib.rs::function::documented");
         let atom = store.get_atom(&id).expect("atom");
         assert!(atom.doc.contains("Does something"), "doc={:?}", atom.doc);
@@ -400,8 +405,9 @@ pub type Alias = u32;\n";
         let store = Store::new();
         let src = b"pub trait Foo {}\npub struct Bar;\nimpl Foo for Bar {}\n";
         CodeParser::rust()
-            .parse_into(src, "src/impl_trait.rs", &store)
-            .expect("parse");
+            .parse(src, "src/impl_trait.rs")
+            .expect("parse")
+            .apply_to(&store);
         // The impl atom should exist with "Foo for Bar" as name
         let atoms = store.atoms_by_kind("impl");
         assert!(!atoms.is_empty(), "expected impl atom");
@@ -460,8 +466,9 @@ pub type Alias = u32;\n";
 use crate::other::helper;\n\
 fn caller() { helper(); }\n";
         CodeParser::rust()
-            .parse_into(src, "src/lib.rs", &store)
-            .expect("parse");
+            .parse(src, "src/lib.rs")
+            .expect("parse")
+            .apply_to(&store);
         let id = EntityId::new("code:src/lib.rs::function::caller");
         let atom = store.get_atom(&id).expect("atom");
         // Bare `helper()` should be normalised to the imported full path.
@@ -477,8 +484,9 @@ fn caller() { helper(); }\n";
         let store = Store::new();
         let src = b"fn caller() { project::render(s); }\n";
         CodeParser::rust()
-            .parse_into(src, "src/lib.rs", &store)
-            .expect("parse");
+            .parse(src, "src/lib.rs")
+            .expect("parse")
+            .apply_to(&store);
         let id = EntityId::new("code:src/lib.rs::function::caller");
         let atom = store.get_atom(&id).expect("atom");
         assert!(
@@ -497,8 +505,9 @@ fn caller() { helper(); }\n";
 fn render(s: u32) {}\n\
 fn caller() { project::render(0); }\n";
         CodeParser::rust()
-            .parse_into(src, "src/lib.rs", &store)
-            .expect("parse");
+            .parse(src, "src/lib.rs")
+            .expect("parse")
+            .apply_to(&store);
         let caller_id = EntityId::new("code:src/lib.rs::function::caller");
         let local_render = EntityId::new("code:src/lib.rs::function::render");
         assert!(
@@ -566,8 +575,9 @@ impl Foo {\n\
     pub fn update(&self) {}\n\
 }\n";
         CodeParser::rust()
-            .parse_into(src, "src/foo.rs", &store)
-            .expect("parse");
+            .parse(src, "src/foo.rs")
+            .expect("parse")
+            .apply_to(&store);
         // Expect: 1 module + 1 struct + 1 impl + 2 method = 5 atoms.
         assert_eq!(store.atom_count(), 5, "impl methods must produce atoms");
         let build_id = EntityId::new("code:src/foo.rs::function::Foo::build");
@@ -586,8 +596,9 @@ impl Foo {\n\
 pub struct Foo;\n\
 impl Foo { pub fn build(&self) {} }\n";
         CodeParser::rust()
-            .parse_into(src, "src/foo.rs", &store)
-            .expect("parse");
+            .parse(src, "src/foo.rs")
+            .expect("parse")
+            .apply_to(&store);
         let impl_id = EntityId::new("code:src/foo.rs::impl::Foo");
         let build_id = EntityId::new("code:src/foo.rs::function::Foo::build");
         let children = store.children_of(&impl_id);
@@ -610,8 +621,9 @@ impl Foo {\n\
     pub fn update(&self) { let _ = self.build(); }\n\
 }\n";
         CodeParser::rust()
-            .parse_into(src, "src/foo.rs", &store)
-            .expect("parse");
+            .parse(src, "src/foo.rs")
+            .expect("parse")
+            .apply_to(&store);
         let update_id = EntityId::new("code:src/foo.rs::function::Foo::update");
         let build_id = EntityId::new("code:src/foo.rs::function::Foo::build");
         assert!(
@@ -637,8 +649,9 @@ impl Bar {\n\
     pub fn new() -> Self { Self }\n\
 }\n";
         CodeParser::rust()
-            .parse_into(src, "src/foo.rs", &store)
-            .expect("parse");
+            .parse(src, "src/foo.rs")
+            .expect("parse")
+            .apply_to(&store);
         let foo_build = EntityId::new("code:src/foo.rs::function::Foo::build");
         let foo_new = EntityId::new("code:src/foo.rs::function::Foo::new");
         let bar_new = EntityId::new("code:src/foo.rs::function::Bar::new");
@@ -656,8 +669,9 @@ pub struct Foo;\n\
 pub trait Display { fn fmt(&self); }\n\
 impl Display for Foo { fn fmt(&self) {} }\n";
         CodeParser::rust()
-            .parse_into(src, "src/foo.rs", &store)
-            .expect("parse");
+            .parse(src, "src/foo.rs")
+            .expect("parse")
+            .apply_to(&store);
         let fmt_id = EntityId::new("code:src/foo.rs::function::Display for Foo::fmt");
         let fmt = store
             .get_atom(&fmt_id)
