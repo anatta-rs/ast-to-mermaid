@@ -8,6 +8,60 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0](https://github.com/anatta-rs/ast-to-mermaid/compare/v0.5.1...v0.6.0) - 2026-05-05
+
+### Bug fixes
+
+- *(security)* Defense-in-depth pass on symlink, blob-sha, GIT_* env, decorator loop, log injection (C42) ([#153](https://github.com/anatta-rs/ast-to-mermaid/pull/153))
+- *(cache)* Dedup gc_at to_remove + partial GcReport on disk-full + tmp sweep on Cache::open (C40) ([#151](https://github.com/anatta-rs/ast-to-mermaid/pull/151))
+- *(pipeline)* Error on canonicalize-strip-prefix failure + refuse prune on empty bundle (C39) ([#150](https://github.com/anatta-rs/ast-to-mermaid/pull/150))
+- *(cli/format)* Strip_suffix + checked_mul in parse_size/parse_duration (C38) ([#149](https://github.com/anatta-rs/ast-to-mermaid/pull/149))
+- *(cache)* Append ThreadId + counter to atomic_write tmp suffix (C26) ([#137](https://github.com/anatta-rs/ast-to-mermaid/pull/137))
+- *(artifacts)* Filename collision-safe IDs on case-insensitive filesystems ([#108](https://github.com/anatta-rs/ast-to-mermaid/pull/108))
+- *(parser)* Handle BOM, CR-only line endings, and non-UTF-8 git paths ([#107](https://github.com/anatta-rs/ast-to-mermaid/pull/107))
+- *(graph)* Recover gracefully on poisoned RwLock in Store accessors ([#106](https://github.com/anatta-rs/ast-to-mermaid/pull/106))
+- *(security)* Refuse to follow symlinks on cache writes and wipes ([#78](https://github.com/anatta-rs/ast-to-mermaid/pull/78)) ([#104](https://github.com/anatta-rs/ast-to-mermaid/pull/104))
+- *(security)* Validate git refs to block flag-injection (--upload-pack=...) in --ref ([#103](https://github.com/anatta-rs/ast-to-mermaid/pull/103))
+- *(render)* Unify mermaid_id and sequence::sanitize_id (single sanitizer contract) ([#102](https://github.com/anatta-rs/ast-to-mermaid/pull/102))
+- *(security)* Recursion guards on AST visitors (depth limit, no stack overflow on adversarial input) ([#101](https://github.com/anatta-rs/ast-to-mermaid/pull/101))
+- *(parser)* Parse_phase skips+warns on per-file failure (no halt) ([#99](https://github.com/anatta-rs/ast-to-mermaid/pull/99))
+
+### Features
+
+- *(cache)* Bounded GC with symlink-loop guard and high-water-mark auto-trigger ([#105](https://github.com/anatta-rs/ast-to-mermaid/pull/105))
+- *(graph)* Add forward + reverse edge adjacency index to Store ([#90](https://github.com/anatta-rs/ast-to-mermaid/pull/90))
+
+### Performance
+
+- *(parser,cache)* Consume ParseUnit by value in apply_to + put_unit (C37) ([#148](https://github.com/anatta-rs/ast-to-mermaid/pull/148))
+- *(sequence)* Parallel build_sequences + extract_all O(N) + cache max_depth + has_visible memo (C36) ([#147](https://github.com/anatta-rs/ast-to-mermaid/pull/147))
+- *(render)* Snapshot atom HashMap once per render to eliminate per-child RwLock reads (C35) ([#146](https://github.com/anatta-rs/ast-to-mermaid/pull/146))
+- *(artifacts)* Reuse AdjMaps across bundle phases + intern EntityIds (C34) ([#145](https://github.com/anatta-rs/ast-to-mermaid/pull/145))
+- *(pipeline)* Stream parse_phase results to avoid O(N) memory peak (C33) ([#144](https://github.com/anatta-rs/ast-to-mermaid/pull/144))
+- *(graph,resolve)* Borrow-not-clone APIs for Store and resolver (C28) ([#139](https://github.com/anatta-rs/ast-to-mermaid/pull/139))
+- *(pipeline)* Drop bundle() input.content clone via Arc<[u8]> (C27) ([#138](https://github.com/anatta-rs/ast-to-mermaid/pull/138))
+- *(cli/sequence)* Propagate v0.6.0 BatchReader + extract_all to sequence-CLI branch ([#136](https://github.com/anatta-rs/ast-to-mermaid/pull/136))
+- *(pipeline)* Parallelize parse_phase per-file with rayon ([#100](https://github.com/anatta-rs/ast-to-mermaid/pull/100))
+- *(sequence)* Parse each file once for build_sequences (no per-function reparse) ([#98](https://github.com/anatta-rs/ast-to-mermaid/pull/98))
+- *(git)* Use git cat-file --batch over a persistent piped child ([#97](https://github.com/anatta-rs/ast-to-mermaid/pull/97))
+- *(graph)* Predecessor-map BFS for reverse_call_paths (no path cloning) ([#96](https://github.com/anatta-rs/ast-to-mermaid/pull/96))
+- *(artifacts)* Build adjacency maps once for emit_artifacts + entity_meta ([#94](https://github.com/anatta-rs/ast-to-mermaid/pull/94))
+- *(render/overview)* Switch to forward edge adjacency ([#93](https://github.com/anatta-rs/ast-to-mermaid/pull/93))
+- *(render)* Switch project loop to forward edge adjacency ([#92](https://github.com/anatta-rs/ast-to-mermaid/pull/92))
+
+### Refactor
+
+- *(cli/sequence)* Funnel sequence_filename through artifacts::filename_id (C41) ([#152](https://github.com/anatta-rs/ast-to-mermaid/pull/152))
+- *(pipeline)* Expose language_for and DRY ext->Language mapping (C32) ([#143](https://github.com/anatta-rs/ast-to-mermaid/pull/143))
+- *(parser)* Move MAX_AST_DEPTH out of sequence/ to break parser→sequence import (C31) ([#142](https://github.com/anatta-rs/ast-to-mermaid/pull/142))
+- *(render)* Collapse 3 ID/label sanitizers into render::util ([#141](https://github.com/anatta-rs/ast-to-mermaid/pull/141))
+- *(cli)* Split cli/run.rs (1451L) into per-subcommand modules (C29) ([#140](https://github.com/anatta-rs/ast-to-mermaid/pull/140))
+- Remove dead code (deserialize_out_edges, parser PartialEq, capture_index, parse_into) ([#114](https://github.com/anatta-rs/ast-to-mermaid/pull/114))
+- *(parser)* Split parser/mod.rs per language (rust, python, typescript) ([#112](https://github.com/anatta-rs/ast-to-mermaid/pull/112))
+- *(cli)* Split cli_support.rs into cli/{flags,run,format} ([#111](https://github.com/anatta-rs/ast-to-mermaid/pull/111))
+- *(cli)* DRY the CSV exclude parser across 4 subcommands ([#110](https://github.com/anatta-rs/ast-to-mermaid/pull/110))
+- *(error)* Unify parse_size and parse_duration on AstToMermaidError ([#109](https://github.com/anatta-rs/ast-to-mermaid/pull/109))
+
 <!--
 This section is regenerated by release-plz from conventional commit
 messages on the next release PR. Do not hand-curate entries here —
