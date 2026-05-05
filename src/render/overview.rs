@@ -3,7 +3,7 @@
 
 use crate::graph::Store;
 use crate::model::EntityId;
-use crate::render::util::{escape_label, sanitize_id};
+use crate::render::util::{escape_label_flowchart, sanitize_id};
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write as _;
 
@@ -119,7 +119,7 @@ pub fn render(store: &Store) -> String {
     let mut mermaid = String::from("graph TD\n");
     for (path, (name, counts)) in &modules_map {
         let id = sanitize_id(path);
-        let label = escape_label(&counts.label(name));
+        let label = escape_label_flowchart(&counts.label(name));
         writeln!(mermaid, "    {id}[\"{label}\"]").expect("string write is infallible");
     }
     for ((from, to), n) in &edges {

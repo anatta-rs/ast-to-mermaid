@@ -9,7 +9,7 @@ use crate::error::{AstToMermaidError, Result};
 use crate::graph::Store;
 use crate::model::{EdgeKind, EntityId};
 use crate::render::lookup::resolve_module;
-use crate::render::util::{escape_label, sanitize_id};
+use crate::render::util::{escape_label_flowchart, sanitize_id};
 use std::collections::{BTreeMap, HashSet};
 use std::fmt::Write as _;
 
@@ -101,7 +101,7 @@ pub fn render(store: &Store, target: &str) -> Result<String> {
     // 3. Render Mermaid.
     let subgraph_id = sanitize_id(&module_path);
     let mut mermaid = format!("graph TD\n    subgraph {subgraph_id}[\"");
-    let header = escape_label(&format!("{module_label} ({module_path})"));
+    let header = escape_label_flowchart(&format!("{module_label} ({module_path})"));
     mermaid.push_str(&header);
     mermaid.push_str("\"]\n");
 
@@ -118,7 +118,7 @@ pub fn render(store: &Store, target: &str) -> Result<String> {
             && let Some(methods) = impl_methods.get(item_id)
         {
             let impl_subgraph_id = sanitize_id(&format!("impl_{}", item_id.as_str()));
-            let impl_label = escape_label(&format!("impl {}", atom.name));
+            let impl_label = escape_label_flowchart(&format!("impl {}", atom.name));
             writeln!(
                 mermaid,
                 "        subgraph {impl_subgraph_id}[\"{impl_label}\"]"
@@ -129,7 +129,8 @@ pub fn render(store: &Store, target: &str) -> Result<String> {
             for (mid, mkind) in sorted_methods {
                 if let Some(matom) = store.get_atom(mid) {
                     let id = sanitize_id(mid.as_str());
-                    let label = escape_label(&format!("{} {}", short_kind(mkind), matom.name));
+                    let label =
+                        escape_label_flowchart(&format!("{} {}", short_kind(mkind), matom.name));
                     let shape = node_shape(mkind, &id, &label);
                     writeln!(mermaid, "            {shape}").expect("string write is infallible");
                 }
@@ -138,7 +139,7 @@ pub fn render(store: &Store, target: &str) -> Result<String> {
             continue;
         }
         let id = sanitize_id(item_id.as_str());
-        let label = escape_label(&format!("{} {}", short_kind(kind), atom.name));
+        let label = escape_label_flowchart(&format!("{} {}", short_kind(kind), atom.name));
         let shape = node_shape(kind, &id, &label);
         writeln!(mermaid, "        {shape}").expect("string write is infallible");
     }
@@ -154,7 +155,7 @@ pub fn render(store: &Store, target: &str) -> Result<String> {
     for (ext_id, ext_name) in all_external {
         if external_seen.insert(ext_id.clone()) {
             let id = sanitize_id(ext_id.as_str());
-            let label = escape_label(ext_name);
+            let label = escape_label_flowchart(ext_name);
             writeln!(mermaid, "    {id}([\"{label}\"])").expect("string write is infallible");
         }
     }

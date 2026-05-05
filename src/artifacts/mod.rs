@@ -374,7 +374,7 @@ fn prune_orphans(
 // ── Per-entity mermaid ────────────────────────────────────────────────────────
 
 fn entity_mmd(atom: &CodeAtom, outgoing: &[EntityId], incoming: &[EntityId]) -> String {
-    use crate::render::util::escape_label;
+    use crate::render::util::{escape_label_flowchart, sanitize_id};
     use std::fmt::Write as FmtWrite;
 
     // Single-line, comment-safe text for `%% ...` headers — no newlines,
@@ -417,8 +417,12 @@ fn entity_mmd(atom: &CodeAtom, outgoing: &[EntityId], incoming: &[EntityId]) -> 
     writeln!(out, "  classDef module fill:#f3e5f5,stroke:#4a148c")
         .expect("string write is infallible");
 
-    let self_id = mermaid_id_short(atom.id.as_str());
-    let self_label = escape_label(&atom.name);
+    // Sanitize the full entity id — not just the trailing `::` segment —
+    // so two atoms named `foo` in different modules produce distinct
+    // Mermaid node IDs. Distinct entity ids → distinct sanitized IDs
+    // (see [`sanitize_id`]'s `_H<hash>` suffix contract).
+    let self_id = sanitize_id(atom.id.as_str());
+    let self_label = escape_label_flowchart(&atom.name);
     writeln!(out, "  {self_id}:::{}[{}]", atom.kind, self_label)
         .expect("string write is infallible");
 
@@ -428,8 +432,8 @@ fn entity_mmd(atom: &CodeAtom, outgoing: &[EntityId], incoming: &[EntityId]) -> 
             .rsplit("::")
             .next()
             .unwrap_or(callee_id.as_str());
-        let label = escape_label(callee_name);
-        let cid = mermaid_id_short(callee_id.as_str());
+        let label = escape_label_flowchart(callee_name);
+        let cid = sanitize_id(callee_id.as_str());
         writeln!(out, "  {self_id} -- calls --> {cid}:::function[{label}]")
             .expect("string write is infallible");
     }
@@ -439,28 +443,13 @@ fn entity_mmd(atom: &CodeAtom, outgoing: &[EntityId], incoming: &[EntityId]) -> 
             .rsplit("::")
             .next()
             .unwrap_or(caller_id.as_str());
-        let label = escape_label(caller_name);
-        let cid = mermaid_id_short(caller_id.as_str());
+        let label = escape_label_flowchart(caller_name);
+        let cid = sanitize_id(caller_id.as_str());
         writeln!(out, "  {cid}:::function[{label}] -- calls --> {self_id}")
             .expect("string write is infallible");
     }
 
     out
-}
-
-fn mermaid_id_short(id: &str) -> String {
-    // Use the last segment after `::` as the node id, sanitized.
-    let short = id.rsplit("::").next().unwrap_or(id);
-    short
-        .chars()
-        .map(|c| {
-            if c.is_alphanumeric() || c == '_' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect()
 }
 
 fn class_colors(kind: &str) -> (&'static str, &'static str) {
