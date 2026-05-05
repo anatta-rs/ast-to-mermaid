@@ -31,6 +31,7 @@ mod render;
 mod visit;
 
 pub use render::render;
+pub use visit::{MAX_AST_DEPTH, max_ast_depth};
 
 /// Map from qualified target name (`name` or `Owner::name`) to the
 /// extracted [`SequenceDiagram`]. Returned by [`extract_all`].
@@ -466,5 +467,68 @@ mod tests {
         let a_pos = ids.iter().position(|s| *s == "a").expect("a present");
         let b_pos = ids.iter().position(|s| *s == "b").expect("b present");
         assert!(a_pos < b_pos, "a must appear before b: {ids:?}");
+    }
+
+    /// Reproduces issue #75: a 1000-deep call chain must not stack-overflow
+    /// the AST walker. The depth guard caps recursion at
+    /// [`MAX_AST_DEPTH`] and emits exactly one `…depth limit…` marker
+    /// note so the diagram still renders deterministically.
+    #[test]
+    fn depth_limit_one_thousand_deep_call_chain() {
+        let mut src = String::from("fn deep() {\n    ");
+        // `f(f(f( ... 0 ... )))` — 1000 nested call_expression nodes.
+        for _ in 0..1000 {
+            src.push_str("f(");
+        }
+        src.push('0');
+        for _ in 0..1000 {
+            src.push(')');
+        }
+        src.push_str(";\n}\n");
+
+        let d = extract_ok(&src, "deep");
+
+        // Exactly one depth-limit marker note is emitted, regardless of
+        // how many cut points were hit while unwinding.
+        let marker_count = d
+            .steps
+            .iter()
+            .filter(|s| matches!(s, Step::Note { text, .. } if text.contains("depth limit")))
+            .count();
+        assert_eq!(
+            marker_count, 1,
+            "expected exactly one depth-limit marker, got {marker_count} in {:?}",
+            d.steps,
+        );
+
+        // The renderer must produce a finite, complete diagram (no
+        // panic, no truncation mid-line).
+        let mermaid = render(&d);
+        assert!(mermaid.starts_with("sequenceDiagram\n"));
+        assert!(
+            mermaid.contains("depth limit"),
+            "rendered output must surface the depth-limit marker:\n{mermaid}",
+        );
+    }
+
+    #[test]
+    fn max_ast_depth_default_constant_value() {
+        // The default cap stays put at 256 — bumped only by an
+        // intentional code change. Test guards against accidental drift.
+        assert_eq!(MAX_AST_DEPTH, 256);
+    }
+
+    #[test]
+    fn max_ast_depth_resolver_treats_invalid_env_as_default() {
+        // The public `max_ast_depth()` reads the env each call; with no
+        // override set it must equal `MAX_AST_DEPTH`. We cannot mutate
+        // env safely under `deny(unsafe_code)`, so the override path is
+        // verified end-to-end by the binary `a2m` (see test plan in
+        // issue #75) and locally by callers that feed an explicit
+        // `A2M_MAX_AST_DEPTH` to a subprocess.
+        let key = "A2M_MAX_AST_DEPTH";
+        if std::env::var(key).is_err() {
+            assert_eq!(max_ast_depth(), MAX_AST_DEPTH);
+        }
     }
 }

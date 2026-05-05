@@ -14,6 +14,7 @@
 use crate::error::{AstToMermaidError, Result};
 use crate::graph::Store;
 use crate::model::{CodeAtom, Edge, EdgeKind, EntityId};
+use crate::sequence::max_ast_depth;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use tree_sitter::{Node, Parser as TsParser, QueryCursor, StreamingIterator};
@@ -782,7 +783,7 @@ fn extract_use_decls(root: Node, source: &str) -> Vec<UseDecl> {
                 continue;
             }
             if let Some(arg) = use_argument(&n) {
-                flatten_use(arg, "", source, &mut out);
+                flatten_use(arg, "", source, &mut out, 0);
             }
         }
     }
@@ -816,7 +817,21 @@ fn use_argument<'a>(n: &Node<'a>) -> Option<Node<'a>> {
     })
 }
 
-fn flatten_use(n: Node, prefix: &str, source: &str, out: &mut Vec<UseDecl>) {
+/// Recursively unfold a `use` argument tree into one [`UseDecl`] per
+/// imported leaf.
+///
+/// Bounded by [`max_ast_depth`]: a deeply nested adversarial group form
+/// (`use a::{b::{c::{...}}}`) short-circuits at the depth cap with a
+/// `tracing::warn!` instead of overflowing the stack.
+fn flatten_use(n: Node, prefix: &str, source: &str, out: &mut Vec<UseDecl>, depth: usize) {
+    if depth >= max_ast_depth() {
+        tracing::warn!(
+            depth,
+            limit = max_ast_depth(),
+            "ast depth limit hit in flatten_use; truncating import unfolding",
+        );
+        return;
+    }
     match n.kind() {
         "identifier" | "self" | "super" | "crate" | "metavariable" => {
             let name = n.utf8_text(source.as_bytes()).unwrap_or("");
@@ -868,7 +883,7 @@ fn flatten_use(n: Node, prefix: &str, source: &str, out: &mut Vec<UseDecl>) {
                 let mut cursor = list.walk();
                 for child in list.children(&mut cursor) {
                     if !is_use_punctuation(child) {
-                        flatten_use(child, &combined, source, out);
+                        flatten_use(child, &combined, source, out, depth + 1);
                     }
                 }
             }
@@ -877,7 +892,7 @@ fn flatten_use(n: Node, prefix: &str, source: &str, out: &mut Vec<UseDecl>) {
             let mut cursor = n.walk();
             for child in n.children(&mut cursor) {
                 if !is_use_punctuation(child) {
-                    flatten_use(child, prefix, source, out);
+                    flatten_use(child, prefix, source, out, depth + 1);
                 }
             }
         }
