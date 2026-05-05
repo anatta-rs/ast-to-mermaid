@@ -6,6 +6,7 @@
 
 use crate::graph::Store;
 use crate::model::EntityId;
+use crate::render::AdjMaps;
 use crate::render::util::{crate_name, escape_label_flowchart, sanitize_id};
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write as _;
@@ -41,8 +42,12 @@ impl CrateMeta {
 ///
 /// One node per crate with `(modules, functions, structs)` counts; one edge
 /// per cross-crate `calls` aggregation labelled with the call count.
+///
+/// `adj` supplies the pre-computed forward `Calls` adjacency that this view
+/// walks per function — built once by the bundle / analyze caller and shared
+/// across every level render in the same invocation.
 #[must_use]
-pub fn render(store: &Store) -> String {
+pub fn render(store: &Store, adj: &AdjMaps) -> String {
     let atoms = store.atoms_by_kinds(KINDS);
 
     // Build crate-count map and an id→crate map in a single pass over
@@ -59,15 +64,15 @@ pub fn render(store: &Store) -> String {
         id_to_crate.insert(&atom.id, c);
     }
 
-    // Cross-crate call edges. Forward adjacency via `call_edges_from`
-    // makes this O(F·avg_degree); the callee crate comes from the local
-    // id map, so no `Atom` or `Edge` is cloned in the hot loop.
+    // Cross-crate call edges. `adj.callees` returns a borrowed slice from
+    // the bundle-shared adjacency view — no per-edge atom or edge clone.
     let mut edges: BTreeMap<(String, String), usize> = BTreeMap::new();
     for caller in atoms.iter().filter(|a| a.kind == "function") {
         let Some(&caller_crate) = id_to_crate.get(&caller.id) else {
             continue;
         };
-        for callee_id in store.call_edges_from(&caller.id) {
+        for callee_arc in adj.callees(&caller.id) {
+            let callee_id: &EntityId = callee_arc;
             if let Some(&callee_crate) = id_to_crate.get(&callee_id)
                 && callee_crate != caller_crate
             {
@@ -156,7 +161,7 @@ mod tests {
     #[test]
     fn empty_store_renders_minimal_graph() {
         let store = Store::new();
-        let out = render(&store);
+        let out = render(&store, &AdjMaps::build(&store));
         assert_eq!(out, "graph TD\n");
     }
 
@@ -167,7 +172,7 @@ mod tests {
         store.add_atom(fn_atom("crates/foo/src/lib.rs", "f1"));
         store.add_atom(fn_atom("crates/foo/src/lib.rs", "f2"));
         store.add_atom(struct_atom("crates/foo/src/lib.rs", "S"));
-        let out = render(&store);
+        let out = render(&store, &AdjMaps::build(&store));
         assert!(out.contains("foo — 1 mod, 2 fn, 1 struct"));
     }
 
@@ -184,7 +189,7 @@ mod tests {
         store.add_atom(helper);
         store.add_edge(Edge::new(caller_id, helper_id, EdgeKind::Calls));
 
-        let out = render(&store);
+        let out = render(&store, &AdjMaps::build(&store));
         assert!(out.contains("crate_a"));
         assert!(out.contains("crate_b"));
         assert!(
@@ -205,7 +210,7 @@ mod tests {
         store.add_atom(b);
         store.add_edge(Edge::new(aid, bid, EdgeKind::Calls));
 
-        let out = render(&store);
+        let out = render(&store, &AdjMaps::build(&store));
         assert!(!out.contains("-->"));
     }
 
@@ -226,7 +231,7 @@ mod tests {
         store.add_edge(Edge::new(c1_id, helper_id.clone(), EdgeKind::Calls));
         store.add_edge(Edge::new(c2_id, helper_id, EdgeKind::Calls));
 
-        let out = render(&store);
+        let out = render(&store, &AdjMaps::build(&store));
         assert!(out.contains("crate_a -->|\"2 calls\"| crate_b"));
     }
 
@@ -243,7 +248,7 @@ mod tests {
         store.add_atom(g);
         store.add_edge(Edge::new(fid, gid, EdgeKind::Uses));
 
-        let out = render(&store);
+        let out = render(&store, &AdjMaps::build(&store));
         assert!(!out.contains("-->"));
     }
 
@@ -266,7 +271,7 @@ mod tests {
             parent: None,
         };
         store.add_atom(a);
-        let out = render(&store);
+        let out = render(&store, &AdjMaps::build(&store));
         assert_eq!(out, "graph TD\n");
     }
 

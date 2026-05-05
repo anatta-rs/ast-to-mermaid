@@ -9,7 +9,7 @@ use crate::error::{AstToMermaidError, Result};
 use crate::git_source;
 use crate::graph::Store;
 use crate::parser::{CodeParser, Language, ParseFailure, ParseUnit, git_blob_sha1};
-use crate::render::{Level, render};
+use crate::render::{AdjMaps, Level, render};
 use crate::resolve::{resolve_cross_module_calls, resolve_implements_edges};
 use rayon::prelude::*;
 use std::path::{Path, PathBuf};
@@ -214,7 +214,8 @@ pub fn analyze(root: &Path, opts: &AnalyzeOptions) -> Result<AnalyzeReport> {
 
     let parse_report = parse_phase(&inputs, &store, opts.cache.as_deref());
     let edges_resolved = resolve_phase(&store, parse_report.atoms_indexed);
-    let mermaid = render(opts.level, &store, opts.target.as_deref())?;
+    let adj = AdjMaps::build(&store);
+    let mermaid = render(opts.level, &store, &adj, opts.target.as_deref())?;
 
     Ok(AnalyzeReport {
         mermaid,

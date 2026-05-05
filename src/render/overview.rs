@@ -3,6 +3,7 @@
 
 use crate::graph::Store;
 use crate::model::EntityId;
+use crate::render::AdjMaps;
 use crate::render::util::{escape_label_flowchart, sanitize_id};
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write as _;
@@ -40,8 +41,11 @@ impl ModuleMeta {
 ///
 /// One node per module with `(functions, structs, traits)` counts; one edge
 /// per cross-module `calls` aggregation.
+///
+/// `adj` supplies the pre-computed forward `Contains` and `Calls` adjacency
+/// — both are walked once each, with no per-call store edge clones.
 #[must_use]
-pub fn render(store: &Store) -> String {
+pub fn render(store: &Store, adj: &AdjMaps) -> String {
     let modules = store.atoms_by_kind("module");
 
     // Build a module-path → name + counts map.
@@ -55,34 +59,17 @@ pub fn render(store: &Store) -> String {
             .or_insert_with(|| (m.name.clone(), ModuleMeta::default()));
     }
 
-    // Pre-bucket Contains edges by parent at function entry. Each parent's
-    // children list is read once via the forward adjacency index (O(degree))
-    // — even if the same module appears multiple times in the rendering
-    // frame, the lookup below stays a HashMap hit.
-    let mut contains_by_parent: HashMap<EntityId, Vec<EntityId>> =
-        HashMap::with_capacity(modules.len());
+    // Bump item counts via the shared `Contains` adjacency. The slice is
+    // a borrow into `adj` — no per-module Vec allocation.
     for m in &modules {
         if m.file_path.is_empty() {
             continue;
         }
-        contains_by_parent
-            .entry(m.id.clone())
-            .or_insert_with(|| store.children_of(&m.id));
-    }
-
-    // Bump item counts from the pre-computed Contains buckets.
-    for m in &modules {
-        if m.file_path.is_empty() {
-            continue;
-        }
-        let Some(children) = contains_by_parent.get(&m.id) else {
-            continue;
-        };
         let Some((_, counts)) = modules_map.get_mut(&m.file_path) else {
             continue;
         };
-        for child_id in children {
-            if let Some(child) = store.get_atom(child_id) {
+        for child_arc in adj.children(&m.id) {
+            if let Some(child) = store.get_atom(child_arc) {
                 counts.bump(&child.kind);
             }
         }
@@ -95,16 +82,15 @@ pub fn render(store: &Store) -> String {
         fn_to_path.insert(f.id.clone(), f.file_path.as_str());
     }
 
-    // Cross-module call edges via forward adjacency. `call_edges_from`
-    // returns only the callee ids of `Calls` edges, avoiding per-edge
-    // clones and the post-hoc kind filter.
+    // Cross-module call edges via the shared forward `Calls` adjacency.
     let mut edges: BTreeMap<(String, String), usize> = BTreeMap::new();
     for caller in &functions {
         let Some(&from_path) = fn_to_path.get(&caller.id) else {
             continue;
         };
-        for callee_id in store.call_edges_from(&caller.id) {
-            let Some(&to_path) = fn_to_path.get(&callee_id) else {
+        for callee_arc in adj.callees(&caller.id) {
+            let callee_id: &EntityId = callee_arc;
+            let Some(&to_path) = fn_to_path.get(callee_id) else {
                 continue;
             };
             if to_path != from_path {
@@ -187,7 +173,7 @@ mod tests {
     #[test]
     fn empty_store_yields_only_header() {
         let store = Store::new();
-        let out = render(&store);
+        let out = render(&store, &AdjMaps::build(&store));
         assert_eq!(out, "graph TD\n");
     }
 
@@ -195,7 +181,7 @@ mod tests {
     fn single_module_with_no_items_shows_zero_count() {
         let store = Store::new();
         build_module(&store, "src/lib.rs", "lib", &[]);
-        let out = render(&store);
+        let out = render(&store, &AdjMaps::build(&store));
         assert!(out.contains("lib — 0 fn"), "got: {out}");
     }
 
@@ -213,7 +199,7 @@ mod tests {
                 ("trait", "T"),
             ],
         );
-        let out = render(&store);
+        let out = render(&store, &AdjMaps::build(&store));
         assert!(out.contains("lib — 2 fn, 1 struct, 1 trait"), "got: {out}");
     }
 
@@ -226,7 +212,7 @@ mod tests {
             "lib",
             &[("function", "a"), ("function", "b")],
         );
-        let out = render(&store);
+        let out = render(&store, &AdjMaps::build(&store));
         assert!(out.contains("lib — 2 fn"));
         assert!(!out.contains("struct"));
         assert!(!out.contains("trait"));
@@ -242,7 +228,7 @@ mod tests {
         let hid = EntityId::new("code:src/mod_b.rs::function::helper");
         store.add_edge(Edge::new(cid, hid, EdgeKind::Calls));
 
-        let out = render(&store);
+        let out = render(&store, &AdjMaps::build(&store));
         let from_id = sanitize_id("src/mod_a.rs");
         let to_id = sanitize_id("src/mod_b.rs");
         assert!(
@@ -264,7 +250,7 @@ mod tests {
         let bid = EntityId::new("code:src/mod_a.rs::function::b");
         store.add_edge(Edge::new(aid, bid, EdgeKind::Calls));
 
-        let out = render(&store);
+        let out = render(&store, &AdjMaps::build(&store));
         assert!(!out.contains("-->"));
     }
 
@@ -285,7 +271,7 @@ mod tests {
             store.add_edge(Edge::new(cid, hid.clone(), EdgeKind::Calls));
         }
 
-        let out = render(&store);
+        let out = render(&store, &AdjMaps::build(&store));
         let from_id = sanitize_id("src/mod_a.rs");
         let to_id = sanitize_id("src/mod_b.rs");
         assert!(out.contains(&format!("{from_id} -->|\"2\"| {to_id}")));
@@ -307,7 +293,7 @@ mod tests {
             &[("function", "f2")],
         );
 
-        let out = render(&store);
+        let out = render(&store, &AdjMaps::build(&store));
         assert!(out.contains(&sanitize_id("crates/foo/src/queries.rs")));
         assert!(out.contains(&sanitize_id("crates/bar/src/queries.rs")));
     }
@@ -330,7 +316,7 @@ mod tests {
             parent: None,
         };
         store.add_atom(a);
-        let out = render(&store);
+        let out = render(&store, &AdjMaps::build(&store));
         assert_eq!(out, "graph TD\n");
     }
 
