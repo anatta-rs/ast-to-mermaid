@@ -7,7 +7,8 @@
 
 use crate::error::{AstToMermaidError, Result};
 use crate::graph::Store;
-use crate::model::{EdgeKind, EntityId};
+use crate::model::EntityId;
+use crate::render::AdjMaps;
 use crate::render::lookup::resolve_module;
 use crate::render::util::{escape_label_flowchart, sanitize_id};
 use std::collections::{BTreeMap, HashSet};
@@ -15,12 +16,16 @@ use std::fmt::Write as _;
 
 /// Render the module-zoom view of `target` against `store`.
 ///
+/// `adj` supplies the shared forward `Contains` and forward + reverse
+/// `Calls` adjacencies — the only graph data this view needs once
+/// `resolve_module` has located the target.
+///
 /// # Errors
 ///
 /// - [`AstToMermaidError::InvalidInput`] when `target` doesn't resolve to a
 ///   unique module.
 #[allow(clippy::too_many_lines)]
-pub fn render(store: &Store, target: &str) -> Result<String> {
+pub fn render(store: &Store, adj: &AdjMaps, target: &str) -> Result<String> {
     let module_id = resolve_module(store, target)?;
     let module_atom = store
         .get_atom(&module_id)
@@ -28,37 +33,38 @@ pub fn render(store: &Store, target: &str) -> Result<String> {
     let module_label = module_atom.name.clone();
     let module_path = module_atom.file_path.clone();
 
-    // 1. Items inside the module via `Contains` edges. Two tiers:
+    // 1. Items inside the module via the shared `Contains` adjacency. Two
+    //    tiers:
     //    - top-level items directly contained by the module.
-    //    - methods nested inside `impl` blocks (which we draw as their own
+    //    - methods nested inside `impl` blocks (drawn as their own
     //      sub-subgraph).
-    let child_ids = store.children_of(&module_id);
     let mut top_items: BTreeMap<EntityId, String> = BTreeMap::new(); // id → kind
     let mut impl_methods: BTreeMap<EntityId, BTreeMap<EntityId, String>> = BTreeMap::new(); // impl_id → (method_id → kind)
     let mut inside_set: HashSet<EntityId> = HashSet::new();
-    for id in &child_ids {
-        let Some(atom) = store.get_atom(id) else {
+    for child_arc in adj.children(&module_id) {
+        let child_id: &EntityId = child_arc;
+        let Some(atom) = store.get_atom(child_id) else {
             continue;
         };
-        top_items.insert(id.clone(), atom.kind.clone());
-        inside_set.insert(id.clone());
+        top_items.insert(child_id.clone(), atom.kind.clone());
+        inside_set.insert(child_id.clone());
         if atom.kind == "impl" {
-            let methods = store.children_of(id);
             let mut method_map: BTreeMap<EntityId, String> = BTreeMap::new();
-            for m in &methods {
-                if let Some(matom) = store.get_atom(m) {
-                    method_map.insert(m.clone(), matom.kind.clone());
-                    inside_set.insert(m.clone());
+            for method_arc in adj.children(child_id) {
+                let method_id: &EntityId = method_arc;
+                if let Some(matom) = store.get_atom(method_id) {
+                    method_map.insert(method_id.clone(), matom.kind.clone());
+                    inside_set.insert(method_id.clone());
                 }
             }
             if !method_map.is_empty() {
-                impl_methods.insert(id.clone(), method_map);
+                impl_methods.insert(child_id.clone(), method_map);
             }
         }
     }
 
-    // 2. Walk outgoing + incoming neighbors of every function item — both
-    //    top-level functions and impl methods.
+    // 2. Walk outgoing + incoming `Calls` neighbors of every function item —
+    //    both top-level functions and impl methods.
     let mut function_items: Vec<EntityId> = top_items
         .iter()
         .filter(|(_, kind)| kind.as_str() == "function")
@@ -76,23 +82,23 @@ pub fn render(store: &Store, target: &str) -> Result<String> {
     let mut incoming: BTreeMap<(EntityId, EntityId), String> = BTreeMap::new(); // (outside, inside) → outside name
 
     for item_id in &function_items {
-        for edge in store.edges_from(item_id) {
-            if edge.kind == EdgeKind::Calls
-                && !inside_set.contains(&edge.to)
-                && let Some(ext) = store.get_atom(&edge.to)
+        for callee_arc in adj.callees(item_id) {
+            let callee_id: &EntityId = callee_arc;
+            if !inside_set.contains(callee_id)
+                && let Some(ext) = store.get_atom(callee_id)
             {
                 outgoing
-                    .entry((item_id.clone(), edge.to.clone()))
+                    .entry((item_id.clone(), callee_id.clone()))
                     .or_insert_with(|| ext.name.clone());
             }
         }
-        for edge in store.edges_to(item_id) {
-            if edge.kind == EdgeKind::Calls
-                && !inside_set.contains(&edge.from)
-                && let Some(ext) = store.get_atom(&edge.from)
+        for caller_arc in adj.callers(item_id) {
+            let caller_id: &EntityId = caller_arc;
+            if !inside_set.contains(caller_id)
+                && let Some(ext) = store.get_atom(caller_id)
             {
                 incoming
-                    .entry((edge.from.clone(), item_id.clone()))
+                    .entry((caller_id.clone(), item_id.clone()))
                     .or_insert_with(|| ext.name.clone());
             }
         }
@@ -254,14 +260,14 @@ mod tests {
     #[test]
     fn empty_target_errors() {
         let store = Store::new();
-        let err = render(&store, "").expect_err("must error");
+        let err = render(&store, &AdjMaps::build(&store), "").expect_err("must error");
         assert!(matches!(err, AstToMermaidError::InvalidInput(_)));
     }
 
     #[test]
     fn missing_module_errors() {
         let store = Store::new();
-        let err = render(&store, "ghost").expect_err("must error");
+        let err = render(&store, &AdjMaps::build(&store), "ghost").expect_err("must error");
         assert!(err.to_string().contains("no module"));
     }
 
@@ -283,7 +289,7 @@ mod tests {
                 ("macro", "M"),
             ],
         );
-        let out = render(&store, "src/foo.rs").expect("render");
+        let out = render(&store, &AdjMaps::build(&store), "src/foo.rs").expect("render");
         assert!(out.contains("subgraph"));
         assert!(out.contains("mod (src/foo.rs)"));
         assert!(out.contains("fn f1\"]"));
@@ -308,7 +314,7 @@ mod tests {
         store.add_edge(Edge::new(caller.clone(), helper, EdgeKind::Calls));
         store.add_edge(Edge::new(outside, caller, EdgeKind::Calls));
 
-        let out = render(&store, "src/mod_a.rs").expect("render");
+        let out = render(&store, &AdjMaps::build(&store), "src/mod_a.rs").expect("render");
         assert!(out.contains("subgraph"));
         assert!(out.contains("([\"helper\"])"));
         assert!(out.contains("([\"caller_outside\"])"));
@@ -327,7 +333,7 @@ mod tests {
         let bid = EntityId::new("code:src/foo.rs::function::b");
         store.add_edge(Edge::new(aid, bid, EdgeKind::Calls));
 
-        let out = render(&store, "src/foo.rs").expect("render");
+        let out = render(&store, &AdjMaps::build(&store), "src/foo.rs").expect("render");
         assert!(out.contains("fn a\"]"));
         assert!(out.contains("fn b\"]"));
         let arrows = out.matches("-->").count();
@@ -407,7 +413,7 @@ mod tests {
         store.add_atom(m1);
         store.add_atom(m2);
 
-        let out = render(&store, "src/foo.rs").expect("render");
+        let out = render(&store, &AdjMaps::build(&store), "src/foo.rs").expect("render");
         // Outer module subgraph + nested impl subgraph = two `subgraph` lines.
         let nesting = out.matches("subgraph").count();
         assert!(
@@ -459,7 +465,7 @@ mod tests {
         let helper_id = EntityId::new("code:src/bar.rs::function::helper");
         store.add_edge(Edge::new(method.id, helper_id, EdgeKind::Calls));
 
-        let out = render(&store, "src/foo.rs").expect("render");
+        let out = render(&store, &AdjMaps::build(&store), "src/foo.rs").expect("render");
         assert!(
             out.contains("([\"helper\"])"),
             "external `helper` node missing: {out}"

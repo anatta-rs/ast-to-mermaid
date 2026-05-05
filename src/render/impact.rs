@@ -6,9 +6,11 @@
 
 use crate::error::Result;
 use crate::graph::Store;
+use crate::model::EntityId;
+use crate::render::AdjMaps;
 use crate::render::lookup::resolve_function;
 use crate::render::util::{escape_label_flowchart, sanitize_id};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt::Write as _;
 
 /// Default reverse-walk depth.
@@ -20,38 +22,59 @@ pub const DEFAULT_HOPS: u8 = 3;
 /// duplicate nodes across paths and emits one edge per unique caller →
 /// callee pair seen in the BFS frontier.
 ///
+/// `adj` supplies the reverse `Calls` adjacency that the BFS walks back
+/// from `target` — same map the bundle's other levels share.
+///
 /// # Errors
 ///
 /// Same as [`crate::render::lookup::resolve_function`].
-pub fn render(store: &Store, target: &str, hops: u8) -> Result<String> {
+pub fn render(store: &Store, adj: &AdjMaps, target: &str, hops: u8) -> Result<String> {
     let target_id = resolve_function(store, target)?;
     let target_atom = store
         .get_atom(&target_id)
         .expect("resolve_function vouched the id exists");
 
-    let (predecessors, reachable) = store.reverse_call_paths(&target_id, hops);
-
-    // Drain the predecessor map directly — every entry is one
-    // caller→callee edge in the BFS-reachable region. No path cloning,
-    // no per-path reconstruction.
+    // BFS over `adj.callers` from `target_id`. Per-path-visited semantics
+    // mirror `Store::reverse_call_paths`: a caller can appear in the
+    // reachable region multiple times via different paths, but the same
+    // caller cannot reappear along a single BFS-tree path back to the
+    // root (otherwise we'd render an impossible self-loop along that
+    // chain).
     let mut edges: BTreeSet<(String, String)> = BTreeSet::new();
-    for (caller, callees) in &predecessors {
-        for callee in callees {
-            edges.insert((caller.as_str().to_owned(), callee.as_str().to_owned()));
-        }
-    }
-
-    // Build node name map.
     let mut nodes: BTreeMap<String, String> = BTreeMap::new();
     nodes.insert(target_id.as_str().to_owned(), target_atom.name.clone());
-    for node_id in &reachable {
-        if node_id == &target_id {
-            continue;
+
+    let mut visited: HashSet<EntityId> = HashSet::new();
+    visited.insert(target_id.clone());
+    let mut bfs_pred: HashMap<EntityId, EntityId> = HashMap::new();
+    let mut frontier: Vec<EntityId> = vec![target_id.clone()];
+
+    for _ in 0..usize::from(hops) {
+        let mut next_frontier: Vec<EntityId> = Vec::new();
+        for node in &frontier {
+            for caller_arc in adj.callers(node) {
+                let caller: &EntityId = caller_arc;
+                if caller == &target_id {
+                    continue;
+                }
+                if path_contains(&bfs_pred, node, caller) {
+                    continue;
+                }
+                edges.insert((caller.as_str().to_owned(), node.as_str().to_owned()));
+                if visited.insert(caller.clone()) {
+                    bfs_pred.insert(caller.clone(), node.clone());
+                    let name = store
+                        .get_atom(caller)
+                        .map_or_else(|| "?".to_owned(), |a| a.name.clone());
+                    nodes.insert(caller.as_str().to_owned(), name);
+                    next_frontier.push(caller.clone());
+                }
+            }
         }
-        let name = store
-            .get_atom(node_id)
-            .map_or_else(|| "?".to_owned(), |a| a.name.clone());
-        nodes.insert(node_id.as_str().to_owned(), name);
+        if next_frontier.is_empty() {
+            break;
+        }
+        frontier = next_frontier;
     }
 
     let mut mermaid = String::from("graph BT\n");
@@ -73,6 +96,27 @@ pub fn render(store: &Store, target: &str, hops: u8) -> Result<String> {
         writeln!(mermaid, "    {fid} --> {tid}").expect("string write is infallible");
     }
     Ok(mermaid)
+}
+
+/// Whether `needle` appears on the BFS spanning-tree path from `start`
+/// back to the BFS root. Local copy of the helper that
+/// `Store::reverse_call_paths` uses internally — kept here so the
+/// adjacency-driven BFS does not need to reach back into the store.
+fn path_contains(
+    bfs_pred: &HashMap<EntityId, EntityId>,
+    start: &EntityId,
+    needle: &EntityId,
+) -> bool {
+    let mut cur = start;
+    loop {
+        if cur == needle {
+            return true;
+        }
+        match bfs_pred.get(cur) {
+            Some(next) => cur = next,
+            None => return false,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -102,7 +146,7 @@ mod tests {
     #[test]
     fn missing_target_errors() {
         let store = Store::new();
-        let err = render(&store, "ghost", 3).expect_err("must error");
+        let err = render(&store, &AdjMaps::build(&store), "ghost", 3).expect_err("must error");
         assert!(matches!(err, AstToMermaidError::InvalidInput(_)));
     }
 
@@ -110,7 +154,7 @@ mod tests {
     fn isolated_function_renders_only_target() {
         let store = Store::new();
         store.add_atom(fn_atom("src/lib.rs", "foo"));
-        let out = render(&store, "foo", DEFAULT_HOPS).expect("render");
+        let out = render(&store, &AdjMaps::build(&store), "foo", DEFAULT_HOPS).expect("render");
         assert!(out.contains("fn foo (impacted)"));
         assert_eq!(out.matches("--> ").count(), 0);
     }
@@ -127,7 +171,7 @@ mod tests {
             store.add_edge(Edge::new(f, t, EdgeKind::Calls));
         }
 
-        let out = render(&store, "c", 2).expect("render");
+        let out = render(&store, &AdjMaps::build(&store), "c", 2).expect("render");
         assert!(out.contains("fn c (impacted)"));
         assert!(out.contains("\"a\""));
         assert!(out.contains("\"b\""));
@@ -143,7 +187,7 @@ mod tests {
         let b = EntityId::new("code:src/m.rs::function::b");
         store.add_edge(Edge::new(a, b, EdgeKind::Calls));
 
-        let out = render(&store, "b", 0).expect("render");
+        let out = render(&store, &AdjMaps::build(&store), "b", 0).expect("render");
         assert!(out.contains("fn b (impacted)"));
         assert!(!out.contains("\"a\""));
     }
@@ -160,7 +204,7 @@ mod tests {
             store.add_edge(Edge::new(f, t, EdgeKind::Calls));
         }
 
-        let out = render(&store, "d", 2).expect("render");
+        let out = render(&store, &AdjMaps::build(&store), "d", 2).expect("render");
         for n in ["\"a\"", "\"b\"", "\"c\""] {
             assert!(out.contains(n), "missing {n} in:\n{out}");
         }

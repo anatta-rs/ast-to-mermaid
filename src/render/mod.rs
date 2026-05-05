@@ -13,6 +13,7 @@
 //! - [`Level::Impact`] (target = function name or id) — reverse call chain
 //!   walked back N hops (default 3) — answers "who breaks if I change this?".
 
+pub mod adj;
 pub mod dot;
 mod function;
 mod impact;
@@ -27,6 +28,7 @@ use crate::graph::Store;
 use std::fmt;
 use std::str::FromStr;
 
+pub use adj::AdjMaps;
 pub use dot::mermaid_to_dot;
 pub use impact::DEFAULT_HOPS;
 
@@ -88,20 +90,31 @@ impl FromStr for Level {
     }
 }
 
-/// Render `level` against `store`. `target` is required for module / function
-/// / impact levels and ignored for project / overview.
+/// Render `level` against `store`, reusing `adj` for every adjacency
+/// lookup. `target` is required for module / function / impact levels and
+/// ignored for project / overview.
+///
+/// `adj` should be built once per logical operation via [`AdjMaps::build`]
+/// and shared across all level renders the caller needs — that is the whole
+/// point of threading it explicitly: bundle invocations avoid re-sweeping
+/// the edge slice once per level.
 ///
 /// # Errors
 ///
 /// - [`AstToMermaidError::InvalidInput`] when a target is required but absent
 ///   or doesn't resolve.
-pub fn render(level: Level, store: &Store, target: Option<&str>) -> AtmResult<String> {
+pub fn render(
+    level: Level,
+    store: &Store,
+    adj: &AdjMaps,
+    target: Option<&str>,
+) -> AtmResult<String> {
     let s = match level {
-        Level::Project => project::render(store),
-        Level::Overview => overview::render(store),
-        Level::Module => module::render(store, require_target(level, target)?)?,
-        Level::Function => function::render(store, require_target(level, target)?)?,
-        Level::Impact => impact::render(store, require_target(level, target)?, DEFAULT_HOPS)?,
+        Level::Project => project::render(store, adj),
+        Level::Overview => overview::render(store, adj),
+        Level::Module => module::render(store, adj, require_target(level, target)?)?,
+        Level::Function => function::render(store, adj, require_target(level, target)?)?,
+        Level::Impact => impact::render(store, adj, require_target(level, target)?, DEFAULT_HOPS)?,
     };
     Ok(s)
 }
@@ -176,8 +189,9 @@ mod tests {
     #[test]
     fn render_dispatches_project_and_overview_without_target() {
         let store = Store::new();
-        let project = render(Level::Project, &store, None).expect("project");
-        let overview = render(Level::Overview, &store, None).expect("overview");
+        let adj = AdjMaps::build(&store);
+        let project = render(Level::Project, &store, &adj, None).expect("project");
+        let overview = render(Level::Overview, &store, &adj, None).expect("overview");
         assert_eq!(project, "graph TD\n");
         assert_eq!(overview, "graph TD\n");
     }
@@ -185,8 +199,9 @@ mod tests {
     #[test]
     fn render_target_required_for_zoom_levels() {
         let store = Store::new();
+        let adj = AdjMaps::build(&store);
         for lvl in [Level::Module, Level::Function, Level::Impact] {
-            let err = render(lvl, &store, None).expect_err("must require target");
+            let err = render(lvl, &store, &adj, None).expect_err("must require target");
             assert!(err.to_string().contains("--target"));
         }
     }

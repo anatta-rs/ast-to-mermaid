@@ -20,8 +20,8 @@
 //! ```
 
 use crate::graph::Store;
-use crate::model::{AtomKind, CodeAtom, EdgeKind, EntityId};
-use crate::render::{Level, render};
+use crate::model::{AtomKind, CodeAtom, EntityId};
+use crate::render::{AdjMaps, Level, render};
 use crate::sequence;
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
@@ -88,18 +88,21 @@ pub fn emit_artifacts_with_sequences(
     source_root: &str,
     sequence_sources: &[(String, Arc<[u8]>)],
 ) -> ArtifactSet {
-    let overview_mmd = render(Level::Project, store, None).unwrap_or_default();
+    // Build the shared adjacency view *once*. Both the top-level project
+    // render and the per-entity sweep below read from it — avoids the prior
+    // 3× edge sweep per bundle (project::render, build_adjacency_maps,
+    // overview's children_of) and the per-edge `EntityId` deep clones.
+    let adj = AdjMaps::build(store);
 
-    let adj = build_adjacency_maps(store);
+    let overview_mmd = render(Level::Project, store, &adj, None).unwrap_or_default();
 
     let mut entities: Vec<EntityArtifact> = store.with_atoms(|atoms| {
         let mut out: Vec<EntityArtifact> = Vec::with_capacity(atoms.len());
-        let empty: Vec<EntityId> = Vec::new();
         for atom in atoms {
             let kind = AtomKind::parse(&atom.kind);
-            let outgoing = adj.callees.get(&atom.id).unwrap_or(&empty);
-            let incoming = adj.callers.get(&atom.id).unwrap_or(&empty);
-            let children = adj.children.get(&atom.id).unwrap_or(&empty);
+            let outgoing = adj.callees(&atom.id);
+            let incoming = adj.callers(&atom.id);
+            let children = adj.children(&atom.id);
 
             let mmd = entity_mmd(atom, outgoing, incoming);
             let meta = entity_meta(atom, outgoing, incoming, children, &adj);
@@ -373,7 +376,7 @@ fn prune_orphans(
 
 // ── Per-entity mermaid ────────────────────────────────────────────────────────
 
-fn entity_mmd(atom: &CodeAtom, outgoing: &[EntityId], incoming: &[EntityId]) -> String {
+fn entity_mmd(atom: &CodeAtom, outgoing: &[Arc<EntityId>], incoming: &[Arc<EntityId>]) -> String {
     use crate::render::util::{escape_label_flowchart, sanitize_id};
     use std::fmt::Write as FmtWrite;
 
@@ -466,103 +469,22 @@ fn class_colors(kind: &str) -> (&'static str, &'static str) {
     }
 }
 
-// ── Adjacency maps ────────────────────────────────────────────────────────────
-
-/// Five buckets of pre-computed adjacency, built once per
-/// [`emit_artifacts`] invocation by [`build_adjacency_maps`]. Replaces
-/// the per-atom O(E) edge filters that previously dominated bundle build
-/// time.
-///
-/// `callers` and `callees` are the reverse / forward `Calls` map;
-/// `children` is the forward `Contains` map; `uses_out` / `uses_in` and
-/// `implements_out` / `implements_in` are the forward / reverse maps for
-/// the two remaining edge kinds.
-struct AdjMaps {
-    callers: HashMap<EntityId, Vec<EntityId>>,
-    callees: HashMap<EntityId, Vec<EntityId>>,
-    children: HashMap<EntityId, Vec<EntityId>>,
-    uses_out: HashMap<EntityId, Vec<EntityId>>,
-    uses_in: HashMap<EntityId, Vec<EntityId>>,
-    implements_out: HashMap<EntityId, Vec<EntityId>>,
-    implements_in: HashMap<EntityId, Vec<EntityId>>,
-}
-
-/// Single sweep over the edge slice (held under [`Store::with_edges`]) that
-/// yields the five logical adjacency buckets consumed by [`emit_artifacts`]
-/// and [`entity_meta`]. Borrowing avoids the per-call deep clone of the
-/// store's full edge vector.
-fn build_adjacency_maps(store: &Store) -> AdjMaps {
-    let mut maps = AdjMaps {
-        callers: HashMap::new(),
-        callees: HashMap::new(),
-        children: HashMap::new(),
-        uses_out: HashMap::new(),
-        uses_in: HashMap::new(),
-        implements_out: HashMap::new(),
-        implements_in: HashMap::new(),
-    };
-    store.with_edges(|edges| {
-        for edge in edges {
-            match edge.kind {
-                EdgeKind::Calls => {
-                    maps.callees
-                        .entry(edge.from.clone())
-                        .or_default()
-                        .push(edge.to.clone());
-                    maps.callers
-                        .entry(edge.to.clone())
-                        .or_default()
-                        .push(edge.from.clone());
-                }
-                EdgeKind::Contains => {
-                    maps.children
-                        .entry(edge.from.clone())
-                        .or_default()
-                        .push(edge.to.clone());
-                }
-                EdgeKind::Uses => {
-                    maps.uses_out
-                        .entry(edge.from.clone())
-                        .or_default()
-                        .push(edge.to.clone());
-                    maps.uses_in
-                        .entry(edge.to.clone())
-                        .or_default()
-                        .push(edge.from.clone());
-                }
-                EdgeKind::Implements => {
-                    maps.implements_out
-                        .entry(edge.from.clone())
-                        .or_default()
-                        .push(edge.to.clone());
-                    maps.implements_in
-                        .entry(edge.to.clone())
-                        .or_default()
-                        .push(edge.from.clone());
-                }
-            }
-        }
-    });
-    maps
-}
-
 // ── Per-entity meta JSON ──────────────────────────────────────────────────────
 
 fn entity_meta(
     atom: &CodeAtom,
-    outgoing: &[EntityId],
-    incoming: &[EntityId],
-    children: &[EntityId],
+    outgoing: &[Arc<EntityId>],
+    incoming: &[Arc<EntityId>],
+    children: &[Arc<EntityId>],
     adj: &AdjMaps,
 ) -> Value {
-    let to_strings = |ids: Option<&Vec<EntityId>>| -> Vec<String> {
-        ids.map(|v| v.iter().map(|e| e.as_str().to_owned()).collect())
-            .unwrap_or_default()
+    let to_strings = |ids: &[Arc<EntityId>]| -> Vec<String> {
+        ids.iter().map(|e| e.as_str().to_owned()).collect()
     };
-    let imports = to_strings(adj.uses_out.get(&atom.id));
-    let imported_by = to_strings(adj.uses_in.get(&atom.id));
-    let implements = to_strings(adj.implements_out.get(&atom.id));
-    let implemented_by = to_strings(adj.implements_in.get(&atom.id));
+    let imports = to_strings(adj.uses_out(&atom.id));
+    let imported_by = to_strings(adj.uses_in(&atom.id));
+    let implements = to_strings(adj.implements_out(&atom.id));
+    let implemented_by = to_strings(adj.implements_in(&atom.id));
 
     json!({
         "id": atom.id.as_str(),
@@ -574,9 +496,9 @@ fn entity_meta(
         "signature": atom.signature,
         "doc": atom.doc,
         "content_hash": atom.content_hash,
-        "callers": incoming.iter().map(EntityId::as_str).collect::<Vec<_>>(),
-        "callees": outgoing.iter().map(EntityId::as_str).collect::<Vec<_>>(),
-        "children": children.iter().map(EntityId::as_str).collect::<Vec<_>>(),
+        "callers": incoming.iter().map(|a| a.as_str()).collect::<Vec<_>>(),
+        "callees": outgoing.iter().map(|a| a.as_str()).collect::<Vec<_>>(),
+        "children": children.iter().map(|a| a.as_str()).collect::<Vec<_>>(),
         "imports": imports,
         "imported_by": imported_by,
         "implements": implements,
