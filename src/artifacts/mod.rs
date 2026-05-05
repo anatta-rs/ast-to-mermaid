@@ -250,6 +250,13 @@ fn qualified_fn_name(id: &str) -> Option<String> {
 /// is compared modulo its `generated_at` field — a run that produces the
 /// same entity set keeps the previous timestamp on disk.
 ///
+/// `allow_empty` is the escape hatch for the empty-input safety: when
+/// `false` and `artifacts.entities` is empty against a populated
+/// `entities/` dir, the function returns `Ok(())` without touching the
+/// directory — the prune would otherwise wipe every `.mmd` /
+/// `.meta.json` in there. The CLI handler errors out earlier with a
+/// clear message; this is the library-level fallback for direct callers.
+///
 /// Layout:
 /// - `<out_dir>/overview.mmd`
 /// - `<out_dir>/index.json`
@@ -264,10 +271,19 @@ fn qualified_fn_name(id: &str) -> Option<String> {
 pub fn write_artifacts(
     artifacts: &ArtifactSet,
     out_dir: &std::path::Path,
+    allow_empty: bool,
 ) -> crate::error::Result<()> {
     use std::fs;
-    fs::create_dir_all(out_dir)?;
     let entities_dir = out_dir.join("entities");
+    // Safety net for empty input + populated existing bundle. Without it,
+    // the prune below would delete *every* `.mmd` and `.meta.json` under
+    // `entities/`, wiping the user's previous run, and the empty
+    // overview.mmd / index.json would clobber the previous top-level
+    // files. Skip the whole write when the dangerous condition holds.
+    if artifacts.entities.is_empty() && !allow_empty && dir_contains_files(&entities_dir) {
+        return Ok(());
+    }
+    fs::create_dir_all(out_dir)?;
     fs::create_dir_all(&entities_dir)?;
 
     let mut keep_entity_basenames: HashSet<String> = HashSet::new();
@@ -354,6 +370,14 @@ fn structurally_equal_modulo_generated_at(a: &Value, b: &Value) -> bool {
         m.remove("generated_at");
     }
     a == b
+}
+
+/// True when `dir` exists and contains at least one entry. Used by the
+/// empty-input safety: an artifact set with zero entities against a
+/// populated `entities/` dir is almost always a user mistake, so the
+/// caller refuses to proceed with the destructive prune step.
+pub(crate) fn dir_contains_files(dir: &std::path::Path) -> bool {
+    std::fs::read_dir(dir).is_ok_and(|mut it| it.next().is_some())
 }
 
 /// Delete any file in `dir` whose name ends with one of `suffixes` and whose
@@ -788,7 +812,7 @@ mod tests {
         let artifacts = emit_artifacts(&store, "/src");
 
         let tmp = tempfile::tempdir().expect("tmp");
-        write_artifacts(&artifacts, tmp.path()).expect("string write is infallible");
+        write_artifacts(&artifacts, tmp.path(), false).expect("string write is infallible");
 
         let entities_dir = tmp.path().join("entities");
         let mmd_files: Vec<String> = std::fs::read_dir(&entities_dir)
@@ -821,7 +845,7 @@ mod tests {
         let artifacts = emit_artifacts(&store, "/src");
 
         let tmp = tempfile::tempdir().expect("tmp");
-        write_artifacts(&artifacts, tmp.path()).expect("string write is infallible");
+        write_artifacts(&artifacts, tmp.path(), false).expect("string write is infallible");
 
         assert!(tmp.path().join("overview.mmd").exists());
         assert!(tmp.path().join("index.json").exists());
@@ -854,7 +878,7 @@ mod tests {
         // resolution so no sleep is needed to make this observable.
         let artifacts = small_set("src/lib.rs", "foo", "h1");
         let tmp = tempfile::tempdir().expect("tmp");
-        write_artifacts(&artifacts, tmp.path()).expect("first write");
+        write_artifacts(&artifacts, tmp.path(), false).expect("first write");
 
         let overview = tmp.path().join("overview.mmd");
         let index = tmp.path().join("index.json");
@@ -872,7 +896,7 @@ mod tests {
 
         // Re-emit (so `generated_at` is fresh) and write again.
         let artifacts2 = small_set("src/lib.rs", "foo", "h1");
-        write_artifacts(&artifacts2, tmp.path()).expect("second write");
+        write_artifacts(&artifacts2, tmp.path(), false).expect("second write");
 
         assert_eq!(mtime(&overview), m_overview, "overview.mmd was rewritten");
         assert_eq!(
@@ -898,7 +922,7 @@ mod tests {
         let artifacts = emit_artifacts(&store, "/src");
 
         let tmp = tempfile::tempdir().expect("tmp");
-        write_artifacts(&artifacts, tmp.path()).expect("first write");
+        write_artifacts(&artifacts, tmp.path(), false).expect("first write");
 
         let foo_mmd = tmp
             .path()
@@ -918,7 +942,7 @@ mod tests {
         store2.add_atom(foo2);
         store2.add_atom(bar2);
         let artifacts2 = emit_artifacts(&store2, "/src");
-        write_artifacts(&artifacts2, tmp.path()).expect("second write");
+        write_artifacts(&artifacts2, tmp.path(), false).expect("second write");
 
         assert_eq!(mtime(&foo_mmd), m_foo, "foo.mmd should not be rewritten");
         assert!(
@@ -945,7 +969,7 @@ mod tests {
         let artifacts = emit_artifacts(&store, "/src");
 
         let tmp = tempfile::tempdir().expect("tmp");
-        write_artifacts(&artifacts, tmp.path()).expect("first write");
+        write_artifacts(&artifacts, tmp.path(), false).expect("first write");
 
         let bar_mmd = tmp
             .path()
@@ -963,7 +987,7 @@ mod tests {
             "foo",
         ));
         let artifacts2 = emit_artifacts(&store2, "/src");
-        write_artifacts(&artifacts2, tmp.path()).expect("second write");
+        write_artifacts(&artifacts2, tmp.path(), false).expect("second write");
 
         assert!(!bar_mmd.exists(), "bar.mmd should be pruned");
         assert!(!bar_meta.exists(), "bar.meta.json should be pruned");

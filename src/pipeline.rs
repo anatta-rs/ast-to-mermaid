@@ -42,6 +42,12 @@ pub struct AnalyzeOptions {
     /// every Rust function whose body has at least one step. Off by
     /// default — the extra extraction roughly doubles bundle wall-time.
     pub with_sequences: bool,
+    /// Escape hatch for the empty-input safety: when `true`, [`bundle`]
+    /// will still emit (and [`crate::artifacts::write_artifacts`] will
+    /// still prune) even if the parse phase produced zero entities. Off
+    /// by default — the safety prevents `a2m bundle wrong/path --out
+    /// existing/bundle` from wiping the previous run.
+    pub allow_empty: bool,
 }
 
 impl Default for AnalyzeOptions {
@@ -53,6 +59,7 @@ impl Default for AnalyzeOptions {
             git_ref: None,
             cache: None,
             with_sequences: false,
+            allow_empty: false,
         }
     }
 }
@@ -69,6 +76,7 @@ impl std::fmt::Debug for AnalyzeOptions {
                 &self.cache.as_ref().map(|c| c.root().display().to_string()),
             )
             .field("with_sequences", &self.with_sequences)
+            .field("allow_empty", &self.allow_empty)
             .finish()
     }
 }
@@ -118,13 +126,26 @@ fn collect_from_worktree(root: &Path, exclude: &[String]) -> Result<Vec<ParseInp
 
 fn collect_from_git_ref(root: &Path, git_ref: &str) -> Result<Vec<ParseInput>> {
     let toplevel = git_source::show_toplevel(root)?;
-    // If the user pointed at a subdirectory, only keep entries under it.
-    let prefix = root
-        .canonicalize()
-        .ok()
-        .and_then(|abs| abs.strip_prefix(&toplevel).ok().map(Path::to_path_buf))
-        .map(|p| p.to_string_lossy().into_owned())
-        .filter(|s| !s.is_empty());
+    // Resolve the user-provided path against the git toplevel and keep
+    // entries under it as a subdirectory hint. Used to be
+    // `.canonicalize().ok().and_then(strip_prefix)`, which silently fell
+    // back to "no prefix" when the path was outside the toplevel — a
+    // user pointing at a sibling worktree or repo would then index the
+    // wrong tree without warning. Both failures now bubble up.
+    let abs = root.canonicalize().map_err(|e| {
+        AstToMermaidError::InvalidInput(format!("canonicalize {}: {e}", root.display()))
+    })?;
+    let rel = abs.strip_prefix(&toplevel).map_err(|_| {
+        AstToMermaidError::InvalidInput(format!(
+            "path {} is outside git toplevel {}; refusing to index unrelated tree",
+            abs.display(),
+            toplevel.display(),
+        ))
+    })?;
+    let prefix = {
+        let s = rel.to_string_lossy().into_owned();
+        if s.is_empty() { None } else { Some(s) }
+    };
 
     let entries = git_source::ls_tree(&toplevel, git_ref)?;
     // One persistent `git cat-file --batch` child for the whole loop,
@@ -740,6 +761,7 @@ mod tests {
                 git_ref: None,
                 cache: None,
                 with_sequences: false,
+                allow_empty: false,
             },
         )
         .expect("analyze");
@@ -1032,7 +1054,7 @@ mod tests {
         let (artifacts, _report) = bundle(tmp.path(), &opts).expect("bundle");
 
         let out = tmp.path().join("bundle-out");
-        write_artifacts(&artifacts, &out).expect("write");
+        write_artifacts(&artifacts, &out, false).expect("write");
 
         let seq_dir = out.join("sequences");
         assert!(seq_dir.is_dir(), "sequences/ dir must exist");
@@ -1088,6 +1110,83 @@ mod tests {
         assert_eq!(
             r1.mermaid, r2.mermaid,
             "streaming merge must be deterministic across runs"
+        );
+    }
+
+    /// `collect_from_git_ref` used to silently fall back to "no prefix"
+    /// when canonicalize-then-strip_prefix failed (path outside the
+    /// repo's toplevel), and would then index the *entire* tree without
+    /// warning — a user pointing at a sibling worktree, broken symlink,
+    /// or non-existent path got the wrong answer. The behaviour now
+    /// bubbles up as `InvalidInput` for every failure mode.
+    #[test]
+    fn collect_from_git_ref_errors_when_path_outside_toplevel() {
+        // A non-git dir (no `.git`) — `show_toplevel` returns
+        // `InvalidInput`. Used to silently fall through to the
+        // canonicalize step, which also failed silently. Now: error.
+        let other = tempdir().expect("tmp other");
+        let result = collect_from_git_ref(other.path(), "HEAD");
+        match result {
+            Err(AstToMermaidError::InvalidInput(_)) => {}
+            Err(e) => panic!("expected InvalidInput, got: {e}"),
+            Ok(_) => panic!("expected error for path outside any git toplevel"),
+        }
+
+        // A non-existent absolute path — `canonicalize` fails. Used to
+        // silently fall through to no-prefix. Now: error.
+        let missing = std::path::PathBuf::from("/no/such/path/here-c39-test");
+        let result = collect_from_git_ref(&missing, "HEAD");
+        match result {
+            Err(AstToMermaidError::InvalidInput(_)) => {}
+            Err(e) => panic!("expected InvalidInput for missing path, got: {e}"),
+            Ok(_) => panic!("expected error for missing path"),
+        }
+    }
+
+    /// Belt-and-braces: `write_artifacts` itself refuses to wipe an
+    /// existing populated bundle when handed an empty artifact set
+    /// without `allow_empty=true`. The CLI handler errors out earlier
+    /// with a clear message; this is the library-level fallback.
+    #[test]
+    fn bundle_refuses_empty_prune() {
+        use crate::artifacts::{ArtifactSet, write_artifacts};
+
+        let tmp = tempdir().expect("tmp");
+        let out = tmp.path().join("bundle-out");
+        let entities = out.join("entities");
+        std::fs::create_dir_all(&entities).expect("mkdir entities");
+        // Two pre-existing artifacts that the prune step would wipe.
+        std::fs::write(entities.join("foo.mmd"), "graph TD\n").expect("write foo");
+        std::fs::write(entities.join("foo.meta.json"), "{}").expect("write foo meta");
+
+        let empty = ArtifactSet {
+            overview_mmd: "graph TD\n".to_owned(),
+            entities: Vec::new(),
+            index_json: serde_json::json!({}),
+            sequences: Vec::new(),
+        };
+
+        // Without `allow_empty`: the prune is skipped, the existing
+        // entity files survive untouched.
+        write_artifacts(&empty, &out, false).expect("must not error");
+        assert!(
+            entities.join("foo.mmd").exists(),
+            "existing entity .mmd must survive an empty bundle without --allow-empty"
+        );
+        assert!(
+            entities.join("foo.meta.json").exists(),
+            "existing entity .meta.json must survive an empty bundle"
+        );
+
+        // With `allow_empty=true`: the escape hatch prunes anyway.
+        write_artifacts(&empty, &out, true).expect("allow_empty must succeed");
+        assert!(
+            !entities.join("foo.mmd").exists(),
+            "--allow-empty must prune orphans"
+        );
+        assert!(
+            !entities.join("foo.meta.json").exists(),
+            "--allow-empty must prune orphan .meta.json too"
         );
     }
 }

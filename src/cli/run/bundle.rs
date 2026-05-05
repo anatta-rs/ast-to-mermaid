@@ -1,5 +1,5 @@
 use super::{check_ref_arg, open_default_cache};
-use crate::artifacts::write_artifacts;
+use crate::artifacts::{dir_contains_files, write_artifacts};
 use crate::cli::flags::{BundleFlags, ExitCode};
 use crate::cli::format::parse_csv_exclude;
 use crate::pipeline::{AnalyzeOptions, bundle};
@@ -19,6 +19,7 @@ pub fn run_bundle(flags: &BundleFlags) -> ExitCode {
         git_ref: flags.r#ref.clone(),
         cache,
         with_sequences: flags.with_sequences,
+        allow_empty: flags.allow_empty,
         ..AnalyzeOptions::default()
     };
 
@@ -30,7 +31,24 @@ pub fn run_bundle(flags: &BundleFlags) -> ExitCode {
         }
     };
 
-    if let Err(e) = write_artifacts(&artifacts, &flags.out) {
+    // Refuse to wipe a populated `--out` dir with an empty bundle. Without
+    // this, `a2m bundle wrong/path --out existing/bundle` would parse zero
+    // files, then `write_artifacts` would prune *every* `.mmd` /
+    // `.meta.json` in `entities/`. The escape hatch is `--allow-empty`.
+    if artifacts.entities.is_empty()
+        && !flags.allow_empty
+        && dir_contains_files(&flags.out.join("entities"))
+    {
+        eprintln!(
+            "bundle: refusing to overwrite populated {} with an empty bundle \
+             ({} produced 0 entities). Pass --allow-empty to override.",
+            flags.out.display(),
+            flags.path.display(),
+        );
+        return ExitCode::Failure;
+    }
+
+    if let Err(e) = write_artifacts(&artifacts, &flags.out, flags.allow_empty) {
         eprintln!("bundle: write {}: {e}", flags.out.display());
         return ExitCode::Failure;
     }
@@ -70,6 +88,7 @@ mod tests {
             exclude: String::new(),
             r#ref: None,
             with_sequences: false,
+            allow_empty: false,
         };
         assert_eq!(run_bundle(&flags), ExitCode::Success);
         assert!(out.join("index.json").exists());
@@ -85,6 +104,7 @@ mod tests {
             exclude: String::new(),
             r#ref: None,
             with_sequences: false,
+            allow_empty: false,
         };
         assert_eq!(run_bundle(&flags), ExitCode::Failure);
     }
@@ -104,6 +124,7 @@ mod tests {
             exclude: String::new(),
             r#ref: None,
             with_sequences: true,
+            allow_empty: false,
         };
         assert_eq!(run_bundle(&flags), ExitCode::Success);
         assert!(out.join("sequences").is_dir());
@@ -124,9 +145,89 @@ mod tests {
             exclude: String::new(),
             r#ref: None,
             with_sequences: false,
+            allow_empty: false,
         };
         assert_eq!(run_bundle(&flags), ExitCode::Success);
         assert!(!out.join("sequences").exists());
+    }
+
+    /// `a2m bundle empty/dir --out existing/bundle` used to wipe every
+    /// `.mmd` / `.meta.json` under `existing/bundle/entities/` because
+    /// the empty parse → empty artifact → unconditional `prune_orphans`
+    /// chain ran without any sanity check. The CLI now refuses, with a
+    /// message pointing at `--allow-empty`.
+    #[test]
+    fn bundle_refuses_empty_into_populated_out_dir() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        // Step 1: produce a populated bundle from a real source dir.
+        let src = tmp.path().join("src-real");
+        write_rust(
+            &src,
+            "lib.rs",
+            "pub fn caller() { helper(); }\npub fn helper() {}\n",
+        );
+        let out = tmp.path().join("bundle-out");
+        let populate = BundleFlags {
+            path: src.clone(),
+            out: out.clone(),
+            exclude: String::new(),
+            r#ref: None,
+            with_sequences: false,
+            allow_empty: false,
+        };
+        assert_eq!(run_bundle(&populate), ExitCode::Success);
+        let entities_dir = out.join("entities");
+        let entity_count_before = std::fs::read_dir(&entities_dir)
+            .expect("readdir entities")
+            .count();
+        assert!(
+            entity_count_before > 0,
+            "populated bundle must have entity files"
+        );
+
+        // Step 2: re-bundle from an empty source dir into the same out
+        // dir. Without the safety, this would prune every entity. The
+        // CLI must refuse.
+        let empty = tmp.path().join("src-empty");
+        std::fs::create_dir_all(&empty).expect("mkdir empty");
+        let wipe = BundleFlags {
+            path: empty.clone(),
+            out: out.clone(),
+            exclude: String::new(),
+            r#ref: None,
+            with_sequences: false,
+            allow_empty: false,
+        };
+        assert_eq!(
+            run_bundle(&wipe),
+            ExitCode::Failure,
+            "empty bundle into populated --out must refuse without --allow-empty"
+        );
+        let entity_count_after = std::fs::read_dir(&entities_dir)
+            .expect("readdir entities post-refuse")
+            .count();
+        assert_eq!(
+            entity_count_after, entity_count_before,
+            "refusal must leave entities/ untouched"
+        );
+
+        // Step 3: same call, `--allow-empty` set. Now the prune runs.
+        let force = BundleFlags {
+            path: empty,
+            out: out.clone(),
+            exclude: String::new(),
+            r#ref: None,
+            with_sequences: false,
+            allow_empty: true,
+        };
+        assert_eq!(run_bundle(&force), ExitCode::Success);
+        let entity_count_forced = std::fs::read_dir(&entities_dir)
+            .expect("readdir entities post-force")
+            .count();
+        assert_eq!(
+            entity_count_forced, 0,
+            "--allow-empty must let the prune sweep entities/"
+        );
     }
 
     #[test]
@@ -140,6 +241,7 @@ mod tests {
             exclude: String::new(),
             r#ref: Some("HEAD".into()),
             with_sequences: false,
+            allow_empty: false,
         };
         assert_eq!(run_bundle(&flags), ExitCode::Success);
         assert!(out.join("index.json").exists());
