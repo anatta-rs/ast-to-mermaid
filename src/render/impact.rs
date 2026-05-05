@@ -7,7 +7,7 @@
 use crate::error::Result;
 use crate::graph::Store;
 use crate::render::lookup::resolve_function;
-use crate::render::util::{escape_label, mermaid_id};
+use crate::render::util::{escape_label, sanitize_id};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
@@ -55,20 +55,20 @@ pub fn render(store: &Store, target: &str, hops: u8) -> Result<String> {
     }
 
     let mut mermaid = String::from("graph BT\n");
-    let target_node_id = mermaid_id(target_id.as_str());
+    let target_node_id = sanitize_id(target_id.as_str());
     let target_label = escape_label(&format!("fn {} (impacted)", target_atom.name));
     writeln!(mermaid, "    {target_node_id}((\"{target_label}\"))").expect("writing");
     for (id, name) in &nodes {
         if id == target_id.as_str() {
             continue;
         }
-        let nid = mermaid_id(id);
+        let nid = sanitize_id(id);
         let label = escape_label(name);
         writeln!(mermaid, "    {nid}[\"{label}\"]").expect("writing");
     }
     for (from, to) in &edges {
-        let fid = mermaid_id(from);
-        let tid = mermaid_id(to);
+        let fid = sanitize_id(from);
+        let tid = sanitize_id(to);
         writeln!(mermaid, "    {fid} --> {tid}").expect("writing");
     }
     Ok(mermaid)

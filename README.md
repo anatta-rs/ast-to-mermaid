@@ -44,7 +44,7 @@ graph TD
     pipeline_rs -->|"1 calls"| resolve_rs
 ```
 
-(Note the `graph_` node id: the `graph/` module's name collides with Mermaid's `graph TD` keyword, so `mermaid_id` suffixes it with `_`. Without that escape, the diagram fails to parse — the same kind of reserved-keyword guard that pretty much every codegen tool that emits a target language has to deal with.)
+(Note the `graph_` node id: the `graph/` module's name collides with Mermaid's `graph TD` keyword, so `sanitize_id` suffixes it with `_`. Without that escape, the diagram fails to parse — the same kind of reserved-keyword guard that pretty much every codegen tool that emits a target language has to deal with.)
 
 ### Convergence: `a2m impact ./src --target parse_phase`
 

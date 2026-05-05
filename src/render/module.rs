@@ -9,7 +9,7 @@ use crate::error::{AstToMermaidError, Result};
 use crate::graph::Store;
 use crate::model::{EdgeKind, EntityId};
 use crate::render::lookup::resolve_module;
-use crate::render::util::{escape_label, mermaid_id};
+use crate::render::util::{escape_label, sanitize_id};
 use std::collections::{BTreeMap, HashSet};
 use std::fmt::Write as _;
 
@@ -99,7 +99,7 @@ pub fn render(store: &Store, target: &str) -> Result<String> {
     }
 
     // 3. Render Mermaid.
-    let subgraph_id = mermaid_id(&module_path);
+    let subgraph_id = sanitize_id(&module_path);
     let mut mermaid = format!("graph TD\n    subgraph {subgraph_id}[\"");
     let header = escape_label(&format!("{module_label} ({module_path})"));
     mermaid.push_str(&header);
@@ -117,7 +117,7 @@ pub fn render(store: &Store, target: &str) -> Result<String> {
         if kind.as_str() == "impl"
             && let Some(methods) = impl_methods.get(item_id)
         {
-            let impl_subgraph_id = mermaid_id(&format!("impl_{}", item_id.as_str()));
+            let impl_subgraph_id = sanitize_id(&format!("impl_{}", item_id.as_str()));
             let impl_label = escape_label(&format!("impl {}", atom.name));
             writeln!(
                 mermaid,
@@ -128,7 +128,7 @@ pub fn render(store: &Store, target: &str) -> Result<String> {
             sorted_methods.sort_by_key(|(id, _)| id.as_str());
             for (mid, mkind) in sorted_methods {
                 if let Some(matom) = store.get_atom(mid) {
-                    let id = mermaid_id(mid.as_str());
+                    let id = sanitize_id(mid.as_str());
                     let label = escape_label(&format!("{} {}", short_kind(mkind), matom.name));
                     let shape = node_shape(mkind, &id, &label);
                     writeln!(mermaid, "            {shape}").expect("writing");
@@ -137,7 +137,7 @@ pub fn render(store: &Store, target: &str) -> Result<String> {
             writeln!(mermaid, "        end").expect("writing");
             continue;
         }
-        let id = mermaid_id(item_id.as_str());
+        let id = sanitize_id(item_id.as_str());
         let label = escape_label(&format!("{} {}", short_kind(kind), atom.name));
         let shape = node_shape(kind, &id, &label);
         writeln!(mermaid, "        {shape}").expect("writing");
@@ -153,20 +153,20 @@ pub fn render(store: &Store, target: &str) -> Result<String> {
         .collect();
     for (ext_id, ext_name) in all_external {
         if external_seen.insert(ext_id.clone()) {
-            let id = mermaid_id(ext_id.as_str());
+            let id = sanitize_id(ext_id.as_str());
             let label = escape_label(ext_name);
             writeln!(mermaid, "    {id}([\"{label}\"])").expect("writing");
         }
     }
 
     for (inside, outside) in outgoing.keys() {
-        let from_id = mermaid_id(inside.as_str());
-        let to_id = mermaid_id(outside.as_str());
+        let from_id = sanitize_id(inside.as_str());
+        let to_id = sanitize_id(outside.as_str());
         writeln!(mermaid, "    {from_id} --> {to_id}").expect("writing");
     }
     for (outside, inside) in incoming.keys() {
-        let from_id = mermaid_id(outside.as_str());
-        let to_id = mermaid_id(inside.as_str());
+        let from_id = sanitize_id(outside.as_str());
+        let to_id = sanitize_id(inside.as_str());
         writeln!(mermaid, "    {from_id} --> {to_id}").expect("writing");
     }
 

@@ -21,33 +21,52 @@ const MERMAID_RESERVED: &[&str] = &[
     "accDescr",
 ];
 
-/// Sanitize a name so it can be used as a Mermaid node ID.
+/// Canonical sanitizer for Mermaid node IDs. Single source of truth — every
+/// renderer (project / overview / module / function / impact + sequence)
+/// goes through this function so the same input always produces the same
+/// node ID across diagrams.
 ///
-/// Mermaid IDs must be alphanumeric or `_`. Any other character is replaced
-/// with `_`. Empty input becomes a single `_` to keep IDs syntactically valid.
-/// Reserved Mermaid keywords (e.g. `graph`, `subgraph`, `end`) are prefixed
-/// with `n_` because using them as bare IDs makes the parser interpret the
-/// node line as a new diagram-type declaration.
+/// Contract:
+/// - Output is `[A-Za-z0-9_]+`. Non-ASCII alphanumerics are replaced with
+///   `_` (rejected); Mermaid's flowchart parser is unreliable on unicode
+///   IDs in the wild, so we trade away that subset for byte-stable output.
+/// - Empty input → `_`.
+/// - Digit-leading IDs are prefixed with `_` because Mermaid's parser
+///   reads a bare digit-leading token as a number, not an identifier.
+/// - Reserved Mermaid keywords (case-insensitive: `graph`, `Graph`, `GRAPH`
+///   all match) are prefixed with `n_` because using them as bare IDs
+///   makes the parser interpret the line as a new diagram-type
+///   declaration.
 #[must_use]
-pub fn mermaid_id(name: &str) -> String {
+pub fn sanitize_id(name: &str) -> String {
     if name.is_empty() {
         return "_".to_owned();
     }
-    let sanitized: String = name
-        .chars()
-        .map(|c| {
-            if c.is_alphanumeric() || c == '_' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    if MERMAID_RESERVED.contains(&sanitized.as_str()) {
-        format!("n_{sanitized}")
-    } else {
-        sanitized
+    let mut sanitized = String::with_capacity(name.len());
+    for c in name.chars() {
+        if c.is_ascii_alphanumeric() || c == '_' {
+            sanitized.push(c);
+        } else {
+            sanitized.push('_');
+        }
     }
+    if sanitized
+        .as_bytes()
+        .first()
+        .is_some_and(u8::is_ascii_digit)
+    {
+        let mut prefixed = String::with_capacity(sanitized.len() + 1);
+        prefixed.push('_');
+        prefixed.push_str(&sanitized);
+        return prefixed;
+    }
+    if MERMAID_RESERVED
+        .iter()
+        .any(|r| sanitized.eq_ignore_ascii_case(r))
+    {
+        return format!("n_{sanitized}");
+    }
+    sanitized
 }
 
 /// Escape a string for safe inclusion in a Mermaid node label (the `[".."]`
@@ -90,54 +109,75 @@ mod tests {
     use super::*;
 
     #[test]
-    fn mermaid_id_keeps_alphanumeric_and_underscore() {
-        assert_eq!(mermaid_id("foo_bar123"), "foo_bar123");
+    fn sanitize_id_keeps_alphanumeric_and_underscore() {
+        assert_eq!(sanitize_id("foo_bar123"), "foo_bar123");
     }
 
     #[test]
-    fn mermaid_id_replaces_punctuation() {
-        assert_eq!(mermaid_id("foo-bar.rs"), "foo_bar_rs");
-        assert_eq!(mermaid_id("crates/anatta-api"), "crates_anatta_api");
-        assert_eq!(mermaid_id("a::b::c"), "a__b__c");
+    fn sanitize_id_replaces_punctuation() {
+        assert_eq!(sanitize_id("foo-bar.rs"), "foo_bar_rs");
+        assert_eq!(sanitize_id("crates/anatta-api"), "crates_anatta_api");
+        assert_eq!(sanitize_id("a::b::c"), "a__b__c");
     }
 
     #[test]
-    fn mermaid_id_handles_empty() {
-        assert_eq!(mermaid_id(""), "_");
+    fn sanitize_id_handles_empty() {
+        assert_eq!(sanitize_id(""), "_");
     }
 
     #[test]
-    fn mermaid_id_handles_unicode() {
-        // is_alphanumeric is unicode-aware
-        assert_eq!(mermaid_id("café"), "café");
-        assert_eq!(mermaid_id("ε-greedy"), "ε_greedy");
+    fn sanitize_id_rejects_unicode() {
+        // Documented contract: non-ASCII alphanumerics are *replaced* with
+        // `_`, not preserved. Mermaid's flowchart parser is iffy on unicode
+        // IDs in the wild and we want byte-stable output.
+        assert_eq!(sanitize_id("café"), "caf_");
+        assert_eq!(sanitize_id("ε-greedy"), "__greedy");
     }
 
     #[test]
-    fn mermaid_id_escapes_reserved_keywords() {
+    fn sanitize_id_prefixes_digit_leading() {
+        // `3things` would be parsed as a number by Mermaid; the `_` prefix
+        // forces it back into identifier territory while keeping the
+        // alphanumeric+`_` invariant.
+        assert_eq!(sanitize_id("3things"), "_3things");
+        assert_eq!(sanitize_id("42"), "_42");
+        // Already-prefixed digit-leading is unchanged.
+        assert_eq!(sanitize_id("_3things"), "_3things");
+    }
+
+    #[test]
+    fn sanitize_id_escapes_reserved_keywords() {
         // `graph` as an ID makes the Mermaid parser see a nested diagram
         // declaration. Prefix with `n_` to keep it syntactically a node.
-        assert_eq!(mermaid_id("graph"), "n_graph");
-        assert_eq!(mermaid_id("subgraph"), "n_subgraph");
-        assert_eq!(mermaid_id("end"), "n_end");
-        assert_eq!(mermaid_id("flowchart"), "n_flowchart");
-        assert_eq!(mermaid_id("classDef"), "n_classDef");
-        assert_eq!(mermaid_id("style"), "n_style");
-        assert_eq!(mermaid_id("click"), "n_click");
+        assert_eq!(sanitize_id("graph"), "n_graph");
+        assert_eq!(sanitize_id("subgraph"), "n_subgraph");
+        assert_eq!(sanitize_id("end"), "n_end");
+        assert_eq!(sanitize_id("flowchart"), "n_flowchart");
+        assert_eq!(sanitize_id("classDef"), "n_classDef");
+        assert_eq!(sanitize_id("style"), "n_style");
+        assert_eq!(sanitize_id("click"), "n_click");
         // Sanitized-but-not-equal-to-reserved still needs no escape.
-        assert_eq!(mermaid_id("graph!"), "graph_");
-        assert_eq!(mermaid_id("graphical"), "graphical");
+        assert_eq!(sanitize_id("graph!"), "graph_");
+        assert_eq!(sanitize_id("graphical"), "graphical");
     }
 
     #[test]
-    fn mermaid_id_does_not_escape_substring_matches() {
+    fn sanitize_id_reserved_keyword_check_is_case_insensitive() {
+        // Mermaid's parser is case-insensitive on diagram-type keywords —
+        // `Graph`, `GRAPH`, `gRaPh` all clash. Match the parser.
+        assert_eq!(sanitize_id("Graph"), "n_Graph");
+        assert_eq!(sanitize_id("GRAPH"), "n_GRAPH");
+        assert_eq!(sanitize_id("Subgraph"), "n_Subgraph");
+        assert_eq!(sanitize_id("END"), "n_END");
+    }
+
+    #[test]
+    fn sanitize_id_does_not_escape_substring_matches() {
         // Only exact reserved-word matches get the prefix; substrings are fine.
-        assert_eq!(mermaid_id("graphics"), "graphics");
-        assert_eq!(mermaid_id("subgraph_inner"), "subgraph_inner");
-        assert_eq!(mermaid_id("my_graph"), "my_graph");
-        assert_eq!(mermaid_id("ending"), "ending");
-        // Case-sensitive: `Graph` is not in the reserved list.
-        assert_eq!(mermaid_id("Graph"), "Graph");
+        assert_eq!(sanitize_id("graphics"), "graphics");
+        assert_eq!(sanitize_id("subgraph_inner"), "subgraph_inner");
+        assert_eq!(sanitize_id("my_graph"), "my_graph");
+        assert_eq!(sanitize_id("ending"), "ending");
     }
 
     #[test]

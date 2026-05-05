@@ -257,7 +257,7 @@ pub fn write_artifacts(
 
     let mut keep_entity_basenames: HashSet<String> = HashSet::new();
     for entity in &artifacts.entities {
-        let base = sanitize_id(entity.id.as_str());
+        let base = filename_id(entity.id.as_str());
         keep_entity_basenames.insert(base.clone());
         write_if_changed(
             &entities_dir.join(format!("{base}.mmd")),
@@ -276,7 +276,7 @@ pub fn write_artifacts(
     if !artifacts.sequences.is_empty() {
         fs::create_dir_all(&sequences_dir)?;
         for seq in &artifacts.sequences {
-            let base = sanitize_id(seq.entity_id.as_str());
+            let base = filename_id(seq.entity_id.as_str());
             keep_seq_basenames.insert(base.clone());
             write_if_changed(
                 &sequences_dir.join(format!("{base}.mmd")),
@@ -582,7 +582,7 @@ fn build_index(
     let entity_list: Vec<Value> = entities
         .iter()
         .map(|e| {
-            let base = sanitize_id(e.id.as_str());
+            let base = filename_id(e.id.as_str());
             // Extract callees + callers from meta.
             let out_edges: Vec<&str> = e
                 .meta
@@ -632,9 +632,15 @@ fn build_index(
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 /// Sanitize an entity id for use as a filename.
-/// `[^a-zA-Z0-9._-]` → `_`.
+///
+/// Conceptually distinct from [`crate::render::util::sanitize_id`]: that
+/// function targets Mermaid node IDs (alphanumeric+`_`, with reserved-word
+/// and digit-leading guards), whereas this one targets filesystem paths.
+/// Filenames need to keep `.` (extensions) and `-` (idiomatic in repo
+/// paths), so the allowed set is wider; we don't apply Mermaid's
+/// keyword/digit guards because they're meaningless on disk.
 #[must_use]
-pub fn sanitize_id(id: &str) -> String {
+pub fn filename_id(id: &str) -> String {
     id.chars()
         .map(|c| {
             if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
@@ -743,13 +749,13 @@ mod tests {
     }
 
     #[test]
-    fn sanitize_id_replaces_special_chars() {
+    fn filename_id_replaces_special_chars() {
         assert_eq!(
-            sanitize_id("code:src/lib.rs::function::foo"),
+            filename_id("code:src/lib.rs::function::foo"),
             "code_src_lib.rs__function__foo"
         );
-        assert_eq!(sanitize_id("abc_123-def.rs"), "abc_123-def.rs");
-        assert_eq!(sanitize_id("a::b"), "a__b");
+        assert_eq!(filename_id("abc_123-def.rs"), "abc_123-def.rs");
+        assert_eq!(filename_id("a::b"), "a__b");
     }
 
     #[test]
