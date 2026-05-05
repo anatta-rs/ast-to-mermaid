@@ -3,9 +3,20 @@
 //! Backed by `HashMap<EntityId, CodeAtom>` for nodes and `Vec<Edge>` for
 //! edges, guarded by a single `RwLock` for interior mutability.
 //!
+//! Forward and reverse adjacency indices (`forward_idx`, `reverse_idx`)
+//! map each endpoint to the indices of its incident edges in the `edges`
+//! vector. This makes the six edge accessors O(degree) instead of O(E),
+//! which matters once an edge list grows past a few thousand entries.
+//!
 //! Designed for: tests, CLI one-shot runs, and the MVP self-bootstrap path.
-//! NOT designed for: large datasets (no compaction), persistence (process-bound),
-//! or concurrent writers (single writer at a time via the rwlock).
+//! NOT designed for: persistence (process-bound) or concurrent writers
+//! (single writer at a time via the rwlock).
+//!
+//! Invariant: `forward_idx[e.from]` and `reverse_idx[e.to]` both contain
+//! the index of `e` in `edges`, for every edge. The only mutation point
+//! that maintains it is [`Store::add_edge`]; a `pub(crate)` escape hatch
+//! [`Store::rebuild_indices`] recomputes both maps from scratch for use
+//! by future bulk-load paths.
 
 use crate::model::{CodeAtom, Edge, EdgeKind, EntityId};
 use std::collections::HashMap;
@@ -22,6 +33,20 @@ pub struct Store {
 struct Inner {
     atoms: HashMap<EntityId, CodeAtom>,
     edges: Vec<Edge>,
+    forward_idx: HashMap<EntityId, Vec<usize>>,
+    reverse_idx: HashMap<EntityId, Vec<usize>>,
+}
+
+impl Inner {
+    #[allow(dead_code)] // reserved: see Store::rebuild_indices
+    fn rebuild_indices(&mut self) {
+        self.forward_idx.clear();
+        self.reverse_idx.clear();
+        for (i, e) in self.edges.iter().enumerate() {
+            self.forward_idx.entry(e.from.clone()).or_default().push(i);
+            self.reverse_idx.entry(e.to.clone()).or_default().push(i);
+        }
+    }
 }
 
 impl Default for Store {
@@ -59,15 +84,38 @@ impl Store {
     /// Both endpoints may be absent at insertion time — dangling edges are
     /// simply ignored by the renderers when they fetch the atoms.
     ///
+    /// This is the sole mutation point for `forward_idx` / `reverse_idx`:
+    /// the new edge's index is appended to both maps in lockstep with the
+    /// `edges` push, so the invariant described at the module level holds.
+    ///
     /// # Panics
     ///
     /// Panics if the internal `RwLock` is poisoned.
     pub fn add_edge(&self, edge: Edge) {
+        let mut guard = self.inner.write().expect("rwlock not poisoned");
+        let idx = guard.edges.len();
+        let from = edge.from.clone();
+        let to = edge.to.clone();
+        guard.edges.push(edge);
+        guard.forward_idx.entry(from).or_default().push(idx);
+        guard.reverse_idx.entry(to).or_default().push(idx);
+    }
+
+    /// Recompute `forward_idx` and `reverse_idx` from `edges`.
+    ///
+    /// Reserved for future bulk-load paths (e.g. bundle reconstruction)
+    /// that may want to populate `edges` directly. Not used by `add_edge`,
+    /// which maintains the maps incrementally.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal `RwLock` is poisoned.
+    #[allow(dead_code)] // reserved for bundle reconstruction; see module docs
+    pub(crate) fn rebuild_indices(&self) {
         self.inner
             .write()
             .expect("rwlock not poisoned")
-            .edges
-            .push(edge);
+            .rebuild_indices();
     }
 
     // ── Reads ─────────────────────────────────────────────────────────────────
@@ -164,12 +212,10 @@ impl Store {
     #[must_use]
     pub fn edges_from(&self, from: &EntityId) -> Vec<Edge> {
         let guard = self.inner.read().expect("rwlock not poisoned");
-        guard
-            .edges
-            .iter()
-            .filter(|e| &e.from == from)
-            .cloned()
-            .collect()
+        match guard.forward_idx.get(from) {
+            Some(idxs) => idxs.iter().map(|&i| guard.edges[i].clone()).collect(),
+            None => Vec::new(),
+        }
     }
 
     /// Incoming edges to `to`.
@@ -180,12 +226,10 @@ impl Store {
     #[must_use]
     pub fn edges_to(&self, to: &EntityId) -> Vec<Edge> {
         let guard = self.inner.read().expect("rwlock not poisoned");
-        guard
-            .edges
-            .iter()
-            .filter(|e| &e.to == to)
-            .cloned()
-            .collect()
+        match guard.reverse_idx.get(to) {
+            Some(idxs) => idxs.iter().map(|&i| guard.edges[i].clone()).collect(),
+            None => Vec::new(),
+        }
     }
 
     /// All edges whose kind is `Calls`, outgoing from `from`.
@@ -196,10 +240,12 @@ impl Store {
     #[must_use]
     pub fn call_edges_from(&self, from: &EntityId) -> Vec<EntityId> {
         let guard = self.inner.read().expect("rwlock not poisoned");
-        guard
-            .edges
-            .iter()
-            .filter(|e| e.kind == EdgeKind::Calls && &e.from == from)
+        let Some(idxs) = guard.forward_idx.get(from) else {
+            return Vec::new();
+        };
+        idxs.iter()
+            .map(|&i| &guard.edges[i])
+            .filter(|e| e.kind == EdgeKind::Calls)
             .map(|e| e.to.clone())
             .collect()
     }
@@ -212,10 +258,12 @@ impl Store {
     #[must_use]
     pub fn call_edges_to(&self, to: &EntityId) -> Vec<EntityId> {
         let guard = self.inner.read().expect("rwlock not poisoned");
-        guard
-            .edges
-            .iter()
-            .filter(|e| e.kind == EdgeKind::Calls && &e.to == to)
+        let Some(idxs) = guard.reverse_idx.get(to) else {
+            return Vec::new();
+        };
+        idxs.iter()
+            .map(|&i| &guard.edges[i])
+            .filter(|e| e.kind == EdgeKind::Calls)
             .map(|e| e.from.clone())
             .collect()
     }
@@ -228,10 +276,12 @@ impl Store {
     #[must_use]
     pub fn children_of(&self, parent: &EntityId) -> Vec<EntityId> {
         let guard = self.inner.read().expect("rwlock not poisoned");
-        guard
-            .edges
-            .iter()
-            .filter(|e| e.kind == EdgeKind::Contains && &e.from == parent)
+        let Some(idxs) = guard.forward_idx.get(parent) else {
+            return Vec::new();
+        };
+        idxs.iter()
+            .map(|&i| &guard.edges[i])
+            .filter(|e| e.kind == EdgeKind::Contains)
             .map(|e| e.to.clone())
             .collect()
     }
@@ -292,10 +342,12 @@ impl Store {
     #[must_use]
     pub fn has_call_edge(&self, from: &EntityId, to: &EntityId) -> bool {
         let guard = self.inner.read().expect("rwlock not poisoned");
-        guard
-            .edges
-            .iter()
-            .any(|e| e.kind == EdgeKind::Calls && &e.from == from && &e.to == to)
+        let Some(idxs) = guard.forward_idx.get(from) else {
+            return false;
+        };
+        idxs.iter()
+            .map(|&i| &guard.edges[i])
+            .any(|e| e.kind == EdgeKind::Calls && &e.to == to)
     }
 
     /// Number of atoms stored (for tests / diagnostics).
@@ -484,5 +536,21 @@ mod tests {
         store.add_edge(edge("a", "b", EdgeKind::Calls));
         assert!(store.has_call_edge(&a, &b));
         assert!(!store.has_call_edge(&b, &a));
+    }
+
+    #[test]
+    fn rebuild_indices_recomputes_from_edges() {
+        let store = Store::new();
+        store.add_edge(edge("a", "b", EdgeKind::Calls));
+        store.add_edge(edge("a", "c", EdgeKind::Contains));
+        store.add_edge(edge("d", "b", EdgeKind::Calls));
+        // Forcing a rebuild must not change observable behaviour.
+        store.rebuild_indices();
+        let from_a = store.edges_from(&EntityId::new("a"));
+        assert_eq!(from_a.len(), 2);
+        let to_b = store.edges_to(&EntityId::new("b"));
+        assert_eq!(to_b.len(), 2);
+        assert!(store.has_call_edge(&EntityId::new("a"), &EntityId::new("b")));
+        assert!(!store.has_call_edge(&EntityId::new("a"), &EntityId::new("c")));
     }
 }
