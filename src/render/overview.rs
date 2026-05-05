@@ -2,19 +2,19 @@
 //! cross-module call edges.
 
 use crate::graph::Store;
-use crate::model::EdgeKind;
+use crate::model::EntityId;
 use crate::render::util::{escape_label, mermaid_id};
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write as _;
 
 #[derive(Default, Debug, Clone, PartialEq, Eq)]
-struct ModuleCounts {
+struct ModuleMeta {
     functions: usize,
     structs: usize,
     traits: usize,
 }
 
-impl ModuleCounts {
+impl ModuleMeta {
     fn bump(&mut self, kind: &str) {
         match kind {
             "function" => self.functions += 1,
@@ -45,33 +45,44 @@ pub fn render(store: &Store) -> String {
     let modules = store.atoms_by_kind("module");
 
     // Build a module-path → name + counts map.
-    let mut modules_map: BTreeMap<String, (String, ModuleCounts)> = BTreeMap::new();
-    // file_path → module entity ids (we need to look up children).
-    let mut path_to_module_ids: HashMap<String, Vec<crate::model::EntityId>> = HashMap::new();
-
+    let mut modules_map: BTreeMap<String, (String, ModuleMeta)> = BTreeMap::new();
     for m in &modules {
         if m.file_path.is_empty() {
             continue;
         }
         modules_map
             .entry(m.file_path.clone())
-            .or_insert_with(|| (m.name.clone(), ModuleCounts::default()));
-        path_to_module_ids
-            .entry(m.file_path.clone())
-            .or_default()
-            .push(m.id.clone());
+            .or_insert_with(|| (m.name.clone(), ModuleMeta::default()));
     }
 
-    // Bump item counts via Contains edges.
+    // Pre-bucket Contains edges by parent at function entry. Each parent's
+    // children list is read once via the forward adjacency index (O(degree))
+    // — even if the same module appears multiple times in the rendering
+    // frame, the lookup below stays a HashMap hit.
+    let mut contains_by_parent: HashMap<EntityId, Vec<EntityId>> =
+        HashMap::with_capacity(modules.len());
     for m in &modules {
         if m.file_path.is_empty() {
             continue;
         }
-        let children = store.children_of(&m.id);
+        contains_by_parent
+            .entry(m.id.clone())
+            .or_insert_with(|| store.children_of(&m.id));
+    }
+
+    // Bump item counts from the pre-computed Contains buckets.
+    for m in &modules {
+        if m.file_path.is_empty() {
+            continue;
+        }
+        let Some(children) = contains_by_parent.get(&m.id) else {
+            continue;
+        };
+        let Some((_, counts)) = modules_map.get_mut(&m.file_path) else {
+            continue;
+        };
         for child_id in children {
-            if let Some(child) = store.get_atom(&child_id)
-                && let Some((_, counts)) = modules_map.get_mut(&m.file_path)
-            {
+            if let Some(child) = store.get_atom(child_id) {
                 counts.bump(&child.kind);
             }
         }
@@ -79,27 +90,27 @@ pub fn render(store: &Store) -> String {
 
     // Build function file_path cache.
     let functions = store.atoms_by_kind("function");
-    let mut fn_to_path: HashMap<crate::model::EntityId, String> = HashMap::new();
+    let mut fn_to_path: HashMap<EntityId, &str> = HashMap::with_capacity(functions.len());
     for f in &functions {
-        fn_to_path.insert(f.id.clone(), f.file_path.clone());
+        fn_to_path.insert(f.id.clone(), f.file_path.as_str());
     }
 
-    // Cross-module call edges.
+    // Cross-module call edges via forward adjacency. `call_edges_from`
+    // returns only the callee ids of `Calls` edges, avoiding per-edge
+    // clones and the post-hoc kind filter.
     let mut edges: BTreeMap<(String, String), usize> = BTreeMap::new();
     for caller in &functions {
-        let Some(from_path) = fn_to_path.get(&caller.id).cloned() else {
+        let Some(&from_path) = fn_to_path.get(&caller.id) else {
             continue;
         };
-        let calls = store.edges_from(&caller.id);
-        for edge in calls {
-            if edge.kind != EdgeKind::Calls {
-                continue;
-            }
-            let Some(to_path) = fn_to_path.get(&edge.to).cloned() else {
+        for callee_id in store.call_edges_from(&caller.id) {
+            let Some(&to_path) = fn_to_path.get(&callee_id) else {
                 continue;
             };
             if to_path != from_path {
-                *edges.entry((from_path.clone(), to_path)).or_default() += 1;
+                *edges
+                    .entry((from_path.to_owned(), to_path.to_owned()))
+                    .or_default() += 1;
             }
         }
     }
@@ -323,8 +334,8 @@ mod tests {
     }
 
     #[test]
-    fn module_counts_default_and_bumps() {
-        let mut c = ModuleCounts::default();
+    fn module_meta_default_and_bumps() {
+        let mut c = ModuleMeta::default();
         c.bump("function");
         c.bump("function");
         c.bump("struct");
@@ -336,7 +347,7 @@ mod tests {
         assert_eq!(c.traits, 1);
         assert_eq!(c.label("m"), "m — 2 fn, 1 struct, 1 trait");
 
-        let bare = ModuleCounts::default();
+        let bare = ModuleMeta::default();
         assert_eq!(bare.label("m"), "m — 0 fn");
     }
 }
