@@ -49,9 +49,36 @@ fn run_walk_ref(start: &std::path::Path, git_ref: &str) -> ExitCode {
         let Some(lang) = language_for(std::path::Path::new(&entry.path)) else {
             continue;
         };
-        println!("{}\t{}", lang.name(), entry.path);
+        println!("{}\t{}", lang.name(), escape_control_chars(&entry.path));
     }
     ExitCode::Success
+}
+
+/// Escape control bytes (`<0x20`, plus DEL `0x7f`) and the `\` itself with
+/// Rust-style `\x..` escapes so the printed line is safe to feed through
+/// `awk -F'\t'` and friends.
+///
+/// Git's tree storage allows any byte except `/` and `\0` in path
+/// components, so a malicious commit can ship a filename containing
+/// embedded `\n`, `\r`, `\t`, or terminal escape sequences. Printing those
+/// raw breaks the line-oriented contract of `walk` (one entry per line,
+/// tab-separated) and could rewrite the user's terminal. Tabs we keep
+/// (the field separator); newlines, carriage returns, NULs, DEL and the
+/// rest of C0 we escape.
+fn escape_control_chars(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            c if c == '\t' => out.push(c),
+            c if (c as u32) < 0x20 || c == '\x7f' => {
+                use std::fmt::Write as _;
+                let _ = write!(out, "\\x{:02x}", c as u32);
+            }
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -121,6 +148,27 @@ mod tests {
             r#ref: Some("definitely-not-a-ref".into()),
         };
         assert_eq!(run_walk(&flags), ExitCode::Failure);
+    }
+
+    #[test]
+    fn escape_control_chars_passes_plain_paths_through() {
+        assert_eq!(escape_control_chars("src/lib.rs"), "src/lib.rs");
+        // Tab is preserved (the field separator on the printed line).
+        assert_eq!(escape_control_chars("a\tb"), "a\tb");
+        // Non-ASCII unicode is preserved verbatim.
+        assert_eq!(escape_control_chars("café/日本語.rs"), "café/日本語.rs");
+    }
+
+    #[test]
+    fn escape_control_chars_escapes_newline_cr_and_nul() {
+        // These are the bytes that would break `awk -F'\t'` consumers.
+        assert_eq!(escape_control_chars("a\nb"), "a\\x0ab");
+        assert_eq!(escape_control_chars("a\rb"), "a\\x0db");
+        assert_eq!(escape_control_chars("a\0b"), "a\\x00b");
+        // Backslash itself is escaped so `\x..` is unambiguous.
+        assert_eq!(escape_control_chars("a\\b"), "a\\\\b");
+        // DEL too — it can move the terminal cursor on some emulators.
+        assert_eq!(escape_control_chars("a\x7fb"), "a\\x7fb");
     }
 
     #[test]
