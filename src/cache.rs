@@ -271,6 +271,13 @@ impl Cache {
 /// root path. Shared with [`maybe_auto_gc`] so the auto path doesn't
 /// have to re-`Cache::open` (and re-walk the tree for the symlink
 /// audit) on every bundle write.
+///
+/// Per-path I/O failures during eviction (disk-full mid-`remove_file`,
+/// permission flip, file vanished concurrently) populate
+/// [`GcReport::errors`] instead of bubbling out as `Err`, so the caller
+/// can still observe what was freed before the failure. Symlink-refusal
+/// remains a hard error — a planted symlink is a security signal, not a
+/// transient condition the caller should paper over.
 fn gc_at(root: &Path, opts: &GcOptions) -> Result<GcReport> {
     let mut entries: Vec<GcEntry> = Vec::new();
     collect_gc_entries(&root.join("blobs"), GcKind::Blob, &mut entries)?;
@@ -309,22 +316,53 @@ fn gc_at(root: &Path, opts: &GcOptions) -> Result<GcReport> {
         }
     }
 
-    let removed_size: u64 = to_remove.iter().map(|e| e.size).sum();
-    let removed_count = to_remove.len();
+    // Belt-and-suspenders: even though the size pass already filters out
+    // age-flagged paths, an explicit dedup by path means the remove loop
+    // can never double-fire on a single path and have the second
+    // `fs::remove_file` surface its `NotFound` as an I/O error.
+    to_remove.sort_by(|a, b| a.path.cmp(&b.path));
+    to_remove.dedup_by(|a, b| a.path == b.path);
 
-    if !opts.dry_run {
+    let planned_size: u64 = to_remove.iter().map(|e| e.size).sum();
+    let planned_count = to_remove.len();
+
+    let mut removed_size: u64 = 0;
+    let mut removed_count: usize = 0;
+    let mut errors: Vec<(PathBuf, std::io::Error)> = Vec::new();
+
+    if opts.dry_run {
+        removed_size = planned_size;
+        removed_count = planned_count;
+    } else {
         for e in &to_remove {
-            let meta = fs::symlink_metadata(&e.path)?;
+            let meta = match fs::symlink_metadata(&e.path) {
+                Ok(m) => m,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(err) => {
+                    errors.push((e.path.clone(), err));
+                    continue;
+                }
+            };
             if meta.file_type().is_symlink() {
                 return Err(AstToMermaidError::InvalidInput(format!(
                     "refusing to remove symlink in cache: {}",
                     e.path.display()
                 )));
             }
-            if meta.is_dir() {
-                remove_dir_all_safe(&e.path)?;
+            let res = if meta.is_dir() {
+                remove_dir_all_safe(&e.path)
             } else {
-                fs::remove_file(&e.path)?;
+                fs::remove_file(&e.path).map_err(AstToMermaidError::from)
+            };
+            match res {
+                Ok(()) => {
+                    removed_size += e.size;
+                    removed_count += 1;
+                }
+                Err(AstToMermaidError::Io(io_err)) => {
+                    errors.push((e.path.clone(), io_err));
+                }
+                Err(other) => return Err(other),
             }
         }
     }
@@ -335,6 +373,7 @@ fn gc_at(root: &Path, opts: &GcOptions) -> Result<GcReport> {
         removed_size,
         count_before,
         dry_run: opts.dry_run,
+        errors,
     })
 }
 
@@ -417,18 +456,30 @@ impl From<&GcPolicy> for GcOptions {
 }
 
 /// Summary of a [`Cache::gc`] run.
-#[derive(Debug, Clone)]
+///
+/// Partial-success: a remove that fails mid-iteration with a transient
+/// I/O error (disk-full, permission flip, racing manual `rm`) is
+/// recorded in [`GcReport::errors`] and the loop continues. Callers
+/// that need strict semantics can check `errors.is_empty()`.
+///
+/// Not `Clone` because [`std::io::Error`] isn't.
+#[derive(Debug)]
 pub struct GcReport {
     /// Total bytes used by cache entries before eviction.
     pub total_before: u64,
     /// Number of entries removed (or that would be, with `dry_run`).
+    /// Excludes entries that hit a per-path I/O error in `errors`.
     pub removed_count: usize,
-    /// Bytes freed (or that would be, with `dry_run`).
+    /// Bytes freed (or that would be, with `dry_run`). Sums only the
+    /// sizes of entries that were actually unlinked.
     pub removed_size: u64,
     /// Entry count before eviction.
     pub count_before: usize,
     /// Whether this run was a dry run.
     pub dry_run: bool,
+    /// Per-path I/O errors encountered during eviction. Empty on a
+    /// fully successful run. `dry_run` runs never populate this.
+    pub errors: Vec<(PathBuf, std::io::Error)>,
 }
 
 #[derive(Debug)]
@@ -1028,5 +1079,99 @@ mod tests {
         let r = cache.gc(&GcOptions::default()).unwrap();
         assert_eq!(r.removed_count, 0);
         assert_eq!(r.total_before, 0);
+        assert!(r.errors.is_empty());
+    }
+
+    #[test]
+    fn gc_dedups_when_age_and_size_passes_overlap() {
+        // Same blob is "old" AND total > cap → both passes flag it.
+        // Pre-fix, the second `fs::remove_file` would surface NotFound
+        // and `gc` would `Err`. Post-fix, dedup_by-path collapses the
+        // two flags and the remove loop fires exactly once.
+        let tmp = tempdir().unwrap();
+        let cache = Cache::open(tmp.path().join("c")).unwrap();
+        for sha in &["a", "b", "c"] {
+            cache
+                .put_unit(sha, &dummy_unit(&format!("code:{sha}")))
+                .unwrap();
+        }
+        let report = cache
+            .gc(&GcOptions {
+                // Cap of zero forces every entry into the size pass...
+                max_size_bytes: Some(0),
+                // ...and a zero age cap forces every entry into the age pass.
+                older_than: Some(std::time::Duration::from_secs(0)),
+                dry_run: false,
+            })
+            .expect("dedup must keep gc Ok-not-Err");
+        assert_eq!(report.removed_count, 3, "expected 3 removed: {report:?}");
+        assert!(report.errors.is_empty(), "no errors expected: {report:?}");
+        let blobs = cache.root().join("blobs");
+        let leftover: Vec<_> = fs::read_dir(&blobs).unwrap().collect();
+        assert!(leftover.is_empty(), "blobs leftover: {leftover:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gc_partial_success_records_errors_instead_of_bubbling() {
+        // Plant a bundle, then chmod it read-only so the inner
+        // `fs::remove_file` fails with PermissionDenied (a stand-in for
+        // disk-full / EROFS / EBUSY). The pre-fix behaviour was `Err`
+        // mid-iteration with no record of what was removed; post-fix,
+        // the per-path failure lands in `report.errors`.
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempdir().unwrap();
+        let cache = Cache::open(tmp.path().join("c")).unwrap();
+
+        let bundle = cache.root().join("refs").join("locked");
+        fs::create_dir_all(&bundle).unwrap();
+        fs::write(bundle.join("index.json"), b"{}").unwrap();
+
+        // Read-exec-only on the bundle dir → can read children but can't
+        // unlink them. Restored at the end so tempdir can drop cleanly.
+        let mut perms = fs::metadata(&bundle).unwrap().permissions();
+        perms.set_mode(0o500);
+        fs::set_permissions(&bundle, perms).unwrap();
+
+        let report = cache
+            .gc(&GcOptions {
+                max_size_bytes: Some(0),
+                older_than: None,
+                dry_run: false,
+            })
+            .expect("partial-success path must keep gc Ok-not-Err");
+        assert!(
+            !report.errors.is_empty(),
+            "expected at least one per-path error: {report:?}"
+        );
+        assert!(
+            report.errors.iter().any(|(p, _)| p == &bundle),
+            "expected bundle path in errors: {report:?}"
+        );
+
+        // Restore so tempdir cleanup can succeed.
+        let mut perms = fs::metadata(&bundle).unwrap().permissions();
+        perms.set_mode(0o700);
+        fs::set_permissions(&bundle, perms).unwrap();
+    }
+
+    #[test]
+    fn open_sweeps_stale_tmp_blobs() {
+        // Crashed prior run left a `.foo.tmp.<pid>.<tid>.<n>` shaped
+        // file in blobs/. Cache::open must wipe it on startup so the
+        // blob dir can't accumulate garbage across crashes.
+        let tmp = tempdir().unwrap();
+        let root = tmp.path().join("c");
+        fs::create_dir_all(root.join("blobs")).unwrap();
+        let stale = root.join("blobs").join(".foo.tmp.123.456.0");
+        fs::write(&stale, b"crashed midwrite").unwrap();
+        assert!(stale.exists());
+        let _cache = Cache::open(&root).unwrap();
+        assert!(
+            !stale.exists(),
+            "Cache::open must sweep stale .tmp. blob: {}",
+            stale.display()
+        );
     }
 }

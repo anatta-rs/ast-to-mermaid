@@ -18,6 +18,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug fixes
 
+- *(cache)* Dedup `gc_at` to_remove + partial `GcReport` on disk-full + tmp sweep on `Cache::open` ([#131](https://github.com/anatta-rs/ast-to-mermaid/issues/131))
+
+  Three robustness gaps in the cache GC path: (1) an entry flagged by
+  both the age and size passes was double-removed, with the second
+  `fs::remove_file` surfacing `NotFound` as a hard I/O error — fixed
+  with an explicit `dedup_by` path before the remove loop and
+  `NotFound` treated as already-gone. (2) A transient I/O failure
+  mid-iteration (disk-full, permission flip) bubbled out as `Err` with
+  no record of what had already been freed — `GcReport` now carries
+  `errors: Vec<(PathBuf, std::io::Error)>` and the loop continues so
+  callers can see partial progress. (3) `Cache::open` now sweeps any
+  leftover `blobs/.*.tmp.*` files at startup so a crashed prior run
+  cannot accumulate atomic-write tmp garbage in the blob dir.
+  `GcReport` is no longer `Clone` (because `std::io::Error` isn't).
+
 - *(artifacts)* Filename collision-safe IDs on case-insensitive filesystems ([#82](https://github.com/anatta-rs/ast-to-mermaid/issues/82))
 
   Bundle filenames for entities and sequences whose ids contain ASCII
