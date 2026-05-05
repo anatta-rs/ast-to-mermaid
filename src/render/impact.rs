@@ -7,7 +7,7 @@
 use crate::error::Result;
 use crate::graph::Store;
 use crate::render::lookup::resolve_function;
-use crate::render::util::{escape_label, sanitize_id};
+use crate::render::util::{escape_label_flowchart, sanitize_id};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
@@ -56,7 +56,7 @@ pub fn render(store: &Store, target: &str, hops: u8) -> Result<String> {
 
     let mut mermaid = String::from("graph BT\n");
     let target_node_id = sanitize_id(target_id.as_str());
-    let target_label = escape_label(&format!("fn {} (impacted)", target_atom.name));
+    let target_label = escape_label_flowchart(&format!("fn {} (impacted)", target_atom.name));
     writeln!(mermaid, "    {target_node_id}((\"{target_label}\"))")
         .expect("string write is infallible");
     for (id, name) in &nodes {
@@ -64,7 +64,7 @@ pub fn render(store: &Store, target: &str, hops: u8) -> Result<String> {
             continue;
         }
         let nid = sanitize_id(id);
-        let label = escape_label(name);
+        let label = escape_label_flowchart(name);
         writeln!(mermaid, "    {nid}[\"{label}\"]").expect("string write is infallible");
     }
     for (from, to) in &edges {

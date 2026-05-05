@@ -2,6 +2,7 @@
 
 use super::visit::{DEPTH_LIMIT_LABEL, max_ast_depth};
 use super::{Participant, SELF_ID, SequenceDiagram, Step};
+use crate::render::util::escape_label_sequence;
 use std::fmt::Write;
 
 /// Render a [`SequenceDiagram`] as Mermaid `sequenceDiagram` source.
@@ -27,7 +28,7 @@ pub fn render(diagram: &SequenceDiagram) -> String {
 }
 
 fn write_participant(out: &mut String, p: &Participant) {
-    let label = escape_label(&p.label);
+    let label = escape_label_sequence(&p.label);
     let _ = writeln!(out, "    participant {} as {}", p.id, label);
 }
 
@@ -46,7 +47,7 @@ fn write_step(out: &mut String, step: &Step, depth: usize) {
         let _ = writeln!(
             out,
             "{indent}Note over {SELF_ID}: {}",
-            escape_label(DEPTH_LIMIT_LABEL),
+            escape_label_sequence(DEPTH_LIMIT_LABEL),
         );
         return;
     }
@@ -64,7 +65,7 @@ fn write_step(out: &mut String, step: &Step, depth: usize) {
                 "{indent}{from}{arrow}{to}: {label}{suffix}",
                 from = from,
                 to = to,
-                label = escape_label(label),
+                label = escape_label_sequence(label),
             );
             // Note: when `from == SELF_ID == to`, Mermaid renders a
             // self-arrow loop, which is the desired behaviour for
@@ -72,7 +73,11 @@ fn write_step(out: &mut String, step: &Step, depth: usize) {
             let _ = SELF_ID; // silence unused-import lint when feature gates change.
         }
         Step::Note { over, text } => {
-            let _ = writeln!(out, "{indent}Note over {over}: {}", escape_label(text));
+            let _ = writeln!(
+                out,
+                "{indent}Note over {over}: {}",
+                escape_label_sequence(text)
+            );
         }
         Step::Loop { label, body } => {
             // Mermaid renders `loop X\nend` (empty body) as a tiny stub
@@ -81,7 +86,7 @@ fn write_step(out: &mut String, step: &Step, depth: usize) {
             if !has_visible_steps(body) {
                 return;
             }
-            let _ = writeln!(out, "{indent}loop {}", escape_label(label));
+            let _ = writeln!(out, "{indent}loop {}", escape_label_sequence(label));
             for s in body {
                 write_step(out, s, depth + 1);
             }
@@ -93,7 +98,7 @@ fn write_step(out: &mut String, step: &Step, depth: usize) {
             if !then_visible && !else_visible {
                 return;
             }
-            let _ = writeln!(out, "{indent}alt {}", escape_label(cond));
+            let _ = writeln!(out, "{indent}alt {}", escape_label_sequence(cond));
             for s in then {
                 write_step(out, s, depth + 1);
             }
@@ -122,19 +127,6 @@ fn has_visible_steps(steps: &[Step]) -> bool {
             has_visible_steps(then) || else_.as_deref().is_some_and(has_visible_steps)
         }
     })
-}
-
-/// Mermaid sequenceDiagram message labels split on the *first* `:` after
-/// the arrow — subsequent colons render fine. The renderer also treats
-/// `<…>` as inline HTML, so an `alt` cond like `if x <= 0` gets parsed
-/// as a malformed tag and lays out vertically. Escape these aggressively.
-/// `#` is reserved for Mermaid HTML entities. Newlines would split the
-/// label across lines and break the doc.
-fn escape_label(s: &str) -> String {
-    s.replace(['\n', '\r'], " ")
-        .replace('#', "_")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
 }
 
 fn strip_newlines(s: &str) -> String {
