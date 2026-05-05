@@ -350,6 +350,25 @@ impl Store {
             .any(|e| e.kind == EdgeKind::Calls && &e.to == to)
     }
 
+    /// Snapshot of all edges in insertion order.
+    ///
+    /// Yields every `Edge` exactly once — the natural counterpart to
+    /// [`Store::all_atoms`]. Use this when a consumer needs to bucket the
+    /// full edge list in a single sweep (e.g. building several adjacency
+    /// maps at once) rather than paying O(E) per atom.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal `RwLock` is poisoned.
+    #[must_use]
+    pub fn all_edges(&self) -> Vec<Edge> {
+        self.inner
+            .read()
+            .expect("rwlock not poisoned")
+            .edges
+            .clone()
+    }
+
     /// Number of atoms stored (for tests / diagnostics).
     ///
     /// # Panics
