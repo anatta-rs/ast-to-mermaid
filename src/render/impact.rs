@@ -29,34 +29,29 @@ pub fn render(store: &Store, target: &str, hops: u8) -> Result<String> {
         .get_atom(&target_id)
         .expect("resolve_function vouched the id exists");
 
-    let paths = store.reverse_call_paths(&target_id, hops);
+    let (predecessors, reachable) = store.reverse_call_paths(&target_id, hops);
 
-    // Collect distinct predecessor ids + edges.
+    // Drain the predecessor map directly — every entry is one
+    // caller→callee edge in the BFS-reachable region. No path cloning,
+    // no per-path reconstruction.
     let mut edges: BTreeSet<(String, String)> = BTreeSet::new();
-    let mut predecessor_ids: Vec<crate::model::EntityId> = Vec::new();
-    let mut seen_predecessor: BTreeSet<String> = BTreeSet::new();
-    for path in &paths {
-        for window in path.windows(2) {
-            let downstream = &window[0];
-            let predecessor = &window[1];
-            if seen_predecessor.insert(predecessor.as_str().to_owned()) {
-                predecessor_ids.push(predecessor.clone());
-            }
-            edges.insert((
-                predecessor.as_str().to_owned(),
-                downstream.as_str().to_owned(),
-            ));
+    for (caller, callees) in &predecessors {
+        for callee in callees {
+            edges.insert((caller.as_str().to_owned(), callee.as_str().to_owned()));
         }
     }
 
     // Build node name map.
     let mut nodes: BTreeMap<String, String> = BTreeMap::new();
     nodes.insert(target_id.as_str().to_owned(), target_atom.name.clone());
-    for pred_id in &predecessor_ids {
+    for node_id in &reachable {
+        if node_id == &target_id {
+            continue;
+        }
         let name = store
-            .get_atom(pred_id)
+            .get_atom(node_id)
             .map_or_else(|| "?".to_owned(), |a| a.name.clone());
-        nodes.insert(pred_id.as_str().to_owned(), name);
+        nodes.insert(node_id.as_str().to_owned(), name);
     }
 
     let mut mermaid = String::from("graph BT\n");

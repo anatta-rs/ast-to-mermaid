@@ -286,52 +286,95 @@ impl Store {
             .collect()
     }
 
-    /// Reverse-path BFS from `from` walking `Calls` edges backwards, up to
+    /// Reverse-path BFS from `target` walking `Calls` edges backwards, up to
     /// `hops` steps.
     ///
-    /// Returns all paths found (each path = `[from, predecessor, …]`).
+    /// Returns `(predecessors, reachable)`:
+    ///
+    /// - `predecessors[caller]` is the list of nodes (closer to `target`)
+    ///   that `caller` calls within the BFS-reachable region. Walking these
+    ///   in any order from a node leads back to `target`.
+    /// - `reachable` is the set of nodes within `hops` reverse-call-distance
+    ///   of `target`, in BFS order with `target` first.
+    ///
+    /// The map only ever stores at most `O(E_reachable)` entries — there is
+    /// no path cloning, so a high fan-in target with `hops = 3` no longer
+    /// blows up to `F^3` cloned `Vec<EntityId>` paths. Callers that need
+    /// individual paths can use [`reconstruct_path`] to walk the map.
     ///
     /// # Panics
     ///
     /// Panics if the internal `RwLock` is poisoned.
     #[must_use]
-    pub fn reverse_call_paths(&self, from: &EntityId, hops: u8) -> Vec<Vec<EntityId>> {
-        use std::collections::{HashSet, VecDeque};
+    pub fn reverse_call_paths(
+        &self,
+        target: &EntityId,
+        hops: u8,
+    ) -> (HashMap<EntityId, Vec<EntityId>>, Vec<EntityId>) {
+        use std::collections::HashSet;
+
+        let mut predecessors: HashMap<EntityId, Vec<EntityId>> = HashMap::new();
+        let mut reachable: Vec<EntityId> = vec![target.clone()];
 
         if hops == 0 {
-            return vec![vec![from.clone()]];
+            return (predecessors, reachable);
         }
 
         let guard = self.inner.read().expect("rwlock not poisoned");
-        let mut out = Vec::new();
-        let mut queue: VecDeque<Vec<EntityId>> = VecDeque::new();
-        queue.push_back(vec![from.clone()]);
+        let mut visited: HashSet<EntityId> = HashSet::new();
+        visited.insert(target.clone());
+        // BFS spanning tree: each visited node remembers the first node
+        // that discovered it. Used to test simple-path reachability so
+        // that back-edges into the current path are skipped, matching
+        // the legacy per-path visited semantics.
+        let mut bfs_pred: HashMap<EntityId, EntityId> = HashMap::new();
+        let mut frontier: Vec<EntityId> = vec![target.clone()];
 
-        while let Some(path) = queue.pop_front() {
-            let depth = path.len() - 1;
-            if depth >= usize::from(hops) {
-                out.push(path);
-                continue;
-            }
-
-            let tip = path.last().expect("path non-empty");
-            let mut visited: HashSet<EntityId> = path.iter().cloned().collect();
-            let mut extended = false;
-            for e in &guard.edges {
-                if e.kind == EdgeKind::Calls && &e.to == tip && !visited.contains(&e.from) {
-                    let mut new_path = path.clone();
-                    new_path.push(e.from.clone());
-                    queue.push_back(new_path);
-                    visited.insert(e.from.clone());
-                    extended = true;
+        for _ in 0..usize::from(hops) {
+            let mut next_frontier: Vec<EntityId> = Vec::new();
+            for node in &frontier {
+                let Some(idxs) = guard.reverse_idx.get(node) else {
+                    continue;
+                };
+                for &idx in idxs {
+                    let edge = &guard.edges[idx];
+                    if edge.kind != EdgeKind::Calls {
+                        continue;
+                    }
+                    let caller = &edge.from;
+                    // `target` itself never appears as a caller in the
+                    // impact view: edges flow caller → target, never the
+                    // other way. Skipping here also guards cycles where
+                    // some node calls back into the target.
+                    if caller == target {
+                        continue;
+                    }
+                    // Skip if the caller is already on the BFS-tree path
+                    // from `node` back to `target` — adding edge
+                    // (caller, node) would mean the caller appears twice
+                    // along the same impact path, which the legacy code
+                    // disallowed via its per-path visited check.
+                    if path_contains(&bfs_pred, node, caller) {
+                        continue;
+                    }
+                    predecessors
+                        .entry(caller.clone())
+                        .or_default()
+                        .push(node.clone());
+                    if visited.insert(caller.clone()) {
+                        bfs_pred.insert(caller.clone(), node.clone());
+                        reachable.push(caller.clone());
+                        next_frontier.push(caller.clone());
+                    }
                 }
             }
-            if !extended {
-                out.push(path);
+            if next_frontier.is_empty() {
+                break;
             }
+            frontier = next_frontier;
         }
 
-        out
+        (predecessors, reachable)
     }
 
     /// Whether a `Calls` edge already exists from `from` to `to`.
@@ -388,6 +431,54 @@ impl Store {
     pub fn edge_count(&self) -> usize {
         self.inner.read().expect("rwlock not poisoned").edges.len()
     }
+}
+
+/// Whether `needle` appears on the BFS spanning-tree path from `start`
+/// back to the BFS root.
+fn path_contains(
+    bfs_pred: &HashMap<EntityId, EntityId>,
+    start: &EntityId,
+    needle: &EntityId,
+) -> bool {
+    let mut cur = start;
+    loop {
+        if cur == needle {
+            return true;
+        }
+        match bfs_pred.get(cur) {
+            Some(next) => cur = next,
+            None => return false,
+        }
+    }
+}
+
+/// Walk the predecessor map produced by [`Store::reverse_call_paths`] from
+/// `from` back to the BFS root (`target`).
+///
+/// The returned path is `[from, …, target]`. When `from == target`, the
+/// path is just `[target]`. Picks the first successor at each branch, so
+/// the path is one canonical witness — the full edge set lives in the
+/// predecessor map itself.
+#[must_use]
+pub fn reconstruct_path<S: std::hash::BuildHasher>(
+    predecessors: &HashMap<EntityId, Vec<EntityId>, S>,
+    from: &EntityId,
+) -> Vec<EntityId> {
+    use std::collections::HashSet;
+
+    let mut path = vec![from.clone()];
+    let mut seen: HashSet<EntityId> = HashSet::new();
+    seen.insert(from.clone());
+    let mut current = from.clone();
+    while let Some(succs) = predecessors.get(&current) {
+        let Some(next) = succs.first() else { break };
+        if !seen.insert(next.clone()) {
+            break;
+        }
+        path.push(next.clone());
+        current = next.clone();
+    }
+    path
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -516,8 +607,9 @@ mod tests {
     #[test]
     fn reverse_call_paths_zero_hops_returns_self() {
         let store = Store::new();
-        let paths = store.reverse_call_paths(&EntityId::new("c"), 0);
-        assert_eq!(paths, vec![vec![EntityId::new("c")]]);
+        let (predecessors, reachable) = store.reverse_call_paths(&EntityId::new("c"), 0);
+        assert!(predecessors.is_empty());
+        assert_eq!(reachable, vec![EntityId::new("c")]);
     }
 
     #[test]
@@ -526,11 +618,21 @@ mod tests {
         // a → b → c
         store.add_edge(edge("a", "b", EdgeKind::Calls));
         store.add_edge(edge("b", "c", EdgeKind::Calls));
-        let paths = store.reverse_call_paths(&EntityId::new("c"), 2);
-        let has_full = paths.iter().any(|p| {
-            p.len() == 3 && p[0].as_str() == "c" && p[1].as_str() == "b" && p[2].as_str() == "a"
-        });
-        assert!(has_full, "expected c→b→a path, got {paths:?}");
+        let target = EntityId::new("c");
+        let (predecessors, reachable) = store.reverse_call_paths(&target, 2);
+
+        // Reachable contains target plus both transitive callers.
+        let set: std::collections::HashSet<_> = reachable.iter().collect();
+        assert!(set.contains(&EntityId::new("a")));
+        assert!(set.contains(&EntityId::new("b")));
+        assert!(set.contains(&target));
+
+        // Reconstructed path `a → … → c` reads `[a, b, c]`.
+        let path = super::reconstruct_path(&predecessors, &EntityId::new("a"));
+        assert_eq!(
+            path,
+            vec![EntityId::new("a"), EntityId::new("b"), EntityId::new("c")]
+        );
     }
 
     #[test]
@@ -539,11 +641,52 @@ mod tests {
         store.add_edge(edge("a", "b", EdgeKind::Calls));
         store.add_edge(edge("b", "a", EdgeKind::Calls));
         // Must terminate, not loop forever.
-        let paths = store.reverse_call_paths(&EntityId::new("a"), 3);
-        for p in &paths {
-            let ids: std::collections::HashSet<&EntityId> = p.iter().collect();
-            assert_eq!(ids.len(), p.len(), "cycle in path: {p:?}");
+        let (predecessors, reachable) = store.reverse_call_paths(&EntityId::new("a"), 3);
+        // Each node visited at most once.
+        let unique: std::collections::HashSet<_> = reachable.iter().collect();
+        assert_eq!(unique.len(), reachable.len());
+        // Predecessor map never contains a self-loop entry.
+        for (k, vs) in &predecessors {
+            assert!(!vs.contains(k), "self-loop in predecessors[{k:?}]");
         }
+    }
+
+    #[test]
+    fn reverse_call_paths_diamond_records_all_call_edges() {
+        // a → b, a → c, b → d, c → d. With target = d, hops = 2 the
+        // predecessor map must capture all four caller→callee edges so
+        // that the impact view does not lose the parallel branch.
+        let store = Store::new();
+        for (f, t) in [("a", "b"), ("a", "c"), ("b", "d"), ("c", "d")] {
+            store.add_edge(edge(f, t, EdgeKind::Calls));
+        }
+        let (predecessors, _reachable) = store.reverse_call_paths(&EntityId::new("d"), 2);
+
+        let mut edges: Vec<(String, String)> = predecessors
+            .iter()
+            .flat_map(|(k, vs)| {
+                vs.iter()
+                    .map(|v| (k.as_str().to_owned(), v.as_str().to_owned()))
+            })
+            .collect();
+        edges.sort();
+        assert_eq!(
+            edges,
+            vec![
+                ("a".to_owned(), "b".to_owned()),
+                ("a".to_owned(), "c".to_owned()),
+                ("b".to_owned(), "d".to_owned()),
+                ("c".to_owned(), "d".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn reconstruct_path_returns_singleton_for_target() {
+        let store = Store::new();
+        let target = EntityId::new("only");
+        let (preds, _reachable) = store.reverse_call_paths(&target, 3);
+        assert_eq!(super::reconstruct_path(&preds, &target), vec![target]);
     }
 
     #[test]
