@@ -760,7 +760,11 @@ pub fn write_bundle_atomic(
             fs::remove_file(&tmp_dir)?;
         }
     }
-    crate::artifacts::write_artifacts(artifacts, &tmp_dir)?;
+    // Atomic-rename target is a freshly-created tmp dir, never an
+    // existing populated bundle, so the empty-input safety in
+    // `write_artifacts` is a no-op here — pass `allow_empty=true` to
+    // make that explicit.
+    crate::artifacts::write_artifacts(artifacts, &tmp_dir, true)?;
     if let Ok(meta) = fs::symlink_metadata(final_dir) {
         if meta.file_type().is_symlink() {
             return Err(AstToMermaidError::InvalidInput(format!(

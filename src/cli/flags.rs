@@ -239,6 +239,15 @@ pub struct BundleFlags {
     /// has at least one step. Off by default; roughly doubles wall-time.
     #[arg(long)]
     pub with_sequences: bool,
+
+    /// Allow bundling to overwrite a populated `--out` dir even when the
+    /// new run produced zero entities. Default refuses, because the
+    /// orphan-prune step would otherwise wipe every `.mmd` and
+    /// `.meta.json` under `entities/` (and `sequences/`) — pointing
+    /// `--out` at an existing bundle dir while passing an empty/wrong
+    /// source path would silently destroy the previous run.
+    #[arg(long)]
+    pub allow_empty: bool,
 }
 
 /// CLI args for the `sequence` subcommand.
