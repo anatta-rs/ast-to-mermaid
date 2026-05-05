@@ -44,6 +44,7 @@
 //! suffix shape) on startup so a crashed prior run can't accumulate
 //! garbage in the blob dir.
 
+use std::borrow::Cow;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -63,11 +64,15 @@ const BLOB_ENVELOPE_VERSION: u32 = 2;
 
 /// On-disk envelope wrapping a cached parse unit. Mismatched magic or
 /// version on read returns `None` from `get_unit` (treated as cache miss).
+///
+/// `unit` is `Cow<'a, ParseUnit>` so `put_unit` can serialize from a
+/// borrow (`Cow::Borrowed`) without cloning the full unit, while
+/// `get_unit` still deserializes into an owned `ParseUnit`.
 #[derive(Serialize, Deserialize)]
-struct BlobEnvelope {
+struct BlobEnvelope<'a> {
     magic: u32,
     version: u32,
-    unit: ParseUnit,
+    unit: Cow<'a, ParseUnit>,
 }
 
 /// Cache schema version. Bump when the on-disk layout changes incompatibly.
@@ -206,11 +211,11 @@ impl Cache {
     pub fn get_unit(&self, blob_sha: &str) -> Option<ParseUnit> {
         let path = self.blob_path(blob_sha);
         let bytes = fs::read(&path).ok()?;
-        let env: BlobEnvelope = ciborium::de::from_reader(&bytes[..]).ok()?;
+        let env: BlobEnvelope<'_> = ciborium::de::from_reader(&bytes[..]).ok()?;
         if env.magic != BLOB_MAGIC || env.version != BLOB_ENVELOPE_VERSION {
             return None;
         }
-        Some(env.unit)
+        Some(env.unit.into_owned())
     }
 
     /// Write a `ParseUnit` for a blob to the cache. Uses write-tmp + atomic
@@ -222,7 +227,7 @@ impl Cache {
         let env = BlobEnvelope {
             magic: BLOB_MAGIC,
             version: BLOB_ENVELOPE_VERSION,
-            unit: unit.clone(),
+            unit: Cow::Borrowed(unit),
         };
         let mut buf = Vec::new();
         ciborium::ser::into_writer(&env, &mut buf)
@@ -999,10 +1004,11 @@ mod tests {
         let tmp = tempdir().unwrap();
         let cache = Cache::open(tmp.path().join("c")).unwrap();
         // Hand-write a CBOR envelope with bogus version.
+        let unit = dummy_unit("code:y");
         let env = BlobEnvelope {
             magic: BLOB_MAGIC,
             version: 9999,
-            unit: dummy_unit("code:y"),
+            unit: Cow::Borrowed(&unit),
         };
         let mut buf = Vec::new();
         ciborium::ser::into_writer(&env, &mut buf).unwrap();

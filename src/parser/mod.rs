@@ -68,12 +68,12 @@ pub struct ParseUnit {
 
 impl ParseUnit {
     /// Apply this unit's atoms and edges to `store`, in their recorded order.
-    pub fn apply_to(&self, store: &Store) {
-        for a in &self.atoms {
-            store.add_atom(a.clone());
+    pub fn apply_to(self, store: &Store) {
+        for a in self.atoms {
+            store.add_atom(a);
         }
-        for e in &self.edges {
-            store.add_edge(e.clone());
+        for e in self.edges {
+            store.add_edge(e);
         }
     }
 
