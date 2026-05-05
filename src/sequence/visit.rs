@@ -3,6 +3,7 @@
 //! depth-first, left-to-right.
 
 use super::{Participant, SELF_ID, Step};
+use crate::render::util::sanitize_id;
 use std::collections::HashSet;
 use tree_sitter::Node;
 
@@ -547,49 +548,9 @@ fn is_skipped_constructor(name: &str) -> bool {
     matches!(name, "Some" | "None" | "Ok" | "Err")
 }
 
-/// Render an arbitrary string as a Mermaid-safe participant id.
-/// Replaces non-alphanumeric chars with `_`, prefixes a digit-leading
-/// id with `p_`.
-pub(super) fn sanitize_id(s: &str) -> String {
-    if s.is_empty() {
-        return "p".to_owned();
-    }
-    let mut out = String::with_capacity(s.len());
-    for ch in s.chars() {
-        if ch.is_ascii_alphanumeric() || ch == '_' {
-            out.push(ch);
-        } else {
-            out.push('_');
-        }
-    }
-    if out.chars().next().is_some_and(|c| c.is_ascii_digit()) {
-        let mut prefixed = String::with_capacity(out.len() + 2);
-        prefixed.push_str("p_");
-        prefixed.push_str(&out);
-        return prefixed;
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn sanitize_id_replaces_special_chars() {
-        assert_eq!(sanitize_id("a-b.c"), "a_b_c");
-        assert_eq!(sanitize_id("ok"), "ok");
-    }
-
-    #[test]
-    fn sanitize_id_prefixes_digit_leading() {
-        assert_eq!(sanitize_id("3things"), "p_3things");
-    }
-
-    #[test]
-    fn sanitize_id_empty_falls_back() {
-        assert_eq!(sanitize_id(""), "p");
-    }
 
     #[test]
     fn resolve_max_ast_depth_respects_env_override() {

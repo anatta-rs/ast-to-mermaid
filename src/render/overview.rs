@@ -3,7 +3,7 @@
 
 use crate::graph::Store;
 use crate::model::EntityId;
-use crate::render::util::{escape_label, mermaid_id};
+use crate::render::util::{escape_label, sanitize_id};
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write as _;
 
@@ -118,13 +118,13 @@ pub fn render(store: &Store) -> String {
     // Render Mermaid.
     let mut mermaid = String::from("graph TD\n");
     for (path, (name, counts)) in &modules_map {
-        let id = mermaid_id(path);
+        let id = sanitize_id(path);
         let label = escape_label(&counts.label(name));
         writeln!(mermaid, "    {id}[\"{label}\"]").expect("writing to String");
     }
     for ((from, to), n) in &edges {
-        let from_id = mermaid_id(from);
-        let to_id = mermaid_id(to);
+        let from_id = sanitize_id(from);
+        let to_id = sanitize_id(to);
         if from_id != to_id {
             writeln!(mermaid, "    {from_id} -->|\"{n}\"| {to_id}").expect("writing to String");
         }
@@ -242,8 +242,8 @@ mod tests {
         store.add_edge(Edge::new(cid, hid, EdgeKind::Calls));
 
         let out = render(&store);
-        let from_id = mermaid_id("src/mod_a.rs");
-        let to_id = mermaid_id("src/mod_b.rs");
+        let from_id = sanitize_id("src/mod_a.rs");
+        let to_id = sanitize_id("src/mod_b.rs");
         assert!(
             out.contains(&format!("{from_id} -->|\"1\"| {to_id}")),
             "expected edge in {out}"
@@ -285,8 +285,8 @@ mod tests {
         }
 
         let out = render(&store);
-        let from_id = mermaid_id("src/mod_a.rs");
-        let to_id = mermaid_id("src/mod_b.rs");
+        let from_id = sanitize_id("src/mod_a.rs");
+        let to_id = sanitize_id("src/mod_b.rs");
         assert!(out.contains(&format!("{from_id} -->|\"2\"| {to_id}")));
     }
 
@@ -307,8 +307,8 @@ mod tests {
         );
 
         let out = render(&store);
-        assert!(out.contains(&mermaid_id("crates/foo/src/queries.rs")));
-        assert!(out.contains(&mermaid_id("crates/bar/src/queries.rs")));
+        assert!(out.contains(&sanitize_id("crates/foo/src/queries.rs")));
+        assert!(out.contains(&sanitize_id("crates/bar/src/queries.rs")));
     }
 
     #[test]

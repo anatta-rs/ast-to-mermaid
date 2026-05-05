@@ -108,7 +108,7 @@ jobs:
       - name: Generate every CLI output and pipe through mmdc
         # If mmdc exits non-zero on any input, the job fails. The renderer is
         # the spec; mmdc is the validator. Fix bugs in the renderer (or
-        # `mermaid_id`'s reserved-word list), not in the diagrams.
+        # `sanitize_id`'s reserved-word list), not in the diagrams.
         run: |
           set -euo pipefail
           mkdir -p /tmp/mmd

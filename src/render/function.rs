@@ -7,7 +7,7 @@ use crate::error::Result;
 use crate::graph::Store;
 use crate::model::EdgeKind;
 use crate::render::lookup::resolve_function;
-use crate::render::util::{escape_label, mermaid_id};
+use crate::render::util::{escape_label, sanitize_id};
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
@@ -43,20 +43,20 @@ pub fn render(store: &Store, target: &str) -> Result<String> {
         }
     }
 
-    let target_node_id = mermaid_id(center_id.as_str());
+    let target_node_id = sanitize_id(center_id.as_str());
     let target_label = escape_label(&format!("fn {} (target)", center_atom.name));
 
     let mut mermaid = String::from("graph TD\n");
     writeln!(mermaid, "    {target_node_id}((\"{target_label}\"))").expect("writing");
 
     for (caller_id, caller_name) in &who_calls {
-        let id = mermaid_id(caller_id);
+        let id = sanitize_id(caller_id);
         let label = escape_label(caller_name);
         writeln!(mermaid, "    {id}[\"{label}\"]").expect("writing");
         writeln!(mermaid, "    {id} --> {target_node_id}").expect("writing");
     }
     for (callee_id, callee_name) in &whom_called {
-        let id = mermaid_id(callee_id);
+        let id = sanitize_id(callee_id);
         let label = escape_label(callee_name);
         writeln!(mermaid, "    {id}[\"{label}\"]").expect("writing");
         writeln!(mermaid, "    {target_node_id} --> {id}").expect("writing");

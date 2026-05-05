@@ -6,7 +6,7 @@
 
 use crate::graph::Store;
 use crate::model::EntityId;
-use crate::render::util::{crate_name, escape_label, mermaid_id};
+use crate::render::util::{crate_name, escape_label, sanitize_id};
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write as _;
 
@@ -81,13 +81,13 @@ pub fn render(store: &Store) -> String {
     // Render Mermaid.
     let mut mermaid = String::from("graph TD\n");
     for (name, c) in &counts {
-        let id = mermaid_id(name);
+        let id = sanitize_id(name);
         let label = escape_label(&c.label(name));
         writeln!(mermaid, "    {id}[\"{label}\"]").expect("writing to String");
     }
     for ((from, to), n) in &edges {
-        let from_id = mermaid_id(from);
-        let to_id = mermaid_id(to);
+        let from_id = sanitize_id(from);
+        let to_id = sanitize_id(to);
         if from_id != to_id {
             writeln!(mermaid, "    {from_id} -->|\"{n} calls\"| {to_id}")
                 .expect("writing to String");
