@@ -156,8 +156,12 @@ impl Language {
     }
 
     /// Return the tree-sitter grammar for this language.
+    ///
+    /// `pub(crate)` so the sequence subsystem can configure its own
+    /// [`tree_sitter::Parser`] with the same grammar as the main parser —
+    /// keeping a single source of truth for the language → grammar mapping.
     #[must_use]
-    fn ts_language(self) -> tree_sitter::Language {
+    pub(crate) fn ts_language(self) -> tree_sitter::Language {
         match self {
             Self::Rust => tree_sitter_rust::LANGUAGE.into(),
             Self::Python => tree_sitter_python::LANGUAGE.into(),

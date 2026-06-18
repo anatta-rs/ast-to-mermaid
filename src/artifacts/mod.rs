@@ -197,9 +197,18 @@ fn build_sequences(
         .filter_map(|(file_path, targets)| {
             let content = by_path[*file_path];
             let text = std::str::from_utf8(content).ok()?;
-            let tree = sequence::parse_source_once(content, file_path).ok()?;
+            // Detect the grammar per file from its extension. The bundle
+            // pipeline currently only feeds Rust files here (it filters
+            // before calling), but resolving the language from the path
+            // keeps this forward-compatible and avoids a hardcoded grammar.
+            let lang = crate::pipeline::language_for(std::path::Path::new(file_path))
+                .unwrap_or(crate::parser::Language::Rust);
+            let tree = sequence::parse_source_once(content, file_path, lang).ok()?;
             let target_refs: Vec<&str> = targets.iter().map(String::as_str).collect();
-            Some((*file_path, sequence::extract_all(&tree, text, &target_refs)))
+            Some((
+                *file_path,
+                sequence::extract_all(&tree, text, &target_refs, lang),
+            ))
         })
         .collect();
 

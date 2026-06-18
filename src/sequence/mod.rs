@@ -11,20 +11,26 @@
 //!    walks its body in source order, producing a [`SequenceDiagram`] IR.
 //! 2. [`render`] turns that IR into a Mermaid string.
 //!
-//! # Scope (v1)
+//! # Scope
 //!
-//! - Rust only.
-//! - Calls are classified by syntactic receiver: bare ident, type path,
-//!   or `obj.method()` field-expression root.
+//! - Rust and Python (the same two languages the main parser supports).
+//! - Calls are classified by syntactic receiver: bare ident, type path
+//!   (Rust `Type::method`), or `obj.method()` receiver root (Rust
+//!   `field_expression`, Python `attribute`).
 //! - Control flow lifted: `if` → `alt`, `match` → `alt`, `for`/`while`/
-//!   `loop` → `loop`. Nested closures are walked but their results are
-//!   inlined (no spawn-style "par" blocks yet).
-//! - `.await` is annotated on the arrow label (not a separate lifeline).
+//!   `loop` → `loop`. Nested closures (Rust) and comprehensions (Python)
+//!   are walked but their results are inlined (no spawn-style "par" blocks
+//!   yet).
+//! - Await: Rust postfix `.await` and Python prefix `await` both annotate
+//!   the arrow label (not a separate lifeline).
 
 use crate::error::{AstToMermaidError, Result};
+use crate::parser::Language;
+use lang::SeqLang;
 use std::collections::HashMap;
 use tree_sitter::{Node, Parser as TsParser, Tree};
 
+mod lang;
 mod render;
 mod visit;
 
@@ -126,13 +132,14 @@ impl Step {
 /// Synthetic participant id for the function-under-analysis itself.
 pub const SELF_ID: &str = "self";
 
-/// Parse `content` for `file_path` exactly once and return the
-/// tree-sitter [`Tree`]. Callers typically pass the result to
+/// Parse `content` for `file_path` exactly once with `lang`'s grammar and
+/// return the tree-sitter [`Tree`]. Callers typically pass the result to
 /// [`extract_all`] (or, via the legacy single-target [`extract`] wrapper,
 /// to `extract` indirectly).
 ///
-/// Sequence extraction is Rust-only — the parser is configured for the
-/// `tree-sitter-rust` grammar.
+/// The grammar comes from [`Language::ts_language`], the same table the
+/// main parser uses — so a `.rs` file is parsed with `tree-sitter-rust`
+/// and a `.py` file with `tree-sitter-python`.
 ///
 /// # Errors
 ///
@@ -140,13 +147,11 @@ pub const SELF_ID: &str = "self";
 ///   grammar (only on tree-sitter ABI mismatch).
 /// - [`AstToMermaidError::InvalidInput`] when tree-sitter cannot parse the
 ///   content (e.g. partial input + a hard timeout).
-pub fn parse_source_once(content: &[u8], file_path: &str) -> Result<Tree> {
+pub fn parse_source_once(content: &[u8], file_path: &str, lang: Language) -> Result<Tree> {
     let mut parser = TsParser::new();
-    parser
-        .set_language(&tree_sitter_rust::LANGUAGE.into())
-        .map_err(|e| {
-            AstToMermaidError::InvalidInput(format!("set_language for {file_path}: {e}"))
-        })?;
+    parser.set_language(&lang.ts_language()).map_err(|e| {
+        AstToMermaidError::InvalidInput(format!("set_language for {file_path}: {e}"))
+    })?;
     parser.parse(content, None).ok_or_else(|| {
         AstToMermaidError::InvalidInput(format!("tree-sitter parse failed for {file_path}"))
     })
@@ -165,16 +170,16 @@ pub fn parse_source_once(content: &[u8], file_path: &str) -> Result<Tree> {
 /// node` map, then resolves each target via O(1) lookup — replacing the
 /// prior O(M·N) per-target tree re-walk.
 #[must_use]
-pub fn extract_all(tree: &Tree, source: &str, targets: &[&str]) -> SequenceMap {
+pub fn extract_all(tree: &Tree, source: &str, targets: &[&str], lang: Language) -> SequenceMap {
     let root = tree.root_node();
-    let fn_index = build_fn_index(root, source);
+    let fn_index = build_fn_index(root, source, lang);
     let mut out = SequenceMap::with_capacity(targets.len());
     for &target in targets {
         let Some((fn_node, container)) = fn_index.get(target).cloned() else {
             continue;
         };
         let title = signature(&fn_node, source).map_or_else(|| target.to_owned(), str::to_owned);
-        let mut state = visit::State::new(container.as_deref());
+        let mut state = visit::State::new(container.as_deref(), lang);
         if let Some(block) = fn_node.child_by_field_name("body") {
             state.walk_block(&block, source);
         }
@@ -191,26 +196,29 @@ pub fn extract_all(tree: &Tree, source: &str, targets: &[&str]) -> SequenceMap {
     out
 }
 
-/// Build a `qualified-name → (function_item node, container)` index for
-/// every `function_item` reachable from `root`, in a single DFS pass.
+/// Build a `qualified-name → (function node, container)` index for every
+/// function reachable from `root`, in a single DFS pass. The function and
+/// container node kinds come from `lang` (Rust `function_item` / `impl_item`,
+/// Python `function_definition` / `class_definition`).
 ///
 /// First-occurrence wins, matching the prior single-target search. Each
-/// function is keyed on its bare `name`, and additionally on
-/// `Owner::name` when nested inside an `impl Owner` block. The returned
-/// `Node`s borrow from `tree` via `'tree` so callers can dispatch the
-/// body walk without re-finding.
+/// function is keyed on its bare `name`, and additionally on `Owner::name`
+/// when nested inside a method container. The returned `Node`s borrow from
+/// `tree` via `'tree` so callers can dispatch the body walk without
+/// re-finding.
 fn build_fn_index<'tree>(
     root: Node<'tree>,
     source: &str,
+    lang: Language,
 ) -> HashMap<String, (Node<'tree>, Option<String>)> {
     let mut out: HashMap<String, (Node<'tree>, Option<String>)> = HashMap::new();
     let mut stack: Vec<(Node<'tree>, Option<String>)> = vec![(root, None)];
     while let Some((node, container)) = stack.pop() {
-        if node.kind() == "function_item"
+        if node.kind() == lang.fn_kind()
             && let Some(name_node) = node.child_by_field_name("name")
             && let Ok(name) = name_node.utf8_text(source.as_bytes())
         {
-            // Free function: key on `name`. Method inside `impl Owner`:
+            // Free function: key on `name`. Method inside a container:
             // also insert `Owner::name`. Both forms are accepted by
             // [`extract`] and must resolve to the same node.
             out.entry(name.to_owned())
@@ -220,10 +228,8 @@ fn build_fn_index<'tree>(
                     .or_insert_with(|| (node, container.clone()));
             }
         }
-        let next_container = if node.kind() == "impl_item" {
-            node.child_by_field_name("type")
-                .and_then(|n| n.utf8_text(source.as_bytes()).ok())
-                .map(str::to_owned)
+        let next_container = if node.kind() == lang.container_kind() {
+            lang.container_name(&node, source)
                 .or_else(|| container.clone())
         } else {
             container.clone()
@@ -252,12 +258,17 @@ fn build_fn_index<'tree>(
 /// - [`AstToMermaidError::InvalidInput`] when tree-sitter can't parse it.
 /// - [`AstToMermaidError::InvalidInput`] when no function with that name
 ///   exists in the file.
-pub fn extract(content: &[u8], file_path: &str, target_fn: &str) -> Result<SequenceDiagram> {
+pub fn extract(
+    content: &[u8],
+    file_path: &str,
+    target_fn: &str,
+    lang: Language,
+) -> Result<SequenceDiagram> {
     let text = std::str::from_utf8(content).map_err(|e| {
         AstToMermaidError::InvalidInput(format!("invalid utf-8 in {file_path}: {e}"))
     })?;
-    let tree = parse_source_once(content, file_path)?;
-    extract_all(&tree, text, &[target_fn])
+    let tree = parse_source_once(content, file_path, lang)?;
+    extract_all(&tree, text, &[target_fn], lang)
         .remove(target_fn)
         .ok_or_else(|| {
             AstToMermaidError::InvalidInput(format!(
@@ -278,24 +289,25 @@ pub fn extract(content: &[u8], file_path: &str, target_fn: &str) -> Result<Seque
 /// # Errors
 ///
 /// Same shapes as [`extract`] for UTF-8 / parse failures.
-pub fn list_functions(content: &[u8]) -> Result<Vec<String>> {
+pub fn list_functions(content: &[u8], lang: Language) -> Result<Vec<String>> {
     let text = std::str::from_utf8(content)
         .map_err(|e| AstToMermaidError::InvalidInput(format!("invalid utf-8: {e}")))?;
-    let tree = parse_source_once(content, "<unknown>")?;
-    Ok(list_functions_in_tree(&tree, text))
+    let tree = parse_source_once(content, "<unknown>", lang)?;
+    Ok(list_functions_in_tree(&tree, text, lang))
 }
 
 /// List every function defined in `tree`, returning their qualified names.
 /// Walks the AST without re-parsing; `tree` must come from
-/// [`parse_source_once`] over `source`'s bytes.
+/// [`parse_source_once`] over `source`'s bytes. Function and container node
+/// kinds come from `lang`.
 #[must_use]
-pub fn list_functions_in_tree(tree: &Tree, source: &str) -> Vec<String> {
+pub fn list_functions_in_tree(tree: &Tree, source: &str, lang: Language) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let mut stack: Vec<(Node, Option<String>)> = vec![(tree.root_node(), None)];
     // Depth-first, but preserve source order: push children in reverse so
     // they pop left-to-right.
     while let Some((node, container)) = stack.pop() {
-        if node.kind() == "function_item"
+        if node.kind() == lang.fn_kind()
             && let Some(name_node) = node.child_by_field_name("name")
             && let Ok(name) = name_node.utf8_text(source.as_bytes())
         {
@@ -304,11 +316,8 @@ pub fn list_functions_in_tree(tree: &Tree, source: &str) -> Vec<String> {
                 .map_or_else(|| name.to_owned(), |c| format!("{c}::{name}"));
             out.push(qualified);
         }
-        let next_container = if node.kind() == "impl_item" {
-            node.child_by_field_name("type")
-                .and_then(|n| n.utf8_text(source.as_bytes()).ok())
-                .map(str::to_owned)
-                .or(container)
+        let next_container = if node.kind() == lang.container_kind() {
+            lang.container_name(&node, source).or(container)
         } else {
             container.clone()
         };
@@ -321,11 +330,14 @@ pub fn list_functions_in_tree(tree: &Tree, source: &str) -> Vec<String> {
     out
 }
 
-/// First non-brace line of the function text, used as the diagram title.
+/// First line of the function text, used as the diagram title. Trailing
+/// block-openers are stripped: `{` for Rust and `:` for Python.
 fn signature<'a>(fn_node: &Node, source: &'a str) -> Option<&'a str> {
     let bytes = source.as_bytes();
     let text = fn_node.utf8_text(bytes).ok()?;
-    text.lines().next().map(|l| l.trim_end_matches('{').trim())
+    text.lines()
+        .next()
+        .map(|l| l.trim_end().trim_end_matches([':', '{']).trim_end())
 }
 
 #[cfg(test)]
@@ -333,7 +345,11 @@ mod tests {
     use super::*;
 
     fn extract_ok(src: &str, target: &str) -> SequenceDiagram {
-        extract(src.as_bytes(), "test.rs", target).expect("extract")
+        extract(src.as_bytes(), "test.rs", target, Language::Rust).expect("extract")
+    }
+
+    fn extract_py(src: &str, target: &str) -> SequenceDiagram {
+        extract(src.as_bytes(), "test.py", target, Language::Python).expect("extract")
     }
 
     #[test]
@@ -420,7 +436,8 @@ mod tests {
 
     #[test]
     fn missing_target_errors() {
-        let err = extract(b"fn other() {}", "test.rs", "missing").expect_err("must error");
+        let err = extract(b"fn other() {}", "test.rs", "missing", Language::Rust)
+            .expect_err("must error");
         assert!(matches!(err, AstToMermaidError::InvalidInput(_)));
     }
 
@@ -480,10 +497,159 @@ mod tests {
     fn list_functions_returns_qualified_names() {
         let src = "fn free(){}\nstruct S;\nimpl S { fn m(&self){} }\n\
                    trait T { fn def(&self){} }\nimpl T for S { fn def(&self){} }\n";
-        let names = list_functions(src.as_bytes()).expect("list");
+        let names = list_functions(src.as_bytes(), Language::Rust).expect("list");
         assert!(names.contains(&"free".to_owned()), "{names:?}");
         assert!(names.contains(&"S::m".to_owned()), "{names:?}");
         assert!(names.contains(&"S::def".to_owned()), "{names:?}");
+    }
+
+    // ── Python ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn python_bare_call_targets_self() {
+        let d = extract_py("def run():\n    foo()\n    bar()\n", "run");
+        let calls: Vec<_> = d
+            .steps
+            .iter()
+            .filter_map(|s| match s {
+                Step::Call { to, label, .. } => Some((to.clone(), label.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(calls.len(), 2, "{:?}", d.steps);
+        assert_eq!(calls[0], (SELF_ID.to_owned(), "foo".to_owned()));
+        assert_eq!(calls[1], (SELF_ID.to_owned(), "bar".to_owned()));
+    }
+
+    #[test]
+    fn python_method_call_targets_receiver() {
+        let d = extract_py("def run(cache):\n    cache.open()\n", "run");
+        let Step::Call { to, label, .. } = &d.steps[0] else {
+            panic!("expected call, got {:?}", d.steps);
+        };
+        assert_eq!(to, "cache");
+        assert_eq!(label, "open");
+    }
+
+    #[test]
+    fn python_self_method_targets_self() {
+        let d = extract_py(
+            "class Widget:\n    def build(self):\n        self.helper()\n",
+            "Widget::build",
+        );
+        let Step::Call { to, label, .. } = &d.steps[0] else {
+            panic!("expected call, got {:?}", d.steps);
+        };
+        assert_eq!(to, SELF_ID);
+        assert_eq!(label, "helper");
+    }
+
+    #[test]
+    fn python_await_marked() {
+        let d = extract_py("async def run():\n    await fetch()\n", "run");
+        let Step::Call {
+            is_await, label, ..
+        } = &d.steps[0]
+        else {
+            panic!("expected call, got {:?}", d.steps);
+        };
+        assert!(is_await, "await not marked: {:?}", d.steps);
+        assert_eq!(label, "fetch");
+    }
+
+    #[test]
+    fn python_for_loop_wraps_body() {
+        let d = extract_py("def run(xs):\n    for x in xs:\n        x.go()\n", "run");
+        let Step::Loop { body, .. } = &d.steps[0] else {
+            panic!("expected loop, got {:?}", d.steps);
+        };
+        assert!(
+            body.iter()
+                .any(|s| matches!(s, Step::Call { label, .. } if label == "go"))
+        );
+    }
+
+    #[test]
+    fn python_if_becomes_alt_with_else() {
+        let d = extract_py(
+            "def run():\n    if cond():\n        yes()\n    else:\n        no()\n",
+            "run",
+        );
+        let Step::Alt { then, else_, .. } = &d.steps[0] else {
+            panic!("expected alt, got {:?}", d.steps);
+        };
+        assert!(
+            then.iter()
+                .any(|s| matches!(s, Step::Call { label, .. } if label == "yes"))
+        );
+        let else_steps = else_.as_ref().expect("else branch");
+        assert!(
+            else_steps
+                .iter()
+                .any(|s| matches!(s, Step::Call { label, .. } if label == "no"))
+        );
+    }
+
+    #[test]
+    fn python_match_becomes_alt() {
+        let d = extract_py(
+            "def run(v):\n    match v:\n        case 1:\n            one()\n        case _:\n            other()\n",
+            "run",
+        );
+        let Step::Alt { then, .. } = &d.steps[0] else {
+            panic!("expected alt, got {:?}", d.steps);
+        };
+        let labels: Vec<&str> = then
+            .iter()
+            .filter_map(|s| match s {
+                Step::Call { label, .. } => Some(label.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(labels.contains(&"one"), "{labels:?}");
+        assert!(labels.contains(&"other"), "{labels:?}");
+    }
+
+    #[test]
+    fn python_chained_attribute_collapses_to_root() {
+        let d = extract_py("def run(obj):\n    obj.chain().tail()\n", "run");
+        // `obj.chain().tail()` — outer call targets receiver `obj`, method
+        // `tail`; inner `obj.chain()` also targets `obj`, method `chain`.
+        let to_targets: Vec<&str> = d
+            .steps
+            .iter()
+            .filter_map(|s| match s {
+                Step::Call { to, .. } => Some(to.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            to_targets.iter().all(|t| *t == "obj"),
+            "got: {to_targets:?}"
+        );
+    }
+
+    #[test]
+    fn python_list_functions_returns_qualified_names() {
+        let src = "def free():\n    pass\n\nclass S:\n    def m(self):\n        pass\n";
+        let names = list_functions(src.as_bytes(), Language::Python).expect("list");
+        assert!(names.contains(&"free".to_owned()), "{names:?}");
+        assert!(names.contains(&"S::m".to_owned()), "{names:?}");
+    }
+
+    #[test]
+    fn python_impl_method_target_resolves() {
+        let d = extract_py(
+            "class Foo:\n    def build(self):\n        go()\n",
+            "Foo::build",
+        );
+        assert!(
+            d.steps
+                .iter()
+                .any(|s| matches!(s, Step::Call { label, .. } if label == "go")),
+            "{:?}",
+            d.steps
+        );
     }
 
     #[test]

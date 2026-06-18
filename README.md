@@ -164,7 +164,7 @@ The shape of the graph is the shape of the change. A pure bug fix would have one
 
 ### Order of operations: `a2m sequence ./src --target <fn>`
 
-The other five views are unordered call graphs — they tell you *who calls whom*, not *in what order*. `a2m sequence` walks one function body in source order and emits a Mermaid `sequenceDiagram`: lifelines per receiver, arrows per call, control flow lifted into `alt` / `loop` blocks. Take `dir_size_recursive` from this repo's cache module — 12 lines of Rust, a tree walk:
+The other five views are unordered call graphs — they tell you *who calls whom*, not *in what order*. `a2m sequence` walks one function body in source order and emits a Mermaid `sequenceDiagram`: lifelines per receiver, arrows per call, control flow lifted into `alt` / `loop` blocks. It works on both Rust and Python — `for`/`while`/`if`/`match` lift to `loop`/`alt`, and both Rust's postfix `.await` and Python's prefix `await` mark the async arrow. Take `dir_size_recursive` from this repo's cache module — 12 lines of Rust, a tree walk:
 
 ```rust
 fn dir_size_recursive(dir: &Path) -> Result<u64> {
