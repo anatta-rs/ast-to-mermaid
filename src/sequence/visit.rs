@@ -1,9 +1,18 @@
-//! Tree-sitter walk that turns a Rust function body into ordered
+//! Tree-sitter walk that turns a function body into ordered
 //! [`super::Step`]s. Statement order is preserved by walking the AST
 //! depth-first, left-to-right.
+//!
+//! Handles both Rust and Python. The two grammars use **disjoint** node
+//! kinds for the constructs we care about (`call_expression` vs `call`,
+//! `for_expression` vs `for_statement`, `field_expression`/
+//! `scoped_identifier` vs `attribute`, …), so [`State::walk_expr`] runs one
+//! unified `match` over both vocabularies. Only the helpers whose
+//! *semantics* diverge — callee classification, constructor/macro skipping,
+//! `if`/`match` lifting — branch on [`State::lang`].
 
 use super::{Participant, SELF_ID, Step};
 use crate::limits::max_ast_depth;
+use crate::parser::Language;
 use crate::render::util::sanitize_id;
 use std::collections::HashSet;
 use tree_sitter::Node;
@@ -24,9 +33,14 @@ pub(super) struct State {
     participants: Vec<Participant>,
     /// Set of participant ids already inserted (dedup).
     seen: HashSet<String>,
-    /// Receiver type of the enclosing `impl` block, if any. Used to alias
-    /// `Self::method()` calls onto the impl owner.
+    /// Receiver type of the enclosing method container (Rust `impl` block
+    /// or Python `class`), if any. Used to alias `Self::method()` /
+    /// `self.method()` calls onto the owner.
     container: Option<String>,
+    /// Source language — selects node-kind semantics in the divergent
+    /// helpers (callee classification, constructor/macro skipping, `if`/
+    /// `match` lifting).
+    lang: Language,
     /// Resolved [`max_ast_depth`] captured once per [`State`] so the
     /// limit is consistent across all walkers driving this diagram.
     max_depth: usize,
@@ -38,14 +52,16 @@ pub(super) struct State {
 
 impl State {
     /// Build a fresh visitor with `self` pre-registered as the caller
-    /// lifeline. `container` is the impl owner type (e.g. `Foo` for an
-    /// `impl Foo` method) or `None` for free functions.
-    pub fn new(container: Option<&str>) -> Self {
+    /// lifeline. `container` is the method owner type (e.g. `Foo` for an
+    /// `impl Foo` method or a Python `class Foo`) or `None` for free
+    /// functions. `lang` selects the grammar semantics.
+    pub fn new(container: Option<&str>, lang: Language) -> Self {
         let mut s = Self {
             steps: Vec::new(),
             participants: Vec::new(),
             seen: HashSet::new(),
             container: container.map(str::to_owned),
+            lang,
             max_depth: max_ast_depth(),
             depth_limited: false,
         };
@@ -112,43 +128,55 @@ impl State {
             return;
         }
         match node.kind() {
-            "call_expression" => {
+            // ── Calls ──────────────────────────────────────────────────
+            // Rust `call_expression` and Python `call` share the `function`
+            // + `arguments` field layout, so one handler serves both.
+            "call_expression" | "call" => {
                 self.handle_call(node, source, false, depth + 1);
             }
             "macro_invocation" => {
                 self.handle_macro(node, source, depth + 1);
             }
-            "await_expression" => {
-                // tree-sitter-rust's `await_expression` is `<expr> . await`
-                // with no named field — the awaited expression is the
-                // first non-trivia child.
+            // ── Await ──────────────────────────────────────────────────
+            // Rust postfix `await_expression` (`<expr>.await`) and Python
+            // prefix `await` (`await <expr>`) both wrap a single awaited
+            // expression as a non-keyword child. We mark the inner call
+            // `is_await` so the renderer draws the async arrow.
+            "await_expression" | "await" => {
                 let mut cursor = node.walk();
                 let inner = node
                     .children(&mut cursor)
                     .find(|c| !matches!(c.kind(), "." | "await"));
                 if let Some(value) = inner {
-                    if value.kind() == "call_expression" {
+                    if matches!(value.kind(), "call_expression" | "call") {
                         self.handle_call(&value, source, true, depth + 1);
                     } else {
                         self.walk_expr(&value, source, depth + 1);
                     }
                 }
             }
+            // ── Loops ──────────────────────────────────────────────────
             "for_expression" => {
                 let label = format!("for {}", short_text(node, "value", source));
                 self.lift_loop(node, source, &label, depth + 1);
             }
-            "while_expression" => {
+            // Python `for x in xs:` — the iterable is the `right` field.
+            "for_statement" => {
+                let label = format!("for {}", short_text(node, "right", source));
+                self.lift_loop(node, source, &label, depth + 1);
+            }
+            "while_expression" | "while_statement" => {
                 let label = format!("while {}", short_text(node, "condition", source));
                 self.lift_loop(node, source, &label, depth + 1);
             }
             "loop_expression" => {
                 self.lift_loop(node, source, "loop", depth + 1);
             }
-            "if_expression" => {
+            // ── Conditionals ───────────────────────────────────────────
+            "if_expression" | "if_statement" => {
                 self.lift_if(node, source, depth + 1);
             }
-            "match_expression" => {
+            "match_expression" | "match_statement" => {
                 self.lift_match(node, source, depth + 1);
             }
             "block" => {
@@ -200,16 +228,19 @@ impl State {
         }
     }
 
-    /// Emit a [`Step::Call`] for a `call_expression` and then descend into
-    /// its arguments so nested calls are still surfaced.
+    /// Emit a [`Step::Call`] for a Rust `call_expression` or Python `call`
+    /// and then descend into its arguments so nested calls are still
+    /// surfaced.
     ///
-    /// Bare-name calls to enum-variant constructors (`Some`, `None`,
-    /// `Ok`, `Err`) are skipped — they parse as `call_expression` but
-    /// represent type construction, not flow.
+    /// In Rust, bare-name calls to enum-variant constructors (`Some`,
+    /// `None`, `Ok`, `Err`) are skipped — they parse as `call_expression`
+    /// but represent type construction, not flow. Python has no such
+    /// ambiguity, so the filter only applies when [`Self::lang`] is Rust.
     fn handle_call(&mut self, node: &Node, source: &str, is_await: bool, depth: usize) {
         if let Some(callee) = node.child_by_field_name("function") {
             let (to_id, to_label, method) = self.classify_callee(&callee, source);
-            let is_bare_constructor = callee.kind() == "identifier"
+            let is_bare_constructor = self.lang == Language::Rust
+                && callee.kind() == "identifier"
                 && to_id == SELF_ID
                 && is_skipped_constructor(&method);
             if !is_bare_constructor {
@@ -261,6 +292,24 @@ impl State {
                     field_receiver_root(callee, source, self.max_depth).unwrap_or("?");
                 let method = callee
                     .child_by_field_name("field")
+                    .and_then(|n| node_text(&n, source))
+                    .unwrap_or("?")
+                    .to_owned();
+                if receiver_root == "self" {
+                    (SELF_ID.to_owned(), self.self_label(), method)
+                } else {
+                    let display = cap_label(receiver_root);
+                    (sanitize_id(&display), display, method)
+                }
+            }
+            "attribute" => {
+                // Python `obj.method` — `object` is the receiver chain,
+                // `attribute` is the method name. `obj.x.method` and
+                // `obj.chain().method` both collapse to `obj`.
+                let receiver_root =
+                    attribute_receiver_root(callee, source, self.max_depth).unwrap_or("?");
+                let method = callee
+                    .child_by_field_name("attribute")
                     .and_then(|n| node_text(&n, source))
                     .unwrap_or("?")
                     .to_owned();
@@ -334,20 +383,31 @@ impl State {
     }
 
     fn lift_match(&mut self, node: &Node, source: &str, depth: usize) {
-        let scrutinee = short_text(node, "value", source);
+        // Rust `match x { … }` keys the scrutinee on `value`; Python
+        // `match x:` keys it on `subject`.
+        let (scrutinee_field, arm_kind) = match self.lang {
+            Language::Rust => ("value", "match_arm"),
+            Language::Python => ("subject", "case_clause"),
+        };
+        let scrutinee = short_text(node, scrutinee_field, source);
         let cond = format!("match {scrutinee}");
-        // tree-sitter-rust's match_arm has a named `value` field for the
-        // arm body. v1 collapses all arms into one branch — splitting onto
-        // separate alt elses is a follow-up.
+        // Each arm body: Rust `match_arm` exposes it on `value`, Python
+        // `case_clause` on `consequence` (a block). v1 collapses all arms
+        // into one branch — splitting onto separate alt elses is a
+        // follow-up.
         let arms_steps = self.walk_into(|s| {
             if let Some(body) = node.child_by_field_name("body") {
                 let mut cursor = body.walk();
                 for child in body.children(&mut cursor) {
-                    if child.kind() != "match_arm" {
+                    if child.kind() != arm_kind {
                         continue;
                     }
-                    if let Some(value) = child.child_by_field_name("value") {
-                        s.walk_expr(&value, source, depth);
+                    let arm_body = match s.lang {
+                        Language::Rust => child.child_by_field_name("value"),
+                        Language::Python => child.child_by_field_name("consequence"),
+                    };
+                    if let Some(arm_body) = arm_body {
+                        s.walk_expr(&arm_body, source, depth);
                     }
                 }
             }
@@ -404,7 +464,16 @@ impl State {
 fn is_trivia(node: &Node) -> bool {
     matches!(
         node.kind(),
-        "{" | "}" | ";" | "(" | ")" | "," | "line_comment" | "block_comment"
+        // Rust trivia + Python `comment` / `:` block-opener.
+        "{" | "}"
+            | ";"
+            | "("
+            | ")"
+            | ","
+            | ":"
+            | "line_comment"
+            | "block_comment"
+            | "comment"
     )
 }
 
@@ -473,6 +542,48 @@ fn field_receiver_root<'a>(node: &Node, source: &'a str, limit: usize) -> Option
     tracing::warn!(
         limit,
         "ast depth limit hit in field_receiver_root; returning best-effort label",
+    );
+    node_text(&current, source)
+}
+
+/// Python counterpart of [`field_receiver_root`]: walk the receiver chain
+/// of `obj.method` / `obj.x.method` / `obj.chain().method` and return the
+/// leftmost identifier. Descends through `attribute` (chained access via the
+/// `object` field), `call` (chained calls via the `function` field),
+/// `parenthesized_expression`, and `subscript` (`d[k].method()` → `d`).
+///
+/// `limit` is the depth cap captured once on the enclosing [`State`], passed
+/// in for the same reason as [`field_receiver_root`]. On an adversarially
+/// deep chain we stop and return the best-effort raw text of the current
+/// node so the caller still produces a finite label.
+fn attribute_receiver_root<'a>(node: &Node, source: &'a str, limit: usize) -> Option<&'a str> {
+    let mut current = *node;
+    for _ in 0..limit {
+        match current.kind() {
+            "attribute" => {
+                current = current.child_by_field_name("object")?;
+            }
+            "call" => {
+                current = current.child_by_field_name("function")?;
+            }
+            "subscript" => {
+                current = current.child_by_field_name("value")?;
+            }
+            "parenthesized_expression" => {
+                let mut cursor = current.walk();
+                let inner = current
+                    .children(&mut cursor)
+                    .find(|c| !matches!(c.kind(), "(" | ")"));
+                current = inner?;
+            }
+            // identifier, self, or anything else — give up and use the raw
+            // text. The caller caps overlong snippets.
+            _ => return node_text(&current, source),
+        }
+    }
+    tracing::warn!(
+        limit,
+        "ast depth limit hit in attribute_receiver_root; returning best-effort label",
     );
     node_text(&current, source)
 }

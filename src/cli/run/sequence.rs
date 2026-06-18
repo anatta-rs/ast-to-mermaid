@@ -1,16 +1,20 @@
 use super::check_ref_arg;
 use crate::cli::flags::{ExitCode, SequenceFlags};
 use crate::cli::format::parse_csv_exclude;
+use crate::parser::Language;
 use crate::pipeline::{language_for, walk_for_languages_with_exclude};
 use crate::sequence;
 use std::path::Path;
+
+/// A collected source file: `(display_path, content, language)`.
+type Source = (String, Vec<u8>, Language);
 
 /// Run the `sequence` subcommand. Two modes:
 ///
 /// - Single-target (`--target <name>`): locate one function, render its
 ///   body to stdout or `--out <FILE>`.
-/// - All (`--all`, requires `--out <DIR>`): every Rust function in the
-///   source tree is rendered into its own `<DIR>/<file>__<name>.mmd`.
+/// - All (`--all`, requires `--out <DIR>`): every function (Rust or Python)
+///   in the source tree is rendered into its own `<DIR>/<file>__<name>.mmd`.
 pub fn run_sequence(flags: &SequenceFlags) -> ExitCode {
     if !flags.all && flags.target.as_deref().is_none_or(|t| t.trim().is_empty()) {
         eprintln!("sequence: pass --target <NAME> or --all");
@@ -21,7 +25,7 @@ pub fn run_sequence(flags: &SequenceFlags) -> ExitCode {
     }
     let exclude = parse_csv_exclude(&flags.exclude);
 
-    let candidates = match collect_rust_sources(&flags.path, &exclude, flags.r#ref.as_deref()) {
+    let candidates = match collect_sources(&flags.path, &exclude, flags.r#ref.as_deref()) {
         Ok(v) => v,
         Err(e) => {
             eprintln!("sequence: collect sources {}: {e}", flags.path.display());
@@ -30,7 +34,7 @@ pub fn run_sequence(flags: &SequenceFlags) -> ExitCode {
     };
     if candidates.is_empty() {
         eprintln!(
-            "sequence: no Rust files found under {}",
+            "sequence: no Rust or Python files found under {}",
             flags.path.display()
         );
         return ExitCode::Failure;
@@ -48,7 +52,7 @@ pub fn run_sequence(flags: &SequenceFlags) -> ExitCode {
 }
 
 fn run_sequence_single(
-    candidates: &[(String, Vec<u8>)],
+    candidates: &[Source],
     target: &str,
     out: Option<&Path>,
     path: &Path,
@@ -58,16 +62,16 @@ fn run_sequence_single(
     // and `extract_all` (extract the diagram on the same tree). Once a
     // match is found we break — files past it are never parsed.
     let mut diagram = None;
-    for (file_rel, content) in candidates {
+    for (file_rel, content, lang) in candidates {
         let Ok(text) = std::str::from_utf8(content) else {
             continue;
         };
-        let Ok(tree) = sequence::parse_source_once(content, file_rel) else {
+        let Ok(tree) = sequence::parse_source_once(content, file_rel, *lang) else {
             continue;
         };
-        let names = sequence::list_functions_in_tree(&tree, text);
+        let names = sequence::list_functions_in_tree(&tree, text, *lang);
         if names.iter().any(|n| n == target) {
-            let mut map = sequence::extract_all(&tree, text, &[target]);
+            let mut map = sequence::extract_all(&tree, text, &[target], *lang);
             if let Some(d) = map.remove(target) {
                 diagram = Some((file_rel.clone(), d));
                 break;
@@ -101,7 +105,7 @@ fn run_sequence_single(
     ExitCode::Success
 }
 
-fn run_sequence_all(candidates: &[(String, Vec<u8>)], out: Option<&Path>) -> ExitCode {
+fn run_sequence_all(candidates: &[Source], out: Option<&Path>) -> ExitCode {
     let Some(out_dir) = out else {
         eprintln!("sequence: --all requires --out <DIR>");
         return ExitCode::UsageError;
@@ -117,7 +121,7 @@ fn run_sequence_all(candidates: &[(String, Vec<u8>)], out: Option<&Path>) -> Exi
     // `list_functions`, once per function for `extract`).
     let mut written = 0usize;
     let mut skipped = 0usize;
-    for (file_rel, content) in candidates {
+    for (file_rel, content, lang) in candidates {
         let text = match std::str::from_utf8(content) {
             Ok(s) => s,
             Err(e) => {
@@ -126,7 +130,7 @@ fn run_sequence_all(candidates: &[(String, Vec<u8>)], out: Option<&Path>) -> Exi
                 continue;
             }
         };
-        let tree = match sequence::parse_source_once(content, file_rel) {
+        let tree = match sequence::parse_source_once(content, file_rel, *lang) {
             Ok(t) => t,
             Err(e) => {
                 eprintln!("sequence: parse {file_rel}: {e}");
@@ -134,9 +138,9 @@ fn run_sequence_all(candidates: &[(String, Vec<u8>)], out: Option<&Path>) -> Exi
                 continue;
             }
         };
-        let names = sequence::list_functions_in_tree(&tree, text);
+        let names = sequence::list_functions_in_tree(&tree, text, *lang);
         let target_refs: Vec<&str> = names.iter().map(String::as_str).collect();
-        let mut map = sequence::extract_all(&tree, text, &target_refs);
+        let mut map = sequence::extract_all(&tree, text, &target_refs, *lang);
         for name in names {
             let Some(diagram) = map.remove(&name) else {
                 skipped += 1;
@@ -174,14 +178,18 @@ fn build_sequence_path(file_rel: &str, qualified_name: &str) -> String {
     format!("{}.mmd", crate::artifacts::filename_id(&key))
 }
 
-/// Collect `(display_path, content)` pairs for every Rust source file under
-/// `root`, honouring `exclude`. With `git_ref`, reads from `git ls-tree`
-/// instead of the working tree.
-fn collect_rust_sources(
+/// Collect `(display_path, content, language)` tuples for every supported
+/// source file (Rust + Python) under `root`, honouring `exclude`. With
+/// `git_ref`, reads from `git ls-tree` instead of the working tree.
+///
+/// The per-file language drives which tree-sitter grammar
+/// [`sequence::parse_source_once`] uses, so a mixed Rust/Python tree emits
+/// diagrams for both.
+fn collect_sources(
     root: &Path,
     exclude: &[String],
     git_ref: Option<&str>,
-) -> Result<Vec<(String, Vec<u8>)>, crate::error::AstToMermaidError> {
+) -> Result<Vec<Source>, crate::error::AstToMermaidError> {
     if let Some(git_ref) = git_ref {
         let toplevel = crate::git_source::show_toplevel(root)?;
         let entries = crate::git_source::ls_tree(&toplevel, git_ref)?;
@@ -191,27 +199,24 @@ fn collect_rust_sources(
         let mut reader = crate::git_source::BatchReader::spawn(&toplevel)?;
         let mut out = Vec::new();
         for entry in entries {
-            if language_for(Path::new(&entry.path)) != Some(crate::parser::Language::Rust) {
+            let Some(lang) = language_for(Path::new(&entry.path)) else {
                 continue;
-            }
+            };
             let content = reader.read_blob(&entry.blob_sha)?;
-            out.push((entry.path, content));
+            out.push((entry.path, content, lang));
         }
         Ok(out)
     } else {
         let files = walk_for_languages_with_exclude(root, exclude)?;
         let mut out = Vec::new();
         for (path, lang) in files {
-            if lang != crate::parser::Language::Rust {
-                continue;
-            }
             let content = std::fs::read(&path)?;
             let display = path
                 .strip_prefix(root)
                 .unwrap_or(&path)
                 .to_string_lossy()
                 .into_owned();
-            out.push((display, content));
+            out.push((display, content, lang));
         }
         Ok(out)
     }
@@ -279,6 +284,51 @@ mod tests {
         assert!(body.starts_with("sequenceDiagram"), "got:\n{body}");
         assert!(body.contains("self->>cache: open"), "got:\n{body}");
         assert!(body.contains("self->>self: foo"), "got:\n{body}");
+    }
+
+    #[test]
+    fn sequence_writes_python_mermaid_to_file() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        // `write_rust` is a generic file writer — the `.py` extension drives
+        // `language_for` to pick the Python grammar.
+        write_rust(
+            tmp.path(),
+            "mod.py",
+            "def run(cache):\n    cache.open()\n    helper()\n",
+        );
+        let out = tmp.path().join("seq.mmd");
+        let mut flags = flags_for(tmp.path().to_path_buf(), Some("run"));
+        flags.out = Some(out.clone());
+        assert_eq!(run_sequence(&flags), ExitCode::Success);
+        let body = std::fs::read_to_string(&out).expect("read");
+        assert!(body.starts_with("sequenceDiagram"), "got:\n{body}");
+        assert!(body.contains("self->>cache: open"), "got:\n{body}");
+        assert!(body.contains("self->>self: helper"), "got:\n{body}");
+    }
+
+    #[test]
+    fn sequence_all_writes_python_and_rust_in_mixed_tree() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        write_rust(tmp.path(), "lib.rs", "fn rust_fn(){ helper(); }\nfn helper(){}\n");
+        write_rust(tmp.path(), "mod.py", "def py_fn():\n    work()\n");
+        let out = tmp.path().join("diagrams");
+        let mut flags = flags_for(tmp.path().to_path_buf(), None);
+        flags.all = true;
+        flags.out = Some(out.clone());
+        assert_eq!(run_sequence(&flags), ExitCode::Success);
+        let entries: Vec<String> = std::fs::read_dir(&out)
+            .expect("read out_dir")
+            .filter_map(std::result::Result::ok)
+            .filter_map(|e| e.file_name().into_string().ok())
+            .collect();
+        assert!(
+            entries.iter().any(|n| n.ends_with("__rust_fn.mmd")),
+            "rust diagram missing: {entries:?}"
+        );
+        assert!(
+            entries.iter().any(|n| n.ends_with("__py_fn.mmd")),
+            "python diagram missing: {entries:?}"
+        );
     }
 
     #[test]
