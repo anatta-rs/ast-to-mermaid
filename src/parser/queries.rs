@@ -31,6 +31,8 @@ pub(super) struct PythonQueries {
     pub class_methods: Query,
     /// Call sites inside a function body.
     pub calls: Query,
+    /// `import` / `from … import …` statements anywhere in the file.
+    pub imports: Query,
 }
 
 pub(super) static RUST: LazyLock<RustQueries> = LazyLock::new(|| {
@@ -56,6 +58,8 @@ pub(super) static PYTHON: LazyLock<PythonQueries> = LazyLock::new(|| {
             .expect("queries/python/class_methods.scm must compile"),
         calls: Query::new(&lang, include_str!("queries/python/calls.scm"))
             .expect("queries/python/calls.scm must compile"),
+        imports: Query::new(&lang, include_str!("queries/python/imports.scm"))
+            .expect("queries/python/imports.scm must compile"),
     }
 });
 
@@ -77,5 +81,6 @@ mod tests {
         let _ = &PYTHON.items;
         let _ = &PYTHON.class_methods;
         let _ = &PYTHON.calls;
+        let _ = &PYTHON.imports;
     }
 }

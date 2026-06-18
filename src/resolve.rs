@@ -610,15 +610,29 @@ fn file_module_name(file_path: &str) -> &str {
 
 /// Best-effort crate-root extraction from an atom's `file_path`.
 ///
+/// Rust (Cargo layout):
 /// - `crate_a/src/foo.rs` → `Some("crate_a")` (split at `/src/`).
 /// - `src/foo.rs` → `Some("")` (top-level `src/` — treated as one
 ///   crate so a tempdir test layout works).
-/// - `tests/foo.rs`, `mod.py` → `Some(file_path)` (each its own root —
-///   prevents bare-name cross-file binds in loose layouts).
+/// - `tests/foo.rs` → `Some(file_path)` (each its own root — prevents
+///   bare-name cross-file binds in loose layouts).
+///
+/// Python (package layout): the top-level package directory is the unit of
+/// "same-crate" grouping, so a whole `lib/` package shares one root and the
+/// resolver's same-crate preference fires within it:
+/// - `lib/translator.py`, `lib/sub/x.py` → `Some("lib")` (first segment).
+/// - `mod.py` (no directory) → `Some("")` (top-level — one root).
+///
 /// - empty path → `None`.
 fn crate_root(atom: &CodeAtom) -> Option<String> {
     if atom.file_path.is_empty() {
         return None;
+    }
+    if lang_of(&atom.file_path) == "py" {
+        return Some(match atom.file_path.split_once('/') {
+            Some((head, _)) => head.to_owned(),
+            None => String::new(),
+        });
     }
     if let Some(idx) = atom.file_path.find("/src/") {
         return Some(atom.file_path[..idx].to_owned());
@@ -838,6 +852,45 @@ mod tests {
     fn crate_root_returns_full_path_when_no_src() {
         let atom = function_atom("just/a/path.rs", "f", &[]);
         assert_eq!(crate_root(&atom), Some("just/a/path.rs".to_owned()));
+    }
+
+    #[test]
+    fn crate_root_python_uses_top_level_package() {
+        // A whole Python package shares one root so same-crate preference
+        // fires within it.
+        assert_eq!(
+            crate_root(&function_atom("lib/translator.py", "f", &[])),
+            Some("lib".to_owned())
+        );
+        assert_eq!(
+            crate_root(&function_atom("lib/sub/deep.py", "f", &[])),
+            Some("lib".to_owned())
+        );
+        // Top-level loose file → empty root (one bucket).
+        assert_eq!(
+            crate_root(&function_atom("mod.py", "f", &[])),
+            Some(String::new())
+        );
+    }
+
+    #[test]
+    fn python_module_qualified_call_resolves() {
+        // `from lib.catalog import load_catalog` rewrites the call to
+        // `catalog::load_catalog` (module-last :: symbol). The resolver's
+        // module-name fallback must bind it to `catalog.py`.
+        let store = Store::new();
+        add_to_store(
+            &store,
+            "lib/translator.py",
+            &[("use_it", &["catalog::load_catalog"])],
+        );
+        add_to_store(&store, "lib/catalog.py", &[("load_catalog", &[])]);
+
+        let added = resolve_cross_module_calls(&store);
+        assert_eq!(added, 1, "qualified python call must resolve");
+        let from = EntityId::new("code:lib/translator.py::function::use_it");
+        let to = EntityId::new("code:lib/catalog.py::function::load_catalog");
+        assert!(store.has_call_edge(&from, &to));
     }
 
     #[test]
