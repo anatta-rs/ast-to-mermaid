@@ -445,12 +445,13 @@ pub fn bundle(root: &Path, opts: &AnalyzeOptions) -> Result<(ArtifactSet, Analyz
         None => root.to_string_lossy().into_owned(),
     };
     let artifacts = if opts.with_sequences {
-        // Re-use the bytes already in memory — only Rust files can produce
-        // sequence diagrams, so we filter the rest out cheaply. The
-        // `Arc::clone` is a refcount bump; no source bytes are copied.
+        // Re-use the bytes already in memory — every input is a supported
+        // source file (Rust or Python), and both produce sequence diagrams,
+        // so we feed them all. `build_sequences` resolves the grammar per
+        // file from its path. The `Arc::clone` is a refcount bump; no
+        // source bytes are copied.
         let sources: Vec<(String, Arc<[u8]>)> = inputs
             .iter()
-            .filter(|i| matches!(i.language, Language::Rust))
             .map(|i| (i.display_path.clone(), Arc::clone(&i.content)))
             .collect();
         emit_artifacts_with_sequences(&store, &source_root, &sources)
@@ -1012,6 +1013,46 @@ mod tests {
         assert!(
             empty.get("sequence_path").is_none(),
             "empty fn must not have sequence_path"
+        );
+    }
+
+    #[test]
+    fn bundle_with_sequences_covers_python() {
+        // A Python module with a non-empty function must produce a sequence
+        // diagram in the bundle, just like Rust — the `--with-sequences`
+        // path is no longer Rust-only.
+        let tmp = tempdir().expect("tmp");
+        write(
+            tmp.path(),
+            "mod.py",
+            "def caller():\n    helper()\n\ndef helper():\n    pass\n",
+        );
+
+        let opts = AnalyzeOptions {
+            with_sequences: true,
+            ..AnalyzeOptions::default()
+        };
+        let (artifacts, _report) = bundle(tmp.path(), &opts).expect("bundle");
+
+        let seq_ids: Vec<&str> = artifacts
+            .sequences
+            .iter()
+            .map(|s| s.entity_id.as_str())
+            .collect();
+        assert!(
+            seq_ids.contains(&"code:mod.py::function::caller"),
+            "expected python caller in sequences, got: {seq_ids:?}"
+        );
+        // The rendered diagram must carry the call to `helper`.
+        let caller = artifacts
+            .sequences
+            .iter()
+            .find(|s| s.entity_id.as_str() == "code:mod.py::function::caller")
+            .expect("caller sequence");
+        assert!(
+            caller.mmd.contains("self->>self: helper"),
+            "got:\n{}",
+            caller.mmd
         );
     }
 
