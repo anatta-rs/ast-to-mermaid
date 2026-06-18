@@ -723,7 +723,7 @@ fn extract_calls(
     match (language, imports) {
         (Language::Rust, Imports::Rust(map)) => rust::extract_calls(node, source, map, &mut out),
         (Language::Python, Imports::Python(py)) => {
-            python::extract_calls(node, source, py, &mut out)
+            python::extract_calls(node, source, py, &mut out);
         }
         _ => {}
     }
