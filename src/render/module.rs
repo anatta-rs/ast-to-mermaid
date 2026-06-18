@@ -40,10 +40,11 @@ pub fn render(adj: &AdjMaps, snapshot: &AtomSnapshot<'_>, target: &str) -> Resul
     // 1. Items inside the module via the shared `Contains` adjacency. Two
     //    tiers:
     //    - top-level items directly contained by the module.
-    //    - methods nested inside `impl` blocks (drawn as their own
-    //      sub-subgraph).
+    //    - methods nested inside a **method container** — a Rust `impl`
+    //      block or a Python `class` (a `struct` atom with method children).
+    //      Drawn as their own sub-subgraph.
     let mut top_items: BTreeMap<EntityId, &str> = BTreeMap::new(); // id → kind
-    let mut impl_methods: BTreeMap<EntityId, BTreeMap<EntityId, &str>> = BTreeMap::new(); // impl_id → (method_id → kind)
+    let mut container_methods: BTreeMap<EntityId, BTreeMap<EntityId, &str>> = BTreeMap::new(); // container_id → (method_id → kind)
     let mut inside_set: HashSet<EntityId> = HashSet::new();
     for child_arc in adj.children(&module_id) {
         let child_id: &EntityId = child_arc;
@@ -52,17 +53,22 @@ pub fn render(adj: &AdjMaps, snapshot: &AtomSnapshot<'_>, target: &str) -> Resul
         };
         top_items.insert(child_id.clone(), atom.kind.as_str());
         inside_set.insert(child_id.clone());
-        if atom.kind == "impl" {
+        // Rust `impl` always groups methods; a `struct` only groups them
+        // when it actually has function children (Python classes do; plain
+        // Rust structs don't — their methods live under a sibling `impl`).
+        if matches!(atom.kind.as_str(), "impl" | "struct") {
             let mut method_map: BTreeMap<EntityId, &str> = BTreeMap::new();
             for method_arc in adj.children(child_id) {
                 let method_id: &EntityId = method_arc;
-                if let Some(matom) = snapshot.get(method_id) {
+                if let Some(matom) = snapshot.get(method_id)
+                    && matom.kind == "function"
+                {
                     method_map.insert(method_id.clone(), matom.kind.as_str());
                     inside_set.insert(method_id.clone());
                 }
             }
             if !method_map.is_empty() {
-                impl_methods.insert(child_id.clone(), method_map);
+                container_methods.insert(child_id.clone(), method_map);
             }
         }
     }
@@ -74,7 +80,7 @@ pub fn render(adj: &AdjMaps, snapshot: &AtomSnapshot<'_>, target: &str) -> Resul
         .filter(|(_, kind)| **kind == "function")
         .map(|(id, _)| id.clone())
         .collect();
-    for methods in impl_methods.values() {
+    for methods in container_methods.values() {
         for (mid, kind) in methods {
             if *kind == "function" {
                 function_items.push(mid.clone());
@@ -123,15 +129,17 @@ pub fn render(adj: &AdjMaps, snapshot: &AtomSnapshot<'_>, target: &str) -> Resul
         let Some(atom) = snapshot.get(item_id) else {
             continue;
         };
-        // For impl atoms with method children, emit a nested subgraph.
-        if **kind == "impl"
-            && let Some(methods) = impl_methods.get(item_id)
-        {
-            let impl_subgraph_id = sanitize_id(&format!("impl_{}", item_id.as_str()));
-            let impl_label = escape_label_flowchart(&format!("impl {}", atom.name));
+        // For method containers (Rust `impl`, Python `class`), emit a
+        // nested subgraph grouping their methods.
+        if let Some(methods) = container_methods.get(item_id) {
+            // `impl Foo` keeps the `impl` keyword; a Python class (`struct`
+            // atom with methods) reads as `class Foo`.
+            let keyword = if **kind == "impl" { "impl" } else { "class" };
+            let container_subgraph_id = sanitize_id(&format!("{keyword}_{}", item_id.as_str()));
+            let container_label = escape_label_flowchart(&format!("{keyword} {}", atom.name));
             writeln!(
                 mermaid,
-                "        subgraph {impl_subgraph_id}[\"{impl_label}\"]"
+                "        subgraph {container_subgraph_id}[\"{container_label}\"]"
             )
             .expect("string write is infallible");
             let mut sorted_methods: Vec<(&EntityId, &&str)> = methods.iter().collect();
@@ -435,6 +443,66 @@ mod tests {
         assert!(out.contains("[\"impl Foo\"]"), "impl label missing: {out}");
         assert!(out.contains("fn build"), "method label missing: {out}");
         assert!(out.contains("fn update"), "method label missing: {out}");
+    }
+
+    #[test]
+    fn python_class_methods_render_as_nested_subgraph() {
+        // A Python class is a `struct` atom with `function` children (the
+        // parser lifts methods). The module view must group them under a
+        // `class X` subgraph, mirroring Rust `impl`.
+        let store = Store::new();
+        let m = module_atom("lib/translator.py", "translator");
+        store.add_atom(m.clone());
+        let class = item_atom("lib/translator.py", "struct", "Translator");
+        let gettext = CodeAtom {
+            id: EntityId::new("code:lib/translator.py::function::Translator::gettext"),
+            kind: "function".to_owned(),
+            name: "gettext".to_owned(),
+            file_path: "lib/translator.py".to_owned(),
+            line_start: 2,
+            line_end: 4,
+            doc: String::new(),
+            signature: String::new(),
+            content_hash: "h".to_owned(),
+            calls: Vec::new(),
+            method_calls: Vec::new(),
+            parent: Some("Translator".to_owned()),
+        };
+        store.add_edge(Edge::new(
+            m.id.clone(),
+            class.id.clone(),
+            EdgeKind::Contains,
+        ));
+        store.add_edge(Edge::new(
+            class.id.clone(),
+            gettext.id.clone(),
+            EdgeKind::Contains,
+        ));
+        store.add_atom(class);
+        store.add_atom(gettext);
+
+        let out = run(&store, "lib/translator.py").expect("render");
+        let nesting = out.matches("subgraph").count();
+        assert!(
+            nesting >= 2,
+            "expected nested subgraph for class, got {nesting}\n{out}"
+        );
+        assert!(
+            out.contains("[\"class Translator\"]"),
+            "class label missing: {out}"
+        );
+        assert!(out.contains("fn gettext"), "method label missing: {out}");
+    }
+
+    #[test]
+    fn rust_struct_without_methods_stays_plain_node() {
+        // A plain Rust struct (no function children) must NOT become a
+        // subgraph — its methods live under a sibling `impl`.
+        let store = Store::new();
+        build_module(&store, "src/foo.rs", &[("struct", "Plain")]);
+        let out = run(&store, "src/foo.rs").expect("render");
+        assert_eq!(out.matches("subgraph").count(), 1, "no nesting:\n{out}");
+        assert!(out.contains("(struct Plain)"), "{out}");
     }
 
     #[test]

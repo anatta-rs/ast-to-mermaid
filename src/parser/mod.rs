@@ -297,12 +297,15 @@ impl CodeParser {
             parent: None,
         });
 
-        // ── File-scope use imports (Rust only) ────────────────────────────────
-        let imports: HashMap<String, String> = if self.language == Language::Rust {
-            let decls = rust::extract_use_decls(root, text);
-            rust::use_decls_to_imports(&decls)
-        } else {
-            HashMap::new()
+        // ── File-scope imports ────────────────────────────────────────────────
+        // Both languages rewrite call sites against their imports so the
+        // cross-module resolver can link them: Rust `use`, Python `import`.
+        let imports: Imports = match self.language {
+            Language::Rust => {
+                let decls = rust::extract_use_decls(root, text);
+                Imports::Rust(rust::use_decls_to_imports(&decls))
+            }
+            Language::Python => Imports::Python(python::extract_imports(root, text)),
         };
 
         // ── Item atoms ────────────────────────────────────────────────────────
@@ -403,7 +406,7 @@ fn extract_item(
     source: &str,
     file_path: &str,
     language: Language,
-    imports: &HashMap<String, String>,
+    imports: &Imports,
 ) -> Option<(CodeAtom, Vec<String>)> {
     // Python decorators — unwrap inner definition iteratively. Tree-sitter
     // can in principle hand us arbitrarily nested `decorated_definition`
@@ -493,7 +496,7 @@ struct MethodCtx<'a> {
     source: &'a str,
     file_path: &'a str,
     language: Language,
-    imports: &'a HashMap<String, String>,
+    imports: &'a Imports,
 }
 
 /// Walk the body of a method container (Rust `impl_item` or Python
@@ -691,6 +694,19 @@ pub(super) struct ExtractedCalls {
     pub(super) method_calls: Vec<String>,
 }
 
+/// File-scope import maps used to rewrite call sites into the qualified
+/// shape the cross-module resolver understands. One variant per language so
+/// each carries exactly the lookup tables its extractor needs.
+///
+/// Module-private: built in [`CodeParser::parse`] and threaded only through
+/// the parser's own extraction helpers.
+enum Imports {
+    /// Rust `use` map: local name → fully-qualified path.
+    Rust(HashMap<String, String>),
+    /// Python `import` maps (symbol + module aliases).
+    Python(python::PyImports),
+}
+
 /// Dispatch call extraction to the matching language module, then
 /// deduplicate the resulting lists in-place. Per-language extractors
 /// append to `out` without worrying about duplicates so the dedupe pass
@@ -699,12 +715,17 @@ fn extract_calls(
     node: &Node,
     source: &str,
     language: Language,
-    imports: &HashMap<String, String>,
+    imports: &Imports,
 ) -> ExtractedCalls {
     let mut out = ExtractedCalls::default();
-    match language {
-        Language::Rust => rust::extract_calls(node, source, imports, &mut out),
-        Language::Python => python::extract_calls(node, source, &mut out),
+    // The `(language, imports)` pair is always constructed in lock-step in
+    // `CodeParser::parse`, so the cross arms are unreachable.
+    match (language, imports) {
+        (Language::Rust, Imports::Rust(map)) => rust::extract_calls(node, source, map, &mut out),
+        (Language::Python, Imports::Python(py)) => {
+            python::extract_calls(node, source, py, &mut out)
+        }
+        _ => {}
     }
     let mut seen: HashSet<String> = HashSet::new();
     out.calls.retain(|c| seen.insert(c.clone()));
