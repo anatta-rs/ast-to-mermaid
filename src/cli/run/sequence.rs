@@ -309,7 +309,11 @@ mod tests {
     #[test]
     fn sequence_all_writes_python_and_rust_in_mixed_tree() {
         let tmp = tempfile::tempdir().expect("tmp");
-        write_rust(tmp.path(), "lib.rs", "fn rust_fn(){ helper(); }\nfn helper(){}\n");
+        write_rust(
+            tmp.path(),
+            "lib.rs",
+            "fn rust_fn(){ helper(); }\nfn helper(){}\n",
+        );
         write_rust(tmp.path(), "mod.py", "def py_fn():\n    work()\n");
         let out = tmp.path().join("diagrams");
         let mut flags = flags_for(tmp.path().to_path_buf(), None);

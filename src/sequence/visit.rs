@@ -465,15 +465,7 @@ fn is_trivia(node: &Node) -> bool {
     matches!(
         node.kind(),
         // Rust trivia + Python `comment` / `:` block-opener.
-        "{" | "}"
-            | ";"
-            | "("
-            | ")"
-            | ","
-            | ":"
-            | "line_comment"
-            | "block_comment"
-            | "comment"
+        "{" | "}" | ";" | "(" | ")" | "," | ":" | "line_comment" | "block_comment" | "comment"
     )
 }
 

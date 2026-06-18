@@ -229,7 +229,8 @@ fn build_fn_index<'tree>(
             }
         }
         let next_container = if node.kind() == lang.container_kind() {
-            lang.container_name(&node, source).or_else(|| container.clone())
+            lang.container_name(&node, source)
+                .or_else(|| container.clone())
         } else {
             container.clone()
         };
@@ -435,8 +436,8 @@ mod tests {
 
     #[test]
     fn missing_target_errors() {
-        let err =
-            extract(b"fn other() {}", "test.rs", "missing", Language::Rust).expect_err("must error");
+        let err = extract(b"fn other() {}", "test.rs", "missing", Language::Rust)
+            .expect_err("must error");
         assert!(matches!(err, AstToMermaidError::InvalidInput(_)));
     }
 
@@ -546,7 +547,10 @@ mod tests {
     #[test]
     fn python_await_marked() {
         let d = extract_py("async def run():\n    await fetch()\n", "run");
-        let Step::Call { is_await, label, .. } = &d.steps[0] else {
+        let Step::Call {
+            is_await, label, ..
+        } = &d.steps[0]
+        else {
             panic!("expected call, got {:?}", d.steps);
         };
         assert!(is_await, "await not marked: {:?}", d.steps);
@@ -619,7 +623,10 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert!(to_targets.iter().all(|t| *t == "obj"), "got: {to_targets:?}");
+        assert!(
+            to_targets.iter().all(|t| *t == "obj"),
+            "got: {to_targets:?}"
+        );
     }
 
     #[test]

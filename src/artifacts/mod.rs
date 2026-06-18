@@ -205,7 +205,10 @@ fn build_sequences(
                 .unwrap_or(crate::parser::Language::Rust);
             let tree = sequence::parse_source_once(content, file_path, lang).ok()?;
             let target_refs: Vec<&str> = targets.iter().map(String::as_str).collect();
-            Some((*file_path, sequence::extract_all(&tree, text, &target_refs, lang)))
+            Some((
+                *file_path,
+                sequence::extract_all(&tree, text, &target_refs, lang),
+            ))
         })
         .collect();
 
