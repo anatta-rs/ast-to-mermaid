@@ -8,6 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Features
+
+- *(tests)* Golden harness over on-disk fixture corpora (`tests/fixtures/mini-rust`, `mini-python`): all 7 views asserted by set equality on full node/edge/participant/counter sets, so a silently missing edge fails CI exactly like an extra one. On the pre-fix tree, 9 of its 13 tests fail — the review's whole bug surface ([#167](https://github.com/anatta-rs/ast-to-mermaid/issues/167))
+
 ### Bug fixes
 
 - *(diff)* Node labels use `fn name (file)` instead of the raw `code:<path>::<kind>::<name>` entity id; legacy bundles without a `name` field still fall back to the id ([#166](https://github.com/anatta-rs/ast-to-mermaid/issues/166))
