@@ -386,6 +386,53 @@ mod tests {
     }
 
     #[test]
+    fn string_literal_receiver_stays_on_self_lifeline() {
+        // `"msg".to_string()` — a literal is a local value, not an actor:
+        // no participant is minted from the literal text.
+        let d = extract_ok(
+            "fn run() -> String { \"run: data must not be empty at all\".to_string() }\n",
+            "run",
+        );
+        let Step::Call { to, label, .. } = &d.steps[0] else {
+            panic!("expected call, got {:?}", d.steps);
+        };
+        assert_eq!(to, SELF_ID);
+        assert_eq!(label, "to_string");
+        assert!(
+            d.participants.iter().all(|p| !p.label.contains("must not")),
+            "literal leaked into participants: {:?}",
+            d.participants
+        );
+    }
+
+    #[test]
+    fn python_string_literal_receiver_stays_on_self_lifeline() {
+        let d = extract_py("def run(xs):\n    return \", \".join(xs)\n", "run");
+        let Step::Call { to, label, .. } = &d.steps[0] else {
+            panic!("expected call, got {:?}", d.steps);
+        };
+        assert_eq!(to, SELF_ID);
+        assert_eq!(label, "join");
+    }
+
+    #[test]
+    fn participant_labels_never_carry_unbalanced_quotes() {
+        // Even for receivers that do become participants, a double quote
+        // in the snippet must not survive into the alias (truncation can
+        // cut the closing one).
+        let d = extract_ok(
+            "fn run() { (x + \"abcdefghijklmnopqrstuvwxyz\").process(); }\n",
+            "run",
+        );
+        for p in &d.participants {
+            assert!(
+                !p.label.contains('"'),
+                "double quote left in participant label: {p:?}"
+            );
+        }
+    }
+
+    #[test]
     fn type_path_targets_type() {
         let d = extract_ok("fn run() { Cache::open(\"x\"); }\n", "run");
         let Step::Call { to, label, .. } = &d.steps[0] else {

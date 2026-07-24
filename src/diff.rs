@@ -329,7 +329,7 @@ pub fn render_mermaid(diff: &BundleDiff, to_entities: &[IndexEntity]) -> String 
                 &mut id_to_node,
                 &mut next_idx,
                 &e.id,
-                &e.id,
+                &entity_label(&e.kind, &e.name, &e.file, &e.id),
                 "added",
             );
         }
@@ -342,7 +342,7 @@ pub fn render_mermaid(diff: &BundleDiff, to_entities: &[IndexEntity]) -> String 
                 &mut id_to_node,
                 &mut next_idx,
                 &e.id,
-                &e.id,
+                &entity_label(&e.kind, &e.name, &e.file, &e.id),
                 "removed",
             );
         }
@@ -355,7 +355,7 @@ pub fn render_mermaid(diff: &BundleDiff, to_entities: &[IndexEntity]) -> String 
                 &mut id_to_node,
                 &mut next_idx,
                 &e.id,
-                &e.id,
+                &entity_label(&e.kind, name_from_id(&e.id, &e.kind), &e.file, &e.id),
                 "modified",
             );
         }
@@ -363,7 +363,7 @@ pub fn render_mermaid(diff: &BundleDiff, to_entities: &[IndexEntity]) -> String 
     if !diff.renamed.is_empty() {
         writeln!(out, "    %% renamed ({})", diff.renamed.len()).ok();
         for r in &diff.renamed {
-            let label = format!("{} ↪ {}", r.from_id, r.to_id);
+            let label = renamed_label(r);
             // The post-state id is `to_id`; that's what edges from `to_entities` reference.
             new_node(
                 &mut out,
@@ -401,6 +401,52 @@ pub fn render_mermaid(diff: &BundleDiff, to_entities: &[IndexEntity]) -> String 
     }
 
     out
+}
+
+/// Human label for a changed entity: `fn resolve (src/resolve.rs)` rather
+/// than the raw `code:src/resolve.rs::function::resolve` id. Falls back to
+/// the id when the index predates the `name` field (legacy bundles).
+fn entity_label(kind: &str, name: &str, file: &str, fallback_id: &str) -> String {
+    if name.is_empty() {
+        return fallback_id.to_owned();
+    }
+    let kind = match kind {
+        "function" => "fn",
+        "module" => "mod",
+        other => other, // struct, trait, enum, … read fine as-is
+    };
+    let mut label = if kind.is_empty() {
+        name.to_owned()
+    } else {
+        format!("{kind} {name}")
+    };
+    if !file.is_empty() {
+        use std::fmt::Write as _;
+        write!(label, " ({file})").ok();
+    }
+    label
+}
+
+/// `old ↪ new` label for a rename pair — ids minus the `code:` prefix
+/// (the rename is a path move, so the path IS the information).
+fn renamed_label(r: &RenamedEntity) -> String {
+    format!(
+        "{} ↪ {}",
+        r.from_id.strip_prefix("code:").unwrap_or(&r.from_id),
+        r.to_id.strip_prefix("code:").unwrap_or(&r.to_id)
+    )
+}
+
+/// Recover the entity name from a `code:<path>::<kind>::<name>` id —
+/// [`ModifiedEntity`] doesn't carry `name`. Names may themselves contain
+/// `::` (e.g. `Foo::build`), so split on the `::<kind>::` marker rather
+/// than the last segment. Empty on no match → label falls back to the id.
+fn name_from_id<'a>(id: &'a str, kind: &str) -> &'a str {
+    if kind.is_empty() {
+        return "";
+    }
+    let marker = format!("::{kind}::");
+    id.split_once(&marker).map_or("", |(_, name)| name)
 }
 
 #[cfg(test)]
@@ -495,6 +541,47 @@ mod tests {
         assert!(m.contains("classDef added"));
         assert!(m.contains("code:b"));
         assert!(m.contains(":::added"));
+    }
+
+    #[test]
+    fn render_mermaid_labels_are_readable_not_raw_ids() {
+        let added = IndexEntity {
+            id: "code:src/resolve.rs::function::resolve_cross_module_calls".to_owned(),
+            kind: "function".to_owned(),
+            name: "resolve_cross_module_calls".to_owned(),
+            file: "src/resolve.rs".to_owned(),
+            content_hash: "h2".to_owned(),
+            edges_out: Vec::new(),
+        };
+        let from = vec![ent("code:a", "h1")];
+        let to = vec![ent("code:a", "h1"), added];
+        let d = compute_diff("a", "b", "sa", "sb", from, to.clone());
+        let m = render_mermaid(&d, &to);
+        assert!(
+            m.contains("[\"fn resolve_cross_module_calls (src/resolve.rs)\"]"),
+            "readable label missing:\n{m}"
+        );
+        assert!(
+            !m.contains("[\"code:src/resolve.rs::function::resolve_cross_module_calls\"]"),
+            "raw id used as label:\n{m}"
+        );
+    }
+
+    #[test]
+    fn render_mermaid_label_falls_back_to_id_without_name() {
+        let legacy = IndexEntity {
+            id: "code:legacy".to_owned(),
+            kind: String::new(),
+            name: String::new(),
+            file: String::new(),
+            content_hash: "h9".to_owned(),
+            edges_out: Vec::new(),
+        };
+        let from: Vec<IndexEntity> = Vec::new();
+        let to = vec![legacy];
+        let d = compute_diff("a", "b", "sa", "sb", from, to.clone());
+        let m = render_mermaid(&d, &to);
+        assert!(m.contains("[\"code:legacy\"]"), "fallback missing:\n{m}");
     }
 
     #[test]

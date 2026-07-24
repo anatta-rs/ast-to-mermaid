@@ -48,12 +48,11 @@ graph TD
 
 ### Convergence: `a2m impact ./src --target parse_phase`
 
-How does a change to `pipeline::parse_phase` ripple outward? It's an internal helper called by both `analyze` and `bundle`, which means **every** subcommand that hits the parse loop reaches it — through five different cli_support handlers, with `run_diff` taking a two-hop detour via `ensure_indexed`:
+How does a change to `pipeline::parse_phase` ripple? Both ways. Backward: it's an internal helper called by both `analyze` and `bundle`, which means **every** subcommand that hits the parse loop reaches it — with `run_diff` taking a two-hop detour via `ensure_indexed`. Forward: it fans out into the per-file parse machinery, down to the language frontends:
 
 ```mermaid
-graph BT
+graph TD
     parse_phase(("fn parse_phase (impacted)"))
-    main["main"]
     run_analyze["run_analyze"]
     run_bundle["run_bundle"]
     run_index["run_index"]
@@ -61,9 +60,10 @@ graph BT
     ensure_indexed["ensure_indexed"]
     analyze["analyze"]
     bundle["bundle"]
-    main --> run_analyze
-    main --> run_bundle
-    main --> run_index
+    parse_one_file["parse_one_file"]
+    apply_unit["apply_unit"]
+    parser_rust["CodeParser::rust"]
+    parser_python["CodeParser::python"]
     run_analyze --> analyze
     run_bundle --> bundle
     run_index --> bundle
@@ -71,19 +71,24 @@ graph BT
     ensure_indexed --> bundle
     analyze --> parse_phase
     bundle --> parse_phase
+    parse_phase --> parse_one_file
+    parse_phase --> apply_unit
+    parse_one_file --> parser_rust
+    parse_one_file --> parser_python
 ```
 
-Five entry points, two private helpers, all converging on one impacted function. The kind of blast radius that turns "is it safe to refactor this?" into a 10-second answer.
+Every entry point converging on one impacted function above it, everything a change can break laid out below it. The kind of blast radius that turns "is it safe to refactor this?" into a 10-second answer.
 
 ### Dispatcher: `a2m module ./src --target render/mod.rs`
 
-`render::render` is one function name shared by **six** modules. The resolver disambiguates via `use` imports + qualified call paths, so the dispatch fan-out and the two real callers land on the right node. Methods inside `impl` blocks are first-class too — addressable via `--target Type::method` (e.g. `--target HnswBuilder::build`) without spelling out generic params:
+`render::render` is one function name shared by **six** modules. The resolver disambiguates via `use` imports + qualified call paths, so the dispatch fan-out and the two real callers land on the right node. Calls that stay inside the module (`render → require_target`) are drawn within the subgraph; methods inside `impl` blocks are first-class too — addressable via `--target Type::method` (e.g. `--target HnswBuilder::build`) without spelling out generic params:
 
 ```mermaid
 graph TD
     subgraph render_mod["render/mod.rs"]
         level(enum Level)
         render["fn render"]
+        render_in_store["fn render_in_store"]
         require_target["fn require_target"]
     end
     function_render(["render"])
@@ -93,6 +98,8 @@ graph TD
     project_render(["render"])
     emit_artifacts(["emit_artifacts"])
     analyze(["analyze"])
+    render --> require_target
+    render_in_store --> render
     render --> function_render
     render --> impact_render
     render --> module_render
@@ -116,25 +123,25 @@ graph TD
     classDef modified fill:#fb8,stroke:#d60,color:#000
     classDef renamed fill:#9ff,stroke:#0aa,color:#000
     %% added (11)
-    n0["parser/mod.rs::function::collect_use_paths"]:::added
-    n1["parser/mod.rs::function::extract_use_imports"]:::added
-    n2["resolve.rs::function::file_module_name"]:::added
-    n3["resolve.rs::function::split_call_name"]:::added
-    n4["tests/cross_module_resolution.rs"]:::added
-    n5["tests/…::bare_call_to_unique_name_still_resolves"]:::added
-    n6["tests/…::build_store"]:::added
-    n7["tests/…::qualified_inline_calls_dispatch_to_correct_sibling_module"]:::added
-    n8["tests/…::use_import_resolves_to_mod_dot_rs_when_name_is_ambiguous"]:::added
+    n0["fn collect_use_paths (parser/mod.rs)"]:::added
+    n1["fn extract_use_imports (parser/mod.rs)"]:::added
+    n2["fn file_module_name (resolve.rs)"]:::added
+    n3["fn split_call_name (resolve.rs)"]:::added
+    n4["mod cross_module_resolution (tests/cross_module_resolution.rs)"]:::added
+    n5["fn bare_call_to_unique_name_still_resolves (tests/cross_module_resolution.rs)"]:::added
+    n6["fn build_store (tests/cross_module_resolution.rs)"]:::added
+    n7["fn qualified_inline_calls_dispatch_to_correct_sibling_module (tests/cross_module_resolution.rs)"]:::added
+    n8["fn use_import_resolves_to_mod_dot_rs_when_name_is_ambiguous (tests/cross_module_resolution.rs)"]:::added
     n9["extern:fs::read"]:::added
     n10["extern:tempfile::tempdir"]:::added
     %% modified (7)
-    n11["parser/mod.rs"]:::modified
-    n12["parser/mod.rs::function::CodeParser::parse_into"]:::modified
-    n13["parser/mod.rs::function::extract_calls"]:::modified
-    n14["parser/mod.rs::function::extract_item"]:::modified
-    n15["parser/mod.rs::impl::CodeParser"]:::modified
-    n16["resolve.rs"]:::modified
-    n17["resolve.rs::function::resolve_cross_module_calls"]:::modified
+    n11["mod parser (parser/mod.rs)"]:::modified
+    n12["fn CodeParser::parse_into (parser/mod.rs)"]:::modified
+    n13["fn extract_calls (parser/mod.rs)"]:::modified
+    n14["fn extract_item (parser/mod.rs)"]:::modified
+    n15["impl CodeParser (parser/mod.rs)"]:::modified
+    n16["mod resolve (resolve.rs)"]:::modified
+    n17["fn resolve_cross_module_calls (resolve.rs)"]:::modified
     %% blast-radius edges (both endpoints in changeset)
     n12 --> n1
     n12 --> n14

@@ -11,7 +11,7 @@
 //! - [`Level::Overview`] — one node per module, cross-module calls.
 //! - [`Level::Module`] — subgraph for one module + external callers/callees.
 //! - [`Level::Function`] — central function + direct callers/callees.
-//! - [`Level::Impact`] — reverse call chain (N hops, default 3).
+//! - [`Level::Impact`] — forward + backward call graph (N hops each way, default 3).
 //!
 //! Plus an orthogonal [`sequence`] view — Mermaid `sequenceDiagram`
 //! extracted from one function's body in source order.

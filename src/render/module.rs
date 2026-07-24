@@ -1,9 +1,9 @@
 //! Module-zoom renderer — `level=module --target=<X>`.
 //!
-//! Shows all items inside a target module as a Mermaid `subgraph`, plus
-//! external functions that call into the module (incoming) or are called
-//! from inside (outgoing). Edge labels carry the function name on each
-//! side.
+//! Shows all items inside a target module as a Mermaid `subgraph`, with
+//! call edges between items of the module (intra), plus external
+//! functions that call into the module (incoming) or are called from
+//! inside (outgoing).
 
 use crate::error::{AstToMermaidError, Result};
 use crate::model::EntityId;
@@ -11,7 +11,7 @@ use crate::render::AdjMaps;
 use crate::render::lookup::resolve_module;
 use crate::render::snapshot::AtomSnapshot;
 use crate::render::util::{escape_label_flowchart, sanitize_id};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fmt::Write as _;
 
 /// Render the module-zoom view of `target` against `snapshot`.
@@ -90,13 +90,16 @@ pub fn render(adj: &AdjMaps, snapshot: &AtomSnapshot<'_>, target: &str) -> Resul
 
     let mut outgoing: BTreeMap<(EntityId, EntityId), String> = BTreeMap::new(); // (inside, outside) → outside name
     let mut incoming: BTreeMap<(EntityId, EntityId), String> = BTreeMap::new(); // (outside, inside) → outside name
+    let mut intra: BTreeSet<(EntityId, EntityId)> = BTreeSet::new(); // (inside, inside)
 
     for item_id in &function_items {
         for callee_arc in adj.callees(item_id) {
             let callee_id: &EntityId = callee_arc;
-            if !inside_set.contains(callee_id)
-                && let Some(ext) = snapshot.get(callee_id)
-            {
+            if inside_set.contains(callee_id) {
+                // Both endpoints in the module: collected once from the
+                // callee side (the caller side would duplicate it).
+                intra.insert((item_id.clone(), callee_id.clone()));
+            } else if let Some(ext) = snapshot.get(callee_id) {
                 outgoing
                     .entry((item_id.clone(), callee_id.clone()))
                     .or_insert_with(|| ext.name.clone());
@@ -178,6 +181,11 @@ pub fn render(adj: &AdjMaps, snapshot: &AtomSnapshot<'_>, target: &str) -> Resul
         }
     }
 
+    for (from, to) in &intra {
+        let from_id = sanitize_id(from.as_str());
+        let to_id = sanitize_id(to.as_str());
+        writeln!(mermaid, "    {from_id} --> {to_id}").expect("string write is infallible");
+    }
     for (inside, outside) in outgoing.keys() {
         let from_id = sanitize_id(inside.as_str());
         let to_id = sanitize_id(outside.as_str());
@@ -342,7 +350,7 @@ mod tests {
     }
 
     #[test]
-    fn intra_module_calls_excluded_from_arrows() {
+    fn intra_module_calls_render_arrows() {
         let store = Store::new();
         build_module(
             &store,
@@ -351,13 +359,65 @@ mod tests {
         );
         let aid = EntityId::new("code:src/foo.rs::function::a");
         let bid = EntityId::new("code:src/foo.rs::function::b");
-        store.add_edge(Edge::new(aid, bid, EdgeKind::Calls));
+        store.add_edge(Edge::new(aid.clone(), bid.clone(), EdgeKind::Calls));
 
         let out = run(&store, "src/foo.rs").expect("render");
         assert!(out.contains("fn a\"]"));
         assert!(out.contains("fn b\"]"));
-        let arrows = out.matches("-->").count();
-        assert_eq!(arrows, 0, "expected no arrows, got {arrows}\n{out}");
+        let expected = format!(
+            "{} --> {}",
+            sanitize_id(aid.as_str()),
+            sanitize_id(bid.as_str())
+        );
+        assert!(out.contains(&expected), "intra edge missing in:\n{out}");
+        assert_eq!(out.matches("-->").count(), 1, "exactly one arrow:\n{out}");
+    }
+
+    #[test]
+    fn impl_method_calling_sibling_method_renders_intra_arrow() {
+        // Two methods under the same impl, one calling the other: the
+        // edge stays inside the module and must still be drawn.
+        let store = Store::new();
+        let m = module_atom("src/foo.rs", "foo");
+        store.add_atom(m.clone());
+        let impl_a = item_atom("src/foo.rs", "impl", "Foo");
+        let build = item_atom("src/foo.rs", "function", "Foo::build");
+        let update = item_atom("src/foo.rs", "function", "Foo::update");
+        store.add_edge(Edge::new(
+            m.id.clone(),
+            impl_a.id.clone(),
+            EdgeKind::Contains,
+        ));
+        store.add_edge(Edge::new(
+            impl_a.id.clone(),
+            build.id.clone(),
+            EdgeKind::Contains,
+        ));
+        store.add_edge(Edge::new(
+            impl_a.id.clone(),
+            update.id.clone(),
+            EdgeKind::Contains,
+        ));
+        store.add_edge(Edge::new(
+            build.id.clone(),
+            update.id.clone(),
+            EdgeKind::Calls,
+        ));
+        let (bid, uid) = (build.id.clone(), update.id.clone());
+        store.add_atom(impl_a);
+        store.add_atom(build);
+        store.add_atom(update);
+
+        let out = run(&store, "src/foo.rs").expect("render");
+        let expected = format!(
+            "{} --> {}",
+            sanitize_id(bid.as_str()),
+            sanitize_id(uid.as_str())
+        );
+        assert!(
+            out.contains(&expected),
+            "method intra edge missing in:\n{out}"
+        );
     }
 
     #[test]

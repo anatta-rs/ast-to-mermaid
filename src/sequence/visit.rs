@@ -526,6 +526,13 @@ fn field_receiver_root<'a>(node: &Node, source: &'a str, limit: usize) -> Option
                 let text = node_text(&current, source)?;
                 return text.split("::").next();
             }
+            // A literal receiver (`"msg".to_string()`, `1.5.sqrt()`) is a
+            // local value, not an actor — keep the call on the current
+            // lifeline instead of minting a participant out of the
+            // literal's text (whose quotes would also survive truncation
+            // unbalanced).
+            "string_literal" | "raw_string_literal" | "char_literal" | "integer_literal"
+            | "float_literal" | "boolean_literal" => return Some("self"),
             // identifier, self, or anything else — give up and use the
             // raw text. The caller caps overlong snippets.
             _ => return node_text(&current, source),
@@ -568,6 +575,11 @@ fn attribute_receiver_root<'a>(node: &Node, source: &'a str, limit: usize) -> Op
                     .find(|c| !matches!(c.kind(), "(" | ")"));
                 current = inner?;
             }
+            // Literal receiver (`", ".join(xs)`, `(1.5).hex()`) — same as
+            // the Rust twin: a local value, not an actor.
+            "string" | "concatenated_string" | "integer" | "float" | "true" | "false" | "none" => {
+                return Some("self");
+            }
             // identifier, self, or anything else — give up and use the raw
             // text. The caller caps overlong snippets.
             _ => return node_text(&current, source),
@@ -589,13 +601,7 @@ fn short_text(node: &Node, field: &str, source: &str) -> String {
         return String::new();
     };
     let raw = node_text(&child, source).unwrap_or("").trim();
-    let one_line: String = raw.split_whitespace().collect::<Vec<_>>().join(" ");
-    if one_line.chars().count() <= MAX {
-        one_line
-    } else {
-        let head: String = one_line.chars().take(MAX).collect();
-        format!("{head}…")
-    }
+    cap_at(raw, MAX)
 }
 
 /// Truncate a participant label so a giant fallback snippet (e.g. a
@@ -603,11 +609,23 @@ fn short_text(node: &Node, field: &str, source: &str) -> String {
 /// diagram up. Whitespace is collapsed too — labels are one-line.
 fn cap_label(s: &str) -> String {
     const MAX: usize = 24;
-    let one_line: String = s.split_whitespace().collect::<Vec<_>>().join(" ");
-    if one_line.chars().count() <= MAX {
+    cap_at(s, MAX)
+}
+
+/// Shared one-line + truncate helper for diagram labels. Double quotes
+/// become single quotes first: truncation can cut a snippet mid-string,
+/// and an unbalanced `"` in a participant alias or alt/loop header
+/// breaks the Mermaid parser.
+fn cap_at(s: &str, max: usize) -> String {
+    let one_line: String = s
+        .replace('"', "'")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if one_line.chars().count() <= max {
         one_line
     } else {
-        let head: String = one_line.chars().take(MAX).collect();
+        let head: String = one_line.chars().take(max).collect();
         format!("{head}…")
     }
 }
