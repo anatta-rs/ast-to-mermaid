@@ -244,7 +244,11 @@ mod tests {
         store.add_edge(Edge::new(m.id.clone(), free.id.clone(), EdgeKind::Contains));
         for name in ["new", "pdf", "cdf"] {
             let method = item_atom("src/beta.rs", "function", &format!("Beta::{name}"));
-            store.add_edge(Edge::new(i.id.clone(), method.id.clone(), EdgeKind::Contains));
+            store.add_edge(Edge::new(
+                i.id.clone(),
+                method.id.clone(),
+                EdgeKind::Contains,
+            ));
             store.add_atom(method);
         }
         store.add_atom(s);
@@ -262,10 +266,22 @@ mod tests {
         let m = module_atom("lib/translator.py", "translator");
         store.add_atom(m.clone());
         let class = item_atom("lib/translator.py", "struct", "Translator");
-        store.add_edge(Edge::new(m.id.clone(), class.id.clone(), EdgeKind::Contains));
+        store.add_edge(Edge::new(
+            m.id.clone(),
+            class.id.clone(),
+            EdgeKind::Contains,
+        ));
         for name in ["gettext", "load"] {
-            let method = item_atom("lib/translator.py", "function", &format!("Translator::{name}"));
-            store.add_edge(Edge::new(class.id.clone(), method.id.clone(), EdgeKind::Contains));
+            let method = item_atom(
+                "lib/translator.py",
+                "function",
+                &format!("Translator::{name}"),
+            );
+            store.add_edge(Edge::new(
+                class.id.clone(),
+                method.id.clone(),
+                EdgeKind::Contains,
+            ));
             store.add_atom(method);
         }
         store.add_atom(class);

@@ -364,7 +364,11 @@ mod tests {
         let out = run(&store, "src/foo.rs").expect("render");
         assert!(out.contains("fn a\"]"));
         assert!(out.contains("fn b\"]"));
-        let expected = format!("{} --> {}", sanitize_id(aid.as_str()), sanitize_id(bid.as_str()));
+        let expected = format!(
+            "{} --> {}",
+            sanitize_id(aid.as_str()),
+            sanitize_id(bid.as_str())
+        );
         assert!(out.contains(&expected), "intra edge missing in:\n{out}");
         assert_eq!(out.matches("-->").count(), 1, "exactly one arrow:\n{out}");
     }
@@ -379,18 +383,41 @@ mod tests {
         let impl_a = item_atom("src/foo.rs", "impl", "Foo");
         let build = item_atom("src/foo.rs", "function", "Foo::build");
         let update = item_atom("src/foo.rs", "function", "Foo::update");
-        store.add_edge(Edge::new(m.id.clone(), impl_a.id.clone(), EdgeKind::Contains));
-        store.add_edge(Edge::new(impl_a.id.clone(), build.id.clone(), EdgeKind::Contains));
-        store.add_edge(Edge::new(impl_a.id.clone(), update.id.clone(), EdgeKind::Contains));
-        store.add_edge(Edge::new(build.id.clone(), update.id.clone(), EdgeKind::Calls));
+        store.add_edge(Edge::new(
+            m.id.clone(),
+            impl_a.id.clone(),
+            EdgeKind::Contains,
+        ));
+        store.add_edge(Edge::new(
+            impl_a.id.clone(),
+            build.id.clone(),
+            EdgeKind::Contains,
+        ));
+        store.add_edge(Edge::new(
+            impl_a.id.clone(),
+            update.id.clone(),
+            EdgeKind::Contains,
+        ));
+        store.add_edge(Edge::new(
+            build.id.clone(),
+            update.id.clone(),
+            EdgeKind::Calls,
+        ));
         let (bid, uid) = (build.id.clone(), update.id.clone());
         store.add_atom(impl_a);
         store.add_atom(build);
         store.add_atom(update);
 
         let out = run(&store, "src/foo.rs").expect("render");
-        let expected = format!("{} --> {}", sanitize_id(bid.as_str()), sanitize_id(uid.as_str()));
-        assert!(out.contains(&expected), "method intra edge missing in:\n{out}");
+        let expected = format!(
+            "{} --> {}",
+            sanitize_id(bid.as_str()),
+            sanitize_id(uid.as_str())
+        );
+        assert!(
+            out.contains(&expected),
+            "method intra edge missing in:\n{out}"
+        );
     }
 
     #[test]

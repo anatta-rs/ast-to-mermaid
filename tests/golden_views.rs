@@ -336,17 +336,9 @@ fn rust_sequence_golden() {
     let src = fs::read(fixture("mini-rust").join("alpha.rs")).expect("read");
     let d = sequence::extract(&src, "alpha.rs", "describe", Language::Rust).expect("extract");
     let ids: BTreeSet<String> = d.participants.iter().map(|p| p.id.clone()).collect();
-    assert_eq!(
-        ids,
-        labels(&["self"]),
-        "participants: {:?}",
-        d.participants
-    );
+    assert_eq!(ids, labels(&["self"]), "participants: {:?}", d.participants);
     for p in &d.participants {
-        assert!(
-            !p.label.contains('"'),
-            "quote in participant label: {p:?}"
-        );
+        assert!(!p.label.contains('"'), "quote in participant label: {p:?}");
     }
     assert_balanced_quotes(&sequence::render(&d));
 }

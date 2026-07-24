@@ -577,8 +577,9 @@ fn attribute_receiver_root<'a>(node: &Node, source: &'a str, limit: usize) -> Op
             }
             // Literal receiver (`", ".join(xs)`, `(1.5).hex()`) — same as
             // the Rust twin: a local value, not an actor.
-            "string" | "concatenated_string" | "integer" | "float" | "true" | "false"
-            | "none" => return Some("self"),
+            "string" | "concatenated_string" | "integer" | "float" | "true" | "false" | "none" => {
+                return Some("self");
+            }
             // identifier, self, or anything else — give up and use the raw
             // text. The caller caps overlong snippets.
             _ => return node_text(&current, source),
