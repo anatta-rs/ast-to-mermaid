@@ -10,6 +10,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug fixes
 
+- *(diff)* Node labels use `fn name (file)` instead of the raw `code:<path>::<kind>::<name>` entity id; legacy bundles without a `name` field still fall back to the id ([#166](https://github.com/anatta-rs/ast-to-mermaid/issues/166))
+- *(dot)* `rankdir` emitted exactly once (the header default duplicated the per-graph directive, and preceded it stale for `BT`/`LR`/`RL` inputs) ([#166](https://github.com/anatta-rs/ast-to-mermaid/issues/166))
+- *(cli)* `a2m function --help` now documents that direct callees render alongside the reverse call chain ([#166](https://github.com/anatta-rs/ast-to-mermaid/issues/166))
 - *(overview)* Count impl-block and class methods in the per-module `fn` counters — modules whose functions all live in `impl` blocks reported a misleading "0 fn" ([#165](https://github.com/anatta-rs/ast-to-mermaid/issues/165))
 - *(sequence)* Literal receivers (`"msg".to_string()`, `", ".join(xs)`) stay on the `self` lifeline instead of minting a participant; double quotes in labels become single quotes so truncation can no longer leave an unbalanced `"` that breaks the Mermaid parser ([#164](https://github.com/anatta-rs/ast-to-mermaid/issues/164))
 - *(module)* Render intra-module call edges inside the subgraph — the help always promised "intra/cross-module calls" but only cross-module arrows were drawn ([#163](https://github.com/anatta-rs/ast-to-mermaid/issues/163))

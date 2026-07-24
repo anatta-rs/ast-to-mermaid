@@ -427,8 +427,7 @@ mod tests {
         for p in &d.participants {
             assert!(
                 !p.label.contains('"'),
-                "double quote left in participant label: {:?}",
-                p
+                "double quote left in participant label: {p:?}"
             );
         }
     }

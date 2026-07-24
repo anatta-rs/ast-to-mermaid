@@ -4,7 +4,7 @@
 //! a2m project  ./src                              # crate-level overview
 //! a2m overview ./src                              # module-level overview
 //! a2m module   ./src --target render/mod.rs       # one module, fully linked
-//! a2m function ./src --target analyze             # reverse call chain
+//! a2m function ./src --target analyze             # callers back + direct callees
 //! a2m impact   ./src --target analyze             # blast radius (3 hops)
 //! a2m sequence ./src --target run_diff            # statement-ordered Mermaid sequenceDiagram
 //! a2m walk     ./src                              # list source files
@@ -46,7 +46,8 @@ enum Command {
     Overview(AnalyzeFlags),
     /// Render a single module's items + intra/cross-module calls.
     Module(AnalyzeFlags),
-    /// Render a function's reverse call chain (who calls it, N hops back).
+    /// Render a function's reverse call chain (who calls it, N hops back)
+    /// plus its direct callees.
     Function(AnalyzeFlags),
     /// Render the impact graph for a target (forward + backward, 3 hops).
     Impact(AnalyzeFlags),

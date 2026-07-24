@@ -21,7 +21,9 @@ use std::fmt::Write as _;
 pub fn mermaid_to_dot(mermaid: &str) -> String {
     let mut out = String::with_capacity(mermaid.len() * 2);
     out.push_str("digraph G {\n");
-    out.push_str("  rankdir=TB;\n");
+    // No default rankdir here: the `graph <dir>` handler below emits the
+    // one true directive (DOT's own default is TB anyway), so the output
+    // never carries a duplicate or stale rankdir.
     out.push_str("  node [shape=box, fontsize=10, fontname=\"Helvetica\"];\n");
     out.push_str("  edge [fontsize=8];\n");
 
@@ -34,8 +36,8 @@ pub fn mermaid_to_dot(mermaid: &str) -> String {
             continue;
         }
 
-        // `graph TD|BT|LR|RL` → translate direction to DOT rankdir, override
-        // the default we emitted above. Unknown directions fall back to TB.
+        // `graph TD|BT|LR|RL` → translate direction to DOT rankdir.
+        // Unknown directions fall back to TB.
         if let Some(dir) = line.strip_prefix("graph ").map(str::trim) {
             let rankdir = match dir {
                 "BT" => "BT",
@@ -191,6 +193,18 @@ mod tests {
         assert!(mermaid_to_dot("graph BT\n").contains("rankdir=BT;"));
         assert!(mermaid_to_dot("graph LR\n").contains("rankdir=LR;"));
         assert!(mermaid_to_dot("graph RL\n").contains("rankdir=RL;"));
+    }
+
+    #[test]
+    fn rankdir_emitted_exactly_once() {
+        for dir in ["TD", "BT", "LR", "RL"] {
+            let out = mermaid_to_dot(&format!("graph {dir}\n    a[\"A\"]\n"));
+            assert_eq!(
+                out.matches("rankdir=").count(),
+                1,
+                "duplicate rankdir for {dir}: {out}"
+            );
+        }
     }
 
     #[test]

@@ -123,25 +123,25 @@ graph TD
     classDef modified fill:#fb8,stroke:#d60,color:#000
     classDef renamed fill:#9ff,stroke:#0aa,color:#000
     %% added (11)
-    n0["parser/mod.rs::function::collect_use_paths"]:::added
-    n1["parser/mod.rs::function::extract_use_imports"]:::added
-    n2["resolve.rs::function::file_module_name"]:::added
-    n3["resolve.rs::function::split_call_name"]:::added
-    n4["tests/cross_module_resolution.rs"]:::added
-    n5["tests/…::bare_call_to_unique_name_still_resolves"]:::added
-    n6["tests/…::build_store"]:::added
-    n7["tests/…::qualified_inline_calls_dispatch_to_correct_sibling_module"]:::added
-    n8["tests/…::use_import_resolves_to_mod_dot_rs_when_name_is_ambiguous"]:::added
+    n0["fn collect_use_paths (parser/mod.rs)"]:::added
+    n1["fn extract_use_imports (parser/mod.rs)"]:::added
+    n2["fn file_module_name (resolve.rs)"]:::added
+    n3["fn split_call_name (resolve.rs)"]:::added
+    n4["mod cross_module_resolution (tests/cross_module_resolution.rs)"]:::added
+    n5["fn bare_call_to_unique_name_still_resolves (tests/cross_module_resolution.rs)"]:::added
+    n6["fn build_store (tests/cross_module_resolution.rs)"]:::added
+    n7["fn qualified_inline_calls_dispatch_to_correct_sibling_module (tests/cross_module_resolution.rs)"]:::added
+    n8["fn use_import_resolves_to_mod_dot_rs_when_name_is_ambiguous (tests/cross_module_resolution.rs)"]:::added
     n9["extern:fs::read"]:::added
     n10["extern:tempfile::tempdir"]:::added
     %% modified (7)
-    n11["parser/mod.rs"]:::modified
-    n12["parser/mod.rs::function::CodeParser::parse_into"]:::modified
-    n13["parser/mod.rs::function::extract_calls"]:::modified
-    n14["parser/mod.rs::function::extract_item"]:::modified
-    n15["parser/mod.rs::impl::CodeParser"]:::modified
-    n16["resolve.rs"]:::modified
-    n17["resolve.rs::function::resolve_cross_module_calls"]:::modified
+    n11["mod parser (parser/mod.rs)"]:::modified
+    n12["fn CodeParser::parse_into (parser/mod.rs)"]:::modified
+    n13["fn extract_calls (parser/mod.rs)"]:::modified
+    n14["fn extract_item (parser/mod.rs)"]:::modified
+    n15["impl CodeParser (parser/mod.rs)"]:::modified
+    n16["mod resolve (resolve.rs)"]:::modified
+    n17["fn resolve_cross_module_calls (resolve.rs)"]:::modified
     %% blast-radius edges (both endpoints in changeset)
     n12 --> n1
     n12 --> n14
