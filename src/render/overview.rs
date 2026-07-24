@@ -66,6 +66,18 @@ pub fn render(adj: &AdjMaps, snapshot: &AtomSnapshot<'_>) -> String {
         for child_arc in adj.children(&m.id) {
             if let Some(child) = snapshot.get(child_arc) {
                 entry.1.bump(&child.kind);
+                // Methods live one `Contains` level down, under a Rust
+                // `impl` block or a class-like `struct` (Python) — count
+                // them as functions, same descent as the module view.
+                if matches!(child.kind.as_str(), "impl" | "struct") {
+                    for method_arc in adj.children(child_arc) {
+                        if let Some(method) = snapshot.get(method_arc)
+                            && method.kind == "function"
+                        {
+                            entry.1.functions += 1;
+                        }
+                    }
+                }
             }
         }
     }
@@ -215,6 +227,51 @@ mod tests {
         assert!(out.contains("lib — 2 fn"));
         assert!(!out.contains("struct"));
         assert!(!out.contains("trait"));
+    }
+
+    #[test]
+    fn impl_methods_counted_as_functions() {
+        // 1 free fn + an impl with 3 methods → 4 fn. The struct the impl
+        // targets is counted once as a struct.
+        let store = Store::new();
+        let m = module_atom("src/beta.rs", "beta");
+        store.add_atom(m.clone());
+        let s = item_atom("src/beta.rs", "struct", "Beta");
+        let i = item_atom("src/beta.rs", "impl", "Beta");
+        let free = item_atom("src/beta.rs", "function", "helper");
+        store.add_edge(Edge::new(m.id.clone(), s.id.clone(), EdgeKind::Contains));
+        store.add_edge(Edge::new(m.id.clone(), i.id.clone(), EdgeKind::Contains));
+        store.add_edge(Edge::new(m.id.clone(), free.id.clone(), EdgeKind::Contains));
+        for name in ["new", "pdf", "cdf"] {
+            let method = item_atom("src/beta.rs", "function", &format!("Beta::{name}"));
+            store.add_edge(Edge::new(i.id.clone(), method.id.clone(), EdgeKind::Contains));
+            store.add_atom(method);
+        }
+        store.add_atom(s);
+        store.add_atom(i);
+        store.add_atom(free);
+
+        let out = run(&store);
+        assert!(out.contains("beta — 4 fn, 1 struct"), "got: {out}");
+    }
+
+    #[test]
+    fn python_class_methods_counted_as_functions() {
+        // A Python class is a `struct` atom with `function` children.
+        let store = Store::new();
+        let m = module_atom("lib/translator.py", "translator");
+        store.add_atom(m.clone());
+        let class = item_atom("lib/translator.py", "struct", "Translator");
+        store.add_edge(Edge::new(m.id.clone(), class.id.clone(), EdgeKind::Contains));
+        for name in ["gettext", "load"] {
+            let method = item_atom("lib/translator.py", "function", &format!("Translator::{name}"));
+            store.add_edge(Edge::new(class.id.clone(), method.id.clone(), EdgeKind::Contains));
+            store.add_atom(method);
+        }
+        store.add_atom(class);
+
+        let out = run(&store);
+        assert!(out.contains("translator — 2 fn, 1 struct"), "got: {out}");
     }
 
     #[test]
