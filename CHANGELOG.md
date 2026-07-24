@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug fixes
 
+- *(sequence)* Literal receivers (`"msg".to_string()`, `", ".join(xs)`) stay on the `self` lifeline instead of minting a participant; double quotes in labels become single quotes so truncation can no longer leave an unbalanced `"` that breaks the Mermaid parser ([#164](https://github.com/anatta-rs/ast-to-mermaid/issues/164))
 - *(module)* Render intra-module call edges inside the subgraph — the help always promised "intra/cross-module calls" but only cross-module arrows were drawn ([#163](https://github.com/anatta-rs/ast-to-mermaid/issues/163))
 - *(impact)* [**breaking output**] Emit forward (callee) edges alongside the backward walk — the help always promised "forward + backward, 3 hops" but only callers were rendered; header goes `graph BT` → `graph TD` ([#162](https://github.com/anatta-rs/ast-to-mermaid/issues/162))
 
