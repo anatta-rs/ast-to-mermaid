@@ -81,13 +81,14 @@ Every entry point converging on one impacted function above it, everything a cha
 
 ### Dispatcher: `a2m module ./src --target render/mod.rs`
 
-`render::render` is one function name shared by **six** modules. The resolver disambiguates via `use` imports + qualified call paths, so the dispatch fan-out and the two real callers land on the right node. Methods inside `impl` blocks are first-class too — addressable via `--target Type::method` (e.g. `--target HnswBuilder::build`) without spelling out generic params:
+`render::render` is one function name shared by **six** modules. The resolver disambiguates via `use` imports + qualified call paths, so the dispatch fan-out and the two real callers land on the right node. Calls that stay inside the module (`render → require_target`) are drawn within the subgraph; methods inside `impl` blocks are first-class too — addressable via `--target Type::method` (e.g. `--target HnswBuilder::build`) without spelling out generic params:
 
 ```mermaid
 graph TD
     subgraph render_mod["render/mod.rs"]
         level(enum Level)
         render["fn render"]
+        render_in_store["fn render_in_store"]
         require_target["fn require_target"]
     end
     function_render(["render"])
@@ -97,6 +98,8 @@ graph TD
     project_render(["render"])
     emit_artifacts(["emit_artifacts"])
     analyze(["analyze"])
+    render --> require_target
+    render_in_store --> render
     render --> function_render
     render --> impact_render
     render --> module_render

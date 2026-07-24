@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug fixes
 
+- *(module)* Render intra-module call edges inside the subgraph — the help always promised "intra/cross-module calls" but only cross-module arrows were drawn ([#163](https://github.com/anatta-rs/ast-to-mermaid/issues/163))
 - *(impact)* [**breaking output**] Emit forward (callee) edges alongside the backward walk — the help always promised "forward + backward, 3 hops" but only callers were rendered; header goes `graph BT` → `graph TD` ([#162](https://github.com/anatta-rs/ast-to-mermaid/issues/162))
 
 ## [0.6.0](https://github.com/anatta-rs/ast-to-mermaid/compare/v0.5.1...v0.6.0) - 2026-05-05
