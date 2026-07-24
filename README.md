@@ -48,12 +48,11 @@ graph TD
 
 ### Convergence: `a2m impact ./src --target parse_phase`
 
-How does a change to `pipeline::parse_phase` ripple outward? It's an internal helper called by both `analyze` and `bundle`, which means **every** subcommand that hits the parse loop reaches it — through five different cli_support handlers, with `run_diff` taking a two-hop detour via `ensure_indexed`:
+How does a change to `pipeline::parse_phase` ripple? Both ways. Backward: it's an internal helper called by both `analyze` and `bundle`, which means **every** subcommand that hits the parse loop reaches it — with `run_diff` taking a two-hop detour via `ensure_indexed`. Forward: it fans out into the per-file parse machinery, down to the language frontends:
 
 ```mermaid
-graph BT
+graph TD
     parse_phase(("fn parse_phase (impacted)"))
-    main["main"]
     run_analyze["run_analyze"]
     run_bundle["run_bundle"]
     run_index["run_index"]
@@ -61,9 +60,10 @@ graph BT
     ensure_indexed["ensure_indexed"]
     analyze["analyze"]
     bundle["bundle"]
-    main --> run_analyze
-    main --> run_bundle
-    main --> run_index
+    parse_one_file["parse_one_file"]
+    apply_unit["apply_unit"]
+    parser_rust["CodeParser::rust"]
+    parser_python["CodeParser::python"]
     run_analyze --> analyze
     run_bundle --> bundle
     run_index --> bundle
@@ -71,9 +71,13 @@ graph BT
     ensure_indexed --> bundle
     analyze --> parse_phase
     bundle --> parse_phase
+    parse_phase --> parse_one_file
+    parse_phase --> apply_unit
+    parse_one_file --> parser_rust
+    parse_one_file --> parser_python
 ```
 
-Five entry points, two private helpers, all converging on one impacted function. The kind of blast radius that turns "is it safe to refactor this?" into a 10-second answer.
+Every entry point converging on one impacted function above it, everything a change can break laid out below it. The kind of blast radius that turns "is it safe to refactor this?" into a 10-second answer.
 
 ### Dispatcher: `a2m module ./src --target render/mod.rs`
 
