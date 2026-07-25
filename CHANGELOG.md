@@ -8,6 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.1](https://github.com/anatta-rs/ast-to-mermaid/compare/v0.7.0...v0.7.1) - 2026-07-25
+
+### Bug fixes
+
+- *(sequence)* Emit lexer-safe labels for older Mermaid parsers: `&` → `&amp;` in sequence labels (symmetry with the existing `<`/`>` escapes) and ASCII `...` instead of the Unicode ellipsis in truncated alt/loop headers and the depth-limit marker. Not reproducible with mermaid ≥ 11.16, kept as defense for embedded/older renderers ([#156](https://github.com/anatta-rs/ast-to-mermaid/issues/156))
+
 ## [0.7.0](https://github.com/anatta-rs/ast-to-mermaid/compare/v0.6.0...v0.7.0) - 2026-07-24
 
 ### Features

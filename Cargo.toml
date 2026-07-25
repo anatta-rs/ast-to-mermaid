@@ -1,7 +1,7 @@
 [package]
 name = "ast-to-mermaid"
 description = "Git-aware tree-sitter-based code-graph builder. Emits Mermaid diagrams at five zoom levels, materializes per-commit bundles into a content-addressed cache, and computes coloured structural diffs between any two refs. Single binary `a2m` with ten subcommands."
-version = "0.7.0"
+version = "0.7.1"
 edition = "2024"
 rust-version = "1.88"
 authors = ["Anatta <noreply@anatta.dev>"]

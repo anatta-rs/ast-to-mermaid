@@ -340,7 +340,9 @@ fn rust_sequence_golden() {
     for p in &d.participants {
         assert!(!p.label.contains('"'), "quote in participant label: {p:?}");
     }
-    assert_balanced_quotes(&sequence::render(&d));
+    let rendered = sequence::render(&d);
+    assert_balanced_quotes(&rendered);
+    assert_no_raw_sequence_breakers(&rendered);
 }
 
 #[test]
@@ -356,7 +358,27 @@ fn python_sequence_golden() {
         "participants: {:?}",
         d.participants
     );
-    assert_balanced_quotes(&sequence::render(&d));
+    let rendered = sequence::render(&d);
+    assert_balanced_quotes(&rendered);
+    assert_no_raw_sequence_breakers(&rendered);
+}
+
+/// The two #156 lexer-breakers: Unicode ellipsis and raw `&` outside an
+/// entity reference. Neither may appear on any line the Mermaid parser
+/// reads (`%%` comment lines are ignored by the parser and may carry the
+/// verbatim signature).
+fn assert_no_raw_sequence_breakers(rendered: &str) {
+    for line in rendered.lines() {
+        if line.trim_start().starts_with("%%") {
+            continue;
+        }
+        assert!(!line.contains('…'), "unicode ellipsis: {line}");
+        let stripped = line
+            .replace("&amp;", "")
+            .replace("&lt;", "")
+            .replace("&gt;", "");
+        assert!(!stripped.contains('&'), "raw ampersand: {line}");
+    }
 }
 
 // -------------------------------------------------------------------- diff

@@ -143,6 +143,9 @@ pub fn escape_label_flowchart(s: &str) -> String {
 /// reserved for Mermaid HTML entity references inside labels. Newlines
 /// would split the label across lines and break the diagram entirely.
 ///
+/// - `&` → `&amp;` — a raw `&` in an `alt`/`loop` header derails older
+///   sequence lexers (#156); escaped first conceptually, but the char
+///   loop never rescans its own output so ordering is moot.
 /// - `<` → `&lt;`, `>` → `&gt;` so HTML-like fragments render as text.
 /// - `#` → `_` so HTML entity refs aren't accidentally introduced.
 /// - newlines → space.
@@ -153,6 +156,7 @@ pub fn escape_label_sequence(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
         match c {
+            '&' => out.push_str("&amp;"),
             '<' => out.push_str("&lt;"),
             '>' => out.push_str("&gt;"),
             '#' => out.push('_'),
@@ -324,6 +328,17 @@ mod tests {
         assert_eq!(escape_label_sequence("first\nsecond"), "first second");
         assert_eq!(escape_label_sequence("first\rsecond"), "first second");
         assert_eq!(escape_label_sequence(""), "");
+    }
+
+    #[test]
+    fn escape_label_sequence_escapes_ampersand() {
+        assert_eq!(
+            escape_label_sequence("a.cmp(&b) & mask"),
+            "a.cmp(&amp;b) &amp; mask"
+        );
+        // Angle escapes emit their own `&` after the input `&` is handled;
+        // the single-pass loop must not double-escape them.
+        assert_eq!(escape_label_sequence("&x <= y"), "&amp;x &lt;= y");
     }
 
     #[test]

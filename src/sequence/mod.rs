@@ -443,6 +443,29 @@ mod tests {
     }
 
     #[test]
+    fn truncated_alt_header_with_ampersand_renders_parseable_mermaid() {
+        // The #156 shape: a long `if` condition containing `&`, truncated
+        // by the header cap. The rendered header must carry `&amp;` and an
+        // ASCII `...` — the Unicode ellipsis and a raw `&` derail older
+        // Mermaid sequence lexers.
+        let d = extract_ok(
+            "fn run(items: &Vec<u64>, mask: &u64) {\n    if items.iter().filter(|x| *x & mask == other_long_name).count() >= 10 {\n        compute();\n    }\n}\n",
+            "run",
+        );
+        let out = render::render(&d);
+        assert!(!out.contains('…'), "unicode ellipsis in output:\n{out}");
+        let alt_line = out
+            .lines()
+            .find(|l| l.trim_start().starts_with("alt "))
+            .expect("alt header");
+        assert!(alt_line.contains("&amp;"), "raw & in header: {alt_line}");
+        assert!(
+            alt_line.contains("..."),
+            "no ASCII truncation marker: {alt_line}"
+        );
+    }
+
+    #[test]
     fn await_marked() {
         let d = extract_ok("async fn run() { fetch().await; }\n", "run");
         let Step::Call { is_await, .. } = &d.steps[0] else {
