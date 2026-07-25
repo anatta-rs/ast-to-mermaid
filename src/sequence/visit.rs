@@ -20,7 +20,9 @@ use tree_sitter::Node;
 /// Marker text emitted into the diagram (sequence note / mermaid note)
 /// when a visitor short-circuits at the depth cap. Kept as a single
 /// shared string so the diff/CI snapshots can match on it verbatim.
-pub(super) const DEPTH_LIMIT_LABEL: &str = "…depth limit…";
+/// ASCII on purpose — older Mermaid sequence lexers reject the Unicode
+/// ellipsis (#156).
+pub(super) const DEPTH_LIMIT_LABEL: &str = "...depth limit...";
 
 /// Mutable visitor state — collects participants in first-appearance order
 /// and the flat step list (control-flow blocks recurse into their own).
@@ -615,7 +617,9 @@ fn cap_label(s: &str) -> String {
 /// Shared one-line + truncate helper for diagram labels. Double quotes
 /// become single quotes first: truncation can cut a snippet mid-string,
 /// and an unbalanced `"` in a participant alias or alt/loop header
-/// breaks the Mermaid parser.
+/// breaks the Mermaid parser. The truncation marker is ASCII `...` —
+/// older Mermaid sequence lexers reject the Unicode ellipsis in alt/loop
+/// headers (#156).
 fn cap_at(s: &str, max: usize) -> String {
     let one_line: String = s
         .replace('"', "'")
@@ -626,7 +630,7 @@ fn cap_at(s: &str, max: usize) -> String {
         one_line
     } else {
         let head: String = one_line.chars().take(max).collect();
-        format!("{head}…")
+        format!("{head}...")
     }
 }
 
