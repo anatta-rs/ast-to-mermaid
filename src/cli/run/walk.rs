@@ -1,7 +1,7 @@
 use super::check_ref_arg;
 use crate::cli::flags::{ExitCode, WalkFlags};
 use crate::cli::format::parse_csv_exclude;
-use crate::pipeline::{language_for, walk_for_languages_with_exclude};
+use crate::pipeline::{language_for, walk_for_languages_with_opts};
 
 /// Run the file-walker subcommand: print one line per source file, format
 /// `<lang>\t<path>`, to stdout.
@@ -14,7 +14,7 @@ pub fn run_walk(flags: &WalkFlags) -> ExitCode {
     }
     let exclude = parse_csv_exclude(&flags.exclude);
 
-    match walk_for_languages_with_exclude(&flags.path, &exclude) {
+    match walk_for_languages_with_opts(&flags.path, &exclude, flags.include_generated) {
         Ok(files) => {
             for (path, lang) in files {
                 println!("{}\t{}", lang.name(), path.display());
@@ -93,6 +93,7 @@ mod tests {
         let flags = WalkFlags {
             path: tmp.path().to_path_buf(),
             exclude: String::new(),
+            include_generated: false,
             r#ref: None,
         };
         assert_eq!(run_walk(&flags), ExitCode::Success);
@@ -105,6 +106,7 @@ mod tests {
         let flags = WalkFlags {
             path: PathBuf::from("/no/such/path/here-cli-test"),
             exclude: String::new(),
+            include_generated: false,
             r#ref: None,
         };
         assert_eq!(run_walk(&flags), ExitCode::Success);
@@ -122,6 +124,7 @@ mod tests {
         let flags = WalkFlags {
             path: tmp.path().to_path_buf(),
             exclude: String::new(),
+            include_generated: false,
             r#ref: Some("HEAD".into()),
         };
         assert_eq!(run_walk(&flags), ExitCode::Success);
@@ -133,6 +136,7 @@ mod tests {
         let flags = WalkFlags {
             path: tmp.path().to_path_buf(),
             exclude: String::new(),
+            include_generated: false,
             r#ref: Some("HEAD".into()),
         };
         assert_eq!(run_walk(&flags), ExitCode::Failure);
@@ -145,6 +149,7 @@ mod tests {
         let flags = WalkFlags {
             path: tmp.path().to_path_buf(),
             exclude: String::new(),
+            include_generated: false,
             r#ref: Some("definitely-not-a-ref".into()),
         };
         assert_eq!(run_walk(&flags), ExitCode::Failure);
@@ -180,6 +185,7 @@ mod tests {
         let flags = WalkFlags {
             path: tmp.path().to_path_buf(),
             exclude: "vendor".into(),
+            include_generated: false,
             r#ref: None,
         };
         assert_eq!(run_walk(&flags), ExitCode::Success);

@@ -440,7 +440,17 @@ Anything else is silently skipped during the walk. The parser is **query-driven*
 
 Where a grammar disagrees with the others about *which field holds a label* — a `for`'s iterable is `value` in Rust, `right` in Python, and `value` again in Dart under Python's own `for_statement` kind — that read lives behind the `SeqLang` trait rather than in the walker. The rule when adding a fourth language: **if your handler reads a field name to build a label it belongs in `SeqLang`; if it only descends or emits a call it stays in the walker.**
 
-Generated Dart (`.g.dart`, `.freezed.dart`, `.mocks.dart`, `.gr.dart`) is skipped by default — it was 27 % of the bytes on the reference corpus and carries no architectural signal.
+Generated Dart (`.g.dart`, `.freezed.dart`, `.mocks.dart`, `.gr.dart`) is skipped by default — it was 27 % of the bytes on the reference corpus and carries no architectural signal. Pass `--include-generated` to opt it back in, e.g. to audit what a generator actually emitted:
+
+```bash
+$ a2m overview lib/
+%% analyzed 98 files, 2920 atoms, 66 cross-module edges
+
+$ a2m overview lib/ --include-generated
+%% analyzed 120 files, 5544 atoms, 66 cross-module edges
+```
+
+Available on `project` / `overview` / `module` / `function` / `impact`, plus `walk`, `bundle` and `sequence`.
 
 ## Use as a library
 
@@ -527,7 +537,7 @@ It earns its place: `mmdc` catches diagrams that lint clean but fail to render, 
 
 `v0.8.0` — git-aware, three languages. Eleven subcommands (seven render levels + `walk` / `index` / `diff` / `gc`), library API, artifact bundle, two-tier content-addressed cache keyed by git blob SHA-1. Tested on Rust crates from 6 to 1 463 files (rust-analyzer) and on Flutter projects up to 261 files; see [`docs/perf/2026-05-01-resolve-cost-baseline.md`](./docs/perf/2026-05-01-resolve-cost-baseline.md) for benchmarks.
 
-Future work: parallel parse loop (`rayon`) for the cold path on large monorepos, optional V2 edge-level cache if `--trace=info` shows resolve-phase exceeding 30% of wall on real workloads (currently ≤ 7% even at rust-analyzer scale), a `--include-generated` flag to opt generated Dart back in, and merging Dart `part` / `part_of` files into their parent library.
+Future work: parallel parse loop (`rayon`) for the cold path on large monorepos, optional V2 edge-level cache if `--trace=info` shows resolve-phase exceeding 30% of wall on real workloads (currently ≤ 7% even at rust-analyzer scale), and merging Dart `part` / `part_of` files into their parent library.
 
 ## Examples (real output from this repo)
 

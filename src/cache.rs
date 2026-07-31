@@ -108,9 +108,26 @@ struct BlobEnvelope<'a> {
 /// `find_atom` shared across the ingester parse-test files, etc.).
 const SCHEMA_VERSION: u32 = 6;
 
-/// Grammar version. Bump when `tree-sitter-rust` or `tree-sitter-python`
-/// is updated in `Cargo.toml`. Forces a cold reparse on next run.
-const GRAMMAR_VERSION: u32 = 1;
+/// Grammar version. Forces a cold reparse on next run.
+///
+/// Bump on **either** of:
+/// - a `tree-sitter-*` dependency changing in `Cargo.toml` (including a
+///   new language);
+/// - the extractors themselves changing what they emit for unchanged
+///   source — new node kinds handled, a receiver classified differently,
+///   a call site that used to be dropped now surfacing.
+///
+/// The second case is the one that bites. Blobs are keyed by content, so
+/// an unchanged file is served from cache no matter how much the parser
+/// improved underneath. `a2m={CARGO_PKG_VERSION}` in the version string
+/// papers over it for released builds, but not during development, where
+/// the version is pinned across many commits — exactly when the
+/// extractors move most.
+///
+/// `2`: Dart support (#170). Added `tree-sitter-dart`, and across #171 to
+/// #175 changed what the parser emits for Rust and Python files too
+/// (`declared_name` is shared by all three).
+const GRAMMAR_VERSION: u32 = 2;
 
 /// Compute the cache version string written to `<root>/version`.
 fn cache_version() -> String {

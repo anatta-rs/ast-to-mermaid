@@ -2,7 +2,7 @@ use super::check_ref_arg;
 use crate::cli::flags::{ExitCode, SequenceFlags};
 use crate::cli::format::parse_csv_exclude;
 use crate::parser::Language;
-use crate::pipeline::{language_for, walk_for_languages_with_exclude};
+use crate::pipeline::{is_generated_dart, language_for, walk_for_languages_with_opts};
 use crate::sequence;
 use std::path::Path;
 
@@ -25,7 +25,12 @@ pub fn run_sequence(flags: &SequenceFlags) -> ExitCode {
     }
     let exclude = parse_csv_exclude(&flags.exclude);
 
-    let candidates = match collect_sources(&flags.path, &exclude, flags.r#ref.as_deref()) {
+    let candidates = match collect_sources(
+        &flags.path,
+        &exclude,
+        flags.r#ref.as_deref(),
+        flags.include_generated,
+    ) {
         Ok(v) => v,
         Err(e) => {
             eprintln!("sequence: collect sources {}: {e}", flags.path.display());
@@ -203,6 +208,7 @@ fn collect_sources(
     root: &Path,
     exclude: &[String],
     git_ref: Option<&str>,
+    include_generated: bool,
 ) -> Result<Vec<Source>, crate::error::AstToMermaidError> {
     if let Some(git_ref) = git_ref {
         let toplevel = crate::git_source::show_toplevel(root)?;
@@ -213,15 +219,22 @@ fn collect_sources(
         let mut reader = crate::git_source::BatchReader::spawn(&toplevel)?;
         let mut out = Vec::new();
         for entry in entries {
-            let Some(lang) = language_for(Path::new(&entry.path)) else {
+            let entry_path = Path::new(&entry.path);
+            let Some(lang) = language_for(entry_path) else {
                 continue;
             };
+            // The worktree branch below filters generated Dart; without
+            // this the same tree would yield different diagrams depending
+            // on whether `--ref` was passed.
+            if !include_generated && is_generated_dart(entry_path) {
+                continue;
+            }
             let content = reader.read_blob(&entry.blob_sha)?;
             out.push((entry.path, content, lang));
         }
         Ok(out)
     } else {
-        let files = walk_for_languages_with_exclude(root, exclude)?;
+        let files = walk_for_languages_with_opts(root, exclude, include_generated)?;
         let mut out = Vec::new();
         for (path, lang) in files {
             let content = std::fs::read(&path)?;
@@ -248,6 +261,7 @@ mod tests {
             target: target.map(str::to_owned),
             all: false,
             exclude: String::new(),
+            include_generated: false,
             out: None,
             r#ref: None,
         }
