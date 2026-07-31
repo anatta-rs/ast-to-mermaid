@@ -1,0 +1,66 @@
+# repolith orchestrating this repository's dev environment.
+#
+#   repolith status                    # what's stale, runs nothing
+#   repolith sync --dry-run --explain  # why it's stale
+#   repolith sync                      # do it
+#
+# Scope is this repository only. Sibling stacks in anatta-rs keep their own
+# `repolith.toml`; a parent manifest one level up can pull them all together
+# with `kind = "repolith"` nodes.
+
+[orchestrator]
+schema_version = "0.1"
+name = "ast-to-mermaid-dev"
+
+# The crate installs its own CLI. `crate` is the *binary* name — the package
+# is `ast-to-mermaid`, the binary it ships is `a2m` (see `[[bin]]` in
+# Cargo.toml), and cargo-install keys on the binary.
+#
+# No `git`, so cargo builds from the local checkout rather than the remote:
+# `repolith sync` after a change reinstalls what you just wrote, which is the
+# point of having this node at all.
+[[node]]
+id = "a2m"
+path = "."
+
+  [[node.action]]
+  kind = "cargo-install"
+  crate = "a2m"
+  install_to = "~/.cargo"      # → ~/.cargo/bin/a2m, already on PATH
+
+# Coverage. `make coverage` and the `coverage (>= 85%)` CI job both shell out
+# to `cargo llvm-cov`; without it the gate cannot be reproduced locally, and
+# the Makefile fails with a bare "command not found".
+[[node]]
+id = "cargo-llvm-cov"
+git = "https://github.com/taiki-e/cargo-llvm-cov"
+
+  [[node.action]]
+  kind = "cargo-install"
+  crate = "cargo-llvm-cov"
+  install_to = "~/.cargo"
+
+# release-plz runs semver checks on every release PR (`semver_check = true`
+# in release-plz.toml) and warns on each run when the tool is absent.
+#
+# `package` is what makes this node work: the repository ships several
+# packages with binaries (test fixtures) and cargo refuses to guess between
+# them. `package` selects it; `crate` still names the binary target.
+#
+# Heads-up: long build the first time (large dependency tree).
+[[node]]
+id = "cargo-semver-checks"
+git = "https://github.com/obi1kenobi/cargo-semver-checks"
+
+  [[node.action]]
+  kind = "cargo-install"
+  package = "cargo-semver-checks"
+  crate = "cargo-semver-checks"
+  install_to = "~/.cargo"
+
+# Not covered here: `@mermaid-js/mermaid-cli` (`mmdc`), which the
+# `mermaid syntax (mmdc)` CI job installs with npm. repolith's actions are
+# `git-clone` / `cargo-install` / `docker` / `repolith` — there is no npm
+# kind, so that one stays a manual `npm install -g @mermaid-js/mermaid-cli`.
+# It matters locally: `mmdc` is what catches a diagram that lints clean but
+# fails to render.

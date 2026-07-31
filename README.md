@@ -1,6 +1,24 @@
+<div align="center">
+
 # ast-to-mermaid
 
+**Git-aware code-graph builder that turns a source tree into Mermaid diagrams.**
+
+🌳 Rust · Python · Dart · 🔍 Five zoom levels · 💾 Cache-first
+
+[![CI](https://img.shields.io/github/actions/workflow/status/anatta-rs/ast-to-mermaid/ci.yml?branch=main&label=CI&logo=github)](https://github.com/anatta-rs/ast-to-mermaid/actions/workflows/ci.yml)
+[![crates.io](https://img.shields.io/crates/v/ast-to-mermaid?logo=rust&label=crates.io)](https://crates.io/crates/ast-to-mermaid)
+[![docs.rs](https://img.shields.io/docsrs/ast-to-mermaid?logo=docsdotrs&label=docs.rs)](https://docs.rs/ast-to-mermaid)
+[![Downloads](https://img.shields.io/crates/d/ast-to-mermaid?label=downloads)](https://crates.io/crates/ast-to-mermaid)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
+[![Rust](https://img.shields.io/badge/rust-1.88%2B-orange?logo=rust)](https://www.rust-lang.org/)
+[![PRs welcome](https://img.shields.io/badge/PRs-welcome-brightgreen)](CONTRIBUTING.md)
+
+</div>
+
 Tree-sitter-based code-graph builder that emits [Mermaid](https://mermaid.js.org/) diagrams at five zoom levels (project / overview / module / function / impact), plus a per-function `sequenceDiagram` view and a JSON artifact bundle suitable for downstream graph stores. **Git-aware**: render the graph at any ref, materialize per-commit bundles, diff structural changes between branches.
+
+Supports **Rust, Python and Dart**.
 
 Self-contained Rust crate. **No database, no graph backend, no async runtime, no in-house framework coupling** — just tree-sitter, serde, clap, plus the usual error/log helpers. Drop a path in, get a Mermaid string (or a directory of `.mmd` + `.meta.json` artifacts) out.
 
@@ -171,7 +189,7 @@ The shape of the graph is the shape of the change. A pure bug fix would have one
 
 ### Order of operations: `a2m sequence ./src --target <fn>`
 
-The other five views are unordered call graphs — they tell you *who calls whom*, not *in what order*. `a2m sequence` walks one function body in source order and emits a Mermaid `sequenceDiagram`: lifelines per receiver, arrows per call, control flow lifted into `alt` / `loop` blocks. It works on both Rust and Python — `for`/`while`/`if`/`match` lift to `loop`/`alt`, and both Rust's postfix `.await` and Python's prefix `await` mark the async arrow. Take `dir_size_recursive` from this repo's cache module — 12 lines of Rust, a tree walk:
+The other five views are unordered call graphs — they tell you *who calls whom*, not *in what order*. `a2m sequence` walks one function body in source order and emits a Mermaid `sequenceDiagram`: lifelines per receiver, arrows per call, control flow lifted into `alt` / `loop` blocks. It works on Rust, Python and Dart — `for`/`while`/`if`/`match`/`switch` lift to `loop`/`alt`, and postfix `.await` (Rust) as well as prefix `await` (Python, Dart) mark the async arrow. Dart cascades (`obj..a()..b()`) emit one call per link, and closures stay transparent: a call inside `items.forEach((e) { … })` is attributed to the enclosing function rather than a lifeline of its own. Take `dir_size_recursive` from this repo's cache module — 12 lines of Rust, a tree walk:
 
 ```rust
 fn dir_size_recursive(dir: &Path) -> Result<u64> {
@@ -416,8 +434,13 @@ The `hits` / `misses` counters tell you exactly how much work the atom cache sav
 
 - **Rust** — `tree-sitter-rust`
 - **Python** — `tree-sitter-python`
+- **Dart** — `tree-sitter-dart`
 
-Anything else is silently skipped during the walk. The parser is **query-driven**: each supported language gets a small set of `.scm` tree-sitter query files in `src/parser/queries/<lang>/` (items, calls, uses, impl-methods). Adding a language is roughly: add the `tree-sitter-<lang>` dep, drop the queries, add a `Language` enum variant. No new walker code per language.
+Anything else is silently skipped during the walk. The parser is **query-driven**: each supported language gets a small set of `.scm` tree-sitter query files in `src/parser/queries/<lang>/` (items, calls, imports, methods). Adding a language is roughly: add the `tree-sitter-<lang>` dep, drop the queries, add a `Language` enum variant.
+
+Where a grammar disagrees with the others about *which field holds a label* — a `for`'s iterable is `value` in Rust, `right` in Python, and `value` again in Dart under Python's own `for_statement` kind — that read lives behind the `SeqLang` trait rather than in the walker. The rule when adding a fourth language: **if your handler reads a field name to build a label it belongs in `SeqLang`; if it only descends or emits a call it stays in the walker.**
+
+Generated Dart (`.g.dart`, `.freezed.dart`, `.mocks.dart`, `.gr.dart`) is skipped by default — it was 27 % of the bytes on the reference corpus and carries no architectural signal.
 
 ## Use as a library
 
@@ -483,11 +506,28 @@ make hooks          # install pre-commit + pre-push hooks (.githooks/)
 
 CI runs `make ci` on every PR. The coverage gate ignores `bin/*.rs` (thin wrappers — the library is what's tested).
 
+### Dev environment
+
+The toolchain those gates need is declared in [`repolith.toml`](repolith.toml) and installed by [repolith](https://github.com/anatta-rs/repolith):
+
+```bash
+repolith status    # what's missing, runs nothing
+repolith sync      # install a2m + cargo-llvm-cov + cargo-semver-checks
+```
+
+`cargo-llvm-cov` is what `make coverage-gate` shells out to, and release-plz wants `cargo-semver-checks` on every release PR. One tool stays manual — `mmdc`, which repolith has no npm action for:
+
+```bash
+npm install -g @mermaid-js/mermaid-cli
+```
+
+It earns its place: `mmdc` catches diagrams that lint clean but fail to render, which a syntax check alone will not.
+
 ## Status
 
-`v0.2` — git-aware. Ten subcommands (seven render levels + `index` / `diff` / `gc`), library API, artifact bundle, two-tier content-addressed cache keyed by git blob SHA-1. Breaking on `index.json` (`schema: 2`, new `content_hash` field, value format change from `sha256:<fnv-1a>` to raw git blob SHA-1). Tested on Rust crates from 6 to 1 463 files (rust-analyzer); see [`docs/perf/2026-05-01-resolve-cost-baseline.md`](./docs/perf/2026-05-01-resolve-cost-baseline.md) for benchmarks.
+`v0.7.1` — git-aware, three languages. Eleven subcommands (seven render levels + `walk` / `index` / `diff` / `gc`), library API, artifact bundle, two-tier content-addressed cache keyed by git blob SHA-1. Tested on Rust crates from 6 to 1 463 files (rust-analyzer) and on Flutter projects up to 261 files; see [`docs/perf/2026-05-01-resolve-cost-baseline.md`](./docs/perf/2026-05-01-resolve-cost-baseline.md) for benchmarks.
 
-Future work: parallel parse loop (`rayon`) for the cold path on large monorepos, optional V2 edge-level cache if `--trace=info` shows resolve-phase exceeding 30% of wall on real workloads (currently ≤ 7% even at rust-analyzer scale).
+Future work: parallel parse loop (`rayon`) for the cold path on large monorepos, optional V2 edge-level cache if `--trace=info` shows resolve-phase exceeding 30% of wall on real workloads (currently ≤ 7% even at rust-analyzer scale), a `--include-generated` flag to opt generated Dart back in, and merging Dart `part` / `part_of` files into their parent library.
 
 ## Examples (real output from this repo)
 
