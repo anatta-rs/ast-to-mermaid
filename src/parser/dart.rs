@@ -67,8 +67,14 @@ fn handle_directive(node: &Node, source: &str, out: &mut DartImports) {
     let mut shown: Vec<String> = Vec::new();
     for child in descendants(node, &mut cursor) {
         match child.kind() {
-            // The `as x` prefix is the directive's `alias` field.
-            "identifier" if is_field(node, &child, "alias") => {
+            // The `as x` prefix. `alias` is a field of the enclosing
+            // `import_specification`, *not* of the `library_import` — so
+            // the parent has to be asked, not the directive root.
+            "identifier"
+                if child
+                    .parent()
+                    .is_some_and(|p| is_field(&p, &child, "alias")) =>
+            {
                 if let Some(t) = node_text(&child, source) {
                     alias = Some(t.to_owned());
                 }
@@ -227,4 +233,81 @@ fn member_root_method<'a>(node: &Node, source: &'a str) -> Option<(&'a str, &'a 
 
 fn node_text<'a>(node: &Node, source: &'a str) -> Option<&'a str> {
     node.utf8_text(source.as_bytes()).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::parser::Language;
+
+    fn imports_of(src: &str) -> DartImports {
+        let mut p = tree_sitter::Parser::new();
+        p.set_language(&Language::Dart.ts_language())
+            .expect("set_language");
+        let tree = p.parse(src, None).expect("parse");
+        extract_imports(tree.root_node(), src)
+    }
+
+    /// `alias` is a field of `import_specification`, not of the
+    /// `library_import` above it. Asking the directive root returns `None`
+    /// and the alias is dropped, so `models.parseUser()` never rewrites
+    /// and the call never resolves.
+    #[test]
+    fn as_alias_maps_to_the_uri_stem() {
+        let i = imports_of("import 'package:demo/models/user.dart' as models;\n");
+        assert_eq!(i.modules.get("models").map(String::as_str), Some("user"));
+    }
+
+    #[test]
+    fn show_binds_each_named_symbol() {
+        let i = imports_of("import '../models/user.dart' show User, parseUser;\n");
+        assert_eq!(
+            i.symbols.get("parseUser").map(String::as_str),
+            Some("user::parseUser")
+        );
+        assert_eq!(
+            i.symbols.get("User").map(String::as_str),
+            Some("user::User")
+        );
+    }
+
+    /// `hide` subtracts from a set we don't know, so it must bind nothing
+    /// — binding the hidden names would be exactly backwards.
+    #[test]
+    fn hide_binds_nothing() {
+        let i = imports_of("import '../models/user.dart' hide User;\n");
+        assert!(i.symbols.is_empty(), "got {:?}", i.symbols);
+    }
+
+    /// SDK URIs have no module in the graph; emitting an edge towards
+    /// `dart:async` would invent a node that does not exist.
+    #[test]
+    fn sdk_uris_are_skipped() {
+        let i = imports_of("import 'dart:async' as async_lib;\nimport 'dart:math';\n");
+        assert!(i.modules.is_empty(), "got {:?}", i.modules);
+    }
+
+    /// The three URI shapes that do resolve all key on the file stem.
+    #[test]
+    fn package_and_relative_uris_key_on_the_file_stem() {
+        for src in [
+            "import 'package:demo/models/user.dart' as m;\n",
+            "import '../models/user.dart' as m;\n",
+            "import 'user.dart' as m;\n",
+        ] {
+            assert_eq!(
+                imports_of(src).modules.get("m").map(String::as_str),
+                Some("user"),
+                "for {src:?}"
+            );
+        }
+    }
+
+    /// `part` / `part_of` merge a file into its parent library rather than
+    /// importing it — treating them as imports would duplicate edges.
+    #[test]
+    fn part_directives_are_not_imports() {
+        let i = imports_of("part of 'user.dart';\npart 'user.g.dart';\n");
+        assert!(i.modules.is_empty() && i.symbols.is_empty(), "got {i:?}");
+    }
 }
