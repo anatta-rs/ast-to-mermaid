@@ -525,7 +525,7 @@ It earns its place: `mmdc` catches diagrams that lint clean but fail to render, 
 
 ## Status
 
-`v0.7.1` — git-aware, three languages. Eleven subcommands (seven render levels + `walk` / `index` / `diff` / `gc`), library API, artifact bundle, two-tier content-addressed cache keyed by git blob SHA-1. Tested on Rust crates from 6 to 1 463 files (rust-analyzer) and on Flutter projects up to 261 files; see [`docs/perf/2026-05-01-resolve-cost-baseline.md`](./docs/perf/2026-05-01-resolve-cost-baseline.md) for benchmarks.
+`v0.8.0` — git-aware, three languages. Eleven subcommands (seven render levels + `walk` / `index` / `diff` / `gc`), library API, artifact bundle, two-tier content-addressed cache keyed by git blob SHA-1. Tested on Rust crates from 6 to 1 463 files (rust-analyzer) and on Flutter projects up to 261 files; see [`docs/perf/2026-05-01-resolve-cost-baseline.md`](./docs/perf/2026-05-01-resolve-cost-baseline.md) for benchmarks.
 
 Future work: parallel parse loop (`rayon`) for the cold path on large monorepos, optional V2 edge-level cache if `--trace=info` shows resolve-phase exceeding 30% of wall on real workloads (currently ≤ 7% even at rust-analyzer scale), a `--include-generated` flag to opt generated Dart back in, and merging Dart `part` / `part_of` files into their parent library.
 
