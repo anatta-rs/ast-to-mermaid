@@ -48,6 +48,12 @@ pub struct AnalyzeOptions {
     /// by default — the safety prevents `a2m bundle wrong/path --out
     /// existing/bundle` from wiping the previous run.
     pub allow_empty: bool,
+    /// Opt generated Dart back into the walk. Off by default: `.g.dart`,
+    /// `.freezed.dart`, `.mocks.dart` and `.gr.dart` are `build_runner`
+    /// output — 27% of the bytes on the reference corpus, one file at
+    /// 893 KB, and no architectural signal. Turn this on to audit what a
+    /// generator actually emitted.
+    pub include_generated: bool,
 }
 
 impl Default for AnalyzeOptions {
@@ -60,6 +66,7 @@ impl Default for AnalyzeOptions {
             cache: None,
             with_sequences: false,
             allow_empty: false,
+            include_generated: false,
         }
     }
 }
@@ -77,6 +84,7 @@ impl std::fmt::Debug for AnalyzeOptions {
             )
             .field("with_sequences", &self.with_sequences)
             .field("allow_empty", &self.allow_empty)
+            .field("include_generated", &self.include_generated)
             .finish()
     }
 }
@@ -101,14 +109,18 @@ struct ParseInput {
 /// (`git ls-tree` + `git cat-file`).
 fn collect_inputs(root: &Path, opts: &AnalyzeOptions) -> Result<Vec<ParseInput>> {
     if let Some(git_ref) = opts.git_ref.as_deref() {
-        collect_from_git_ref(root, git_ref)
+        collect_from_git_ref(root, git_ref, opts.include_generated)
     } else {
-        collect_from_worktree(root, &opts.exclude)
+        collect_from_worktree(root, &opts.exclude, opts.include_generated)
     }
 }
 
-fn collect_from_worktree(root: &Path, exclude: &[String]) -> Result<Vec<ParseInput>> {
-    let files = walk_for_languages_with_exclude(root, exclude)?;
+fn collect_from_worktree(
+    root: &Path,
+    exclude: &[String],
+    include_generated: bool,
+) -> Result<Vec<ParseInput>> {
+    let files = walk_for_languages_with_opts(root, exclude, include_generated)?;
     let mut out = Vec::with_capacity(files.len());
     for (path, language) in files {
         let content = std::fs::read(&path)?;
@@ -124,7 +136,11 @@ fn collect_from_worktree(root: &Path, exclude: &[String]) -> Result<Vec<ParseInp
     Ok(out)
 }
 
-fn collect_from_git_ref(root: &Path, git_ref: &str) -> Result<Vec<ParseInput>> {
+fn collect_from_git_ref(
+    root: &Path,
+    git_ref: &str,
+    include_generated: bool,
+) -> Result<Vec<ParseInput>> {
     let toplevel = git_source::show_toplevel(root)?;
     // Resolve the user-provided path against the git toplevel and keep
     // entries under it as a subdirectory hint. Used to be
@@ -163,7 +179,7 @@ fn collect_from_git_ref(root: &Path, git_ref: &str) -> Result<Vec<ParseInput>> {
         let Some(language) = language_for(entry_path) else {
             continue;
         };
-        if is_generated_dart(entry_path) {
+        if !include_generated && is_generated_dart(entry_path) {
             continue;
         }
         let content = reader.read_blob(&entry.blob_sha)?;
@@ -498,10 +514,33 @@ pub fn walk_for_languages_with_exclude<S: AsRef<str>>(
     root: &Path,
     extra_exclude: &[S],
 ) -> Result<Vec<(PathBuf, Language)>> {
+    walk_for_languages_with_opts(root, extra_exclude, false)
+}
+
+/// Same as [`walk_for_languages_with_exclude`], plus control over
+/// generated Dart.
+///
+/// With `include_generated = false` (what the two wrappers above pass)
+/// `build_runner` output is skipped — see [`is_generated_dart`]. Pass
+/// `true` to opt it back in, which is what `--include-generated` does.
+///
+/// A separate entry point rather than a third parameter on the existing
+/// two: both are public API that integration tests and downstream callers
+/// already use, and widening their signatures would be a breaking change
+/// for a flag most callers do not want.
+///
+/// # Errors
+///
+/// Propagates any I/O error from the walk.
+pub fn walk_for_languages_with_opts<S: AsRef<str>>(
+    root: &Path,
+    extra_exclude: &[S],
+    include_generated: bool,
+) -> Result<Vec<(PathBuf, Language)>> {
     let extra: Vec<&str> = extra_exclude.iter().map(AsRef::as_ref).collect();
     let mut out = Vec::new();
     let mut visited: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
-    walk_into(root, &extra, &mut out, &mut visited)?;
+    walk_into(root, &extra, include_generated, &mut out, &mut visited)?;
     out.sort_by(|a, b| a.0.cmp(&b.0));
     Ok(out)
 }
@@ -532,6 +571,7 @@ fn is_excluded(name: &str, extra_exclude: &[&str]) -> bool {
 fn walk_into(
     dir: &Path,
     extra_exclude: &[&str],
+    include_generated: bool,
     out: &mut Vec<(PathBuf, Language)>,
     visited: &mut std::collections::HashSet<PathBuf>,
 ) -> Result<()> {
@@ -573,10 +613,10 @@ fn walk_into(
             if is_excluded(name, extra_exclude) {
                 continue;
             }
-            walk_into(&path, extra_exclude, out, visited)?;
+            walk_into(&path, extra_exclude, include_generated, out, visited)?;
         } else if file_type.is_file()
             && let Some(lang) = language_for(&path)
-            && !is_generated_dart(&path)
+            && (include_generated || !is_generated_dart(&path))
         {
             out.push((path, lang));
         }
@@ -680,6 +720,40 @@ mod tests {
         assert_eq!(language_for(Path::new("foo.dart")), Some(Language::Dart));
         assert_eq!(language_for(Path::new("Makefile")), None);
         assert_eq!(language_for(Path::new("a.txt")), None);
+    }
+
+    /// The default walk drops generated Dart; `include_generated` opts it
+    /// back in. Same tree, same walker — only the flag differs.
+    #[test]
+    fn include_generated_opts_build_runner_output_back_in() {
+        let tmp = tempdir().expect("tmp");
+        let root = tmp.path();
+        write(root, "lib/user.dart", "class User {}\n");
+        write(root, "lib/user.g.dart", "class UserGen {}\n");
+        write(root, "lib/user.freezed.dart", "class UserFrozen {}\n");
+
+        let default_walk = walk_for_languages(root).expect("walk");
+        assert_eq!(default_walk.len(), 1, "got {default_walk:?}");
+        assert!(default_walk[0].0.to_string_lossy().ends_with("user.dart"));
+
+        let with_generated = walk_for_languages_with_opts::<&str>(root, &[], true).expect("walk");
+        assert_eq!(with_generated.len(), 3, "got {with_generated:?}");
+    }
+
+    /// `include_generated` must not disturb the other languages — a `.rs`
+    /// or `.py` file is picked up either way.
+    #[test]
+    fn include_generated_does_not_affect_rust_or_python() {
+        let tmp = tempdir().expect("tmp");
+        let root = tmp.path();
+        write(root, "src/lib.rs", "pub fn f() {}\n");
+        write(root, "src/mod.py", "def f():\n    pass\n");
+
+        let off = walk_for_languages(root).expect("walk").len();
+        let on = walk_for_languages_with_opts::<&str>(root, &[], true)
+            .expect("walk")
+            .len();
+        assert_eq!((off, on), (2, 2));
     }
 
     #[test]
@@ -821,6 +895,7 @@ mod tests {
                 exclude: Vec::new(),
                 git_ref: None,
                 cache: None,
+                include_generated: false,
                 with_sequences: false,
                 allow_empty: false,
             },
@@ -1226,7 +1301,7 @@ mod tests {
         // `InvalidInput`. Used to silently fall through to the
         // canonicalize step, which also failed silently. Now: error.
         let other = tempdir().expect("tmp other");
-        let result = collect_from_git_ref(other.path(), "HEAD");
+        let result = collect_from_git_ref(other.path(), "HEAD", false);
         match result {
             Err(AstToMermaidError::InvalidInput(_)) => {}
             Err(e) => panic!("expected InvalidInput, got: {e}"),
@@ -1236,7 +1311,7 @@ mod tests {
         // A non-existent absolute path — `canonicalize` fails. Used to
         // silently fall through to no-prefix. Now: error.
         let missing = std::path::PathBuf::from("/no/such/path/here-c39-test");
-        let result = collect_from_git_ref(&missing, "HEAD");
+        let result = collect_from_git_ref(&missing, "HEAD", false);
         match result {
             Err(AstToMermaidError::InvalidInput(_)) => {}
             Err(e) => panic!("expected InvalidInput for missing path, got: {e}"),

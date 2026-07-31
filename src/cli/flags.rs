@@ -57,6 +57,12 @@ pub struct AnalyzeFlags {
     #[arg(short = 'x', long, default_value = "")]
     pub exclude: String,
 
+    /// Include generated Dart (`.g.dart`, `.freezed.dart`, `.mocks.dart`,
+    /// `.gr.dart`). Skipped by default: it is `build_runner` output, 27% of
+    /// the bytes on a typical Flutter project and no architectural signal.
+    #[arg(long)]
+    pub include_generated: bool,
+
     /// Write output to this file instead of stdout.
     #[arg(short, long)]
     pub out: Option<PathBuf>,
@@ -86,6 +92,12 @@ pub struct WalkFlags {
     /// hidden dirs).
     #[arg(short = 'x', long, default_value = "")]
     pub exclude: String,
+
+    /// Include generated Dart (`.g.dart`, `.freezed.dart`, `.mocks.dart`,
+    /// `.gr.dart`). Skipped by default: it is `build_runner` output, 27% of
+    /// the bytes on a typical Flutter project and no architectural signal.
+    #[arg(long)]
+    pub include_generated: bool,
 
     /// Read source from a git ref instead of the working tree. With `--ref`,
     /// `walk` lists `git ls-tree` paths (filtered to supported languages).
@@ -230,6 +242,12 @@ pub struct BundleFlags {
     #[arg(short = 'x', long, default_value = "")]
     pub exclude: String,
 
+    /// Include generated Dart (`.g.dart`, `.freezed.dart`, `.mocks.dart`,
+    /// `.gr.dart`). Skipped by default: it is `build_runner` output, 27% of
+    /// the bytes on a typical Flutter project and no architectural signal.
+    #[arg(long)]
+    pub include_generated: bool,
+
     /// Read source from a git ref (e.g. `main`, `v0.1.0`, `HEAD~3`)
     /// instead of the working tree.
     #[arg(long, value_name = "GIT-REF")]
@@ -271,6 +289,12 @@ pub struct SequenceFlags {
     /// (comma-separated). Combined with the built-in skip set.
     #[arg(short = 'x', long, default_value = "")]
     pub exclude: String,
+
+    /// Include generated Dart (`.g.dart`, `.freezed.dart`, `.mocks.dart`,
+    /// `.gr.dart`). Skipped by default: it is `build_runner` output, 27% of
+    /// the bytes on a typical Flutter project and no architectural signal.
+    #[arg(long)]
+    pub include_generated: bool,
 
     /// In single-target mode: file to write Mermaid output to (default
     /// stdout). In `--all` mode: directory that receives one `.mmd` per
