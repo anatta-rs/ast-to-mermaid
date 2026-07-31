@@ -2,14 +2,24 @@
 //! [`super::Step`]s. Statement order is preserved by walking the AST
 //! depth-first, left-to-right.
 //!
-//! Handles both Rust and Python. The two grammars use **disjoint** node
-//! kinds for the constructs we care about (`call_expression` vs `call`,
-//! `for_expression` vs `for_statement`, `field_expression`/
-//! `scoped_identifier` vs `attribute`, …), so [`State::walk_expr`] runs one
-//! unified `match` over both vocabularies. Only the helpers whose
-//! *semantics* diverge — callee classification, constructor/macro skipping,
-//! `if`/`match` lifting — branch on [`State::lang`].
+//! Handles Rust, Python and Dart. [`State::walk_expr`] runs one unified
+//! `match` over their node kinds, which is safe for everything it does
+//! here: recognising a call, a block or a loop, descending into it and
+//! emitting a step never reads a field name that the grammars spell
+//! differently. `call_expression` notably exposes the same `function:` +
+//! `arguments:` layout in all three.
+//!
+//! What the grammars *do* disagree on is which field carries a label — a
+//! `for`'s iterable is `value` in Rust, `right` in Python, and `value`
+//! again in Dart under Python's own `for_statement` kind. Those reads live
+//! behind [`super::lang::SeqLang`] instead, so this walker never has to
+//! know. See that module for the full rule.
+//!
+//! The remaining `lang` branches here are genuine *semantic* divergences —
+//! callee classification and constructor/macro skipping — not field-name
+//! lookups.
 
+use super::lang::SeqLang;
 use super::{Participant, SELF_ID, Step};
 use crate::limits::max_ast_depth;
 use crate::parser::Language;
@@ -158,21 +168,13 @@ impl State {
                 }
             }
             // ── Loops ──────────────────────────────────────────────────
-            "for_expression" => {
-                let label = format!("for {}", short_text(node, "value", source));
+            // One arm for every loop shape: recognising the shape is
+            // structural, so it stays here. Which field holds the iterable
+            // is what diverges, so the label comes from `SeqLang`.
+            "for_expression" | "for_statement" | "while_expression" | "while_statement"
+            | "loop_expression" => {
+                let label = self.lang.loop_label(node, source);
                 self.lift_loop(node, source, &label, depth + 1);
-            }
-            // Python `for x in xs:` — the iterable is the `right` field.
-            "for_statement" => {
-                let label = format!("for {}", short_text(node, "right", source));
-                self.lift_loop(node, source, &label, depth + 1);
-            }
-            "while_expression" | "while_statement" => {
-                let label = format!("while {}", short_text(node, "condition", source));
-                self.lift_loop(node, source, &label, depth + 1);
-            }
-            "loop_expression" => {
-                self.lift_loop(node, source, "loop", depth + 1);
             }
             // ── Conditionals ───────────────────────────────────────────
             "if_expression" | "if_statement" => {
@@ -356,7 +358,7 @@ impl State {
     }
 
     fn lift_if(&mut self, node: &Node, source: &str, depth: usize) {
-        let cond = format!("if {}", short_text(node, "condition", source));
+        let cond = format!("if {}", self.lang.if_condition(node, source));
         let then_node = node.child_by_field_name("consequence");
         let then = self.walk_into(|s| {
             if let Some(b) = then_node {
@@ -385,39 +387,25 @@ impl State {
     }
 
     fn lift_match(&mut self, node: &Node, source: &str, depth: usize) {
-        // Rust `match x { … }` keys the scrutinee on `value`; Python
-        // `match x:` keys it on `subject`.
-        let (scrutinee_field, arm_kind) = match self.lang {
-            Language::Rust => ("value", "match_arm"),
-            Language::Python => ("subject", "case_clause"),
-            // Dart spells it `switch`, whose node kinds are disjoint from
-            // both `match_expression` and `match_statement` — so this arm
-            // is unreachable until `switch_statement` gets its own entry
-            // in `walk_expr`. Recorded here so the field names are already
-            // right when it does.
-            Language::Dart => ("condition", "switch_statement_case"),
-        };
-        let scrutinee = short_text(node, scrutinee_field, source);
+        // Which field holds the scrutinee, and how an arm is spelled, is
+        // per-grammar — so it comes from `SeqLang` rather than a `match`
+        // on the language here.
+        let spec = self.lang.match_spec();
+        let scrutinee = short_text(node, spec.scrutinee_field, source);
         let cond = format!("match {scrutinee}");
-        // Each arm body: Rust `match_arm` exposes it on `value`, Python
-        // `case_clause` on `consequence` (a block). v1 collapses all arms
-        // into one branch — splitting onto separate alt elses is a
-        // follow-up.
+        // v1 collapses all arms into one branch — splitting onto separate
+        // alt elses is a follow-up.
         let arms_steps = self.walk_into(|s| {
             if let Some(body) = node.child_by_field_name("body") {
                 let mut cursor = body.walk();
                 for child in body.children(&mut cursor) {
-                    if child.kind() != arm_kind {
+                    if child.kind() != spec.arm_kind {
                         continue;
                     }
-                    let arm_body = match s.lang {
-                        Language::Rust => child.child_by_field_name("value"),
-                        Language::Python => child.child_by_field_name("consequence"),
-                        // See the note above: unreachable for now, and a
-                        // Dart case body is a statement list rather than a
-                        // single field, so it descends into the case node.
-                        Language::Dart => Some(child),
-                    };
+                    // `None` means the arm node *is* its own body.
+                    let arm_body = spec
+                        .arm_body_field
+                        .map_or(Some(child), |f| child.child_by_field_name(f));
                     if let Some(arm_body) = arm_body {
                         s.walk_expr(&arm_body, source, depth);
                     }
@@ -630,7 +618,7 @@ fn cap_label(s: &str) -> String {
 /// breaks the Mermaid parser. The truncation marker is ASCII `...` —
 /// older Mermaid sequence lexers reject the Unicode ellipsis in alt/loop
 /// headers (#156).
-fn cap_at(s: &str, max: usize) -> String {
+pub(super) fn cap_at(s: &str, max: usize) -> String {
     let one_line: String = s
         .replace('"', "'")
         .split_whitespace()
