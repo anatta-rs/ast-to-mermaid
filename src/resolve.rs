@@ -617,18 +617,28 @@ fn file_module_name(file_path: &str) -> &str {
 /// - `tests/foo.rs` → `Some(file_path)` (each its own root — prevents
 ///   bare-name cross-file binds in loose layouts).
 ///
-/// Python (package layout): the top-level package directory is the unit of
-/// "same-crate" grouping, so a whole `lib/` package shares one root and the
-/// resolver's same-crate preference fires within it:
+/// Python and Dart (package layout): the top-level package directory is
+/// the unit of "same-crate" grouping, so a whole `lib/` package shares one
+/// root and the resolver's same-crate preference fires within it:
 /// - `lib/translator.py`, `lib/sub/x.py` → `Some("lib")` (first segment).
+/// - `lib/models/user.dart`, `lib/svc/repo.dart` → `Some("lib")`.
 /// - `mod.py` (no directory) → `Some("")` (top-level — one root).
+///
+/// Dart shares Python's rule rather than falling through to the default:
+/// a pub package puts everything under `lib/`, so the default branch
+/// (whole path as the root) would make every file its own crate and the
+/// same-crate filter would reject every cross-file bare call. That is
+/// exactly what kept Dart at near-zero cross-module edges — 93% of the
+/// imports in a real Flutter project are bare (`import '…/user.dart';`
+/// with no `as` or `show`), so bare-call resolution is the only path
+/// available for them.
 ///
 /// - empty path → `None`.
 fn crate_root(atom: &CodeAtom) -> Option<String> {
     if atom.file_path.is_empty() {
         return None;
     }
-    if lang_of(&atom.file_path) == "py" {
+    if matches!(lang_of(&atom.file_path), "py" | "dart") {
         return Some(match atom.file_path.split_once('/') {
             Some((head, _)) => head.to_owned(),
             None => String::new(),
@@ -703,6 +713,63 @@ mod tests {
         for (name, calls) in fns {
             store.add_atom(function_atom(file_path, name, calls));
         }
+    }
+
+    /// A pub package puts everything under `lib/`, so two Dart files in
+    /// the same package must share a crate root. Falling through to the
+    /// default (whole path) made every file its own crate and the
+    /// same-crate filter rejected every cross-file bare call — which is
+    /// what kept Dart near zero cross-module edges.
+    #[test]
+    fn dart_files_in_one_package_share_a_crate_root() {
+        let a = function_atom("lib/models/user.dart", "parseUser", &[]);
+        let b = function_atom("lib/svc/repo.dart", "load", &[]);
+        assert_eq!(crate_root(&a), Some("lib".to_owned()));
+        assert_eq!(crate_root(&a), crate_root(&b));
+    }
+
+    /// Rust must keep its Cargo-layout rule — this is the regression the
+    /// Dart branch could plausibly have caused.
+    #[test]
+    fn dart_rule_does_not_leak_into_rust_paths() {
+        let rs = function_atom("crate_a/src/foo.rs", "f", &[]);
+        assert_eq!(crate_root(&rs), Some("crate_a".to_owned()));
+        let loose = function_atom("tests/foo.rs", "f", &[]);
+        assert_eq!(crate_root(&loose), Some("tests/foo.rs".to_owned()));
+    }
+
+    /// 93% of imports in a real Flutter project are bare (`import
+    /// '…/user.dart';`, no `as`/`show`), so the parser cannot rewrite the
+    /// call site and bare-call resolution is the only path left.
+    #[test]
+    fn dart_bare_call_resolves_across_files_in_the_same_package() {
+        let store = build_store("lib/svc/repo.dart", &[("load", &["parseUser"])]);
+        add_to_store(&store, "lib/models/user.dart", &[("parseUser", &[])]);
+        assert_eq!(resolve_cross_module_calls(&store), 1);
+    }
+
+    /// Unicity still gates it: two same-named free functions must stay
+    /// unresolved rather than pick one at random.
+    #[test]
+    fn dart_ambiguous_bare_call_stays_unresolved() {
+        let store = build_store("lib/svc/repo.dart", &[("load", &["helper"])]);
+        add_to_store(&store, "lib/a/one.dart", &[("helper", &[])]);
+        add_to_store(&store, "lib/b/two.dart", &[("helper", &[])]);
+        assert_eq!(
+            resolve_cross_module_calls(&store),
+            0,
+            "ambiguous target must not ghost-bind"
+        );
+    }
+
+    /// Dart and Python files must not resolve into each other even when a
+    /// name matches — `lang_of` already separates them, and the shared
+    /// crate-root rule must not undo that.
+    #[test]
+    fn dart_does_not_bind_to_a_same_named_python_function() {
+        let store = build_store("lib/svc/repo.dart", &[("load", &["parseUser"])]);
+        add_to_store(&store, "lib/models/user.py", &[("parseUser", &[])]);
+        assert_eq!(resolve_cross_module_calls(&store), 0);
     }
 
     #[test]
