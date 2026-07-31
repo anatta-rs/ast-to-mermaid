@@ -40,6 +40,15 @@ impl SeqLang for Language {
         match self {
             Self::Rust => "function_item",
             Self::Python => "function_definition",
+            // Provisional: Dart actually has five function kinds
+            // (`function_declaration`, `method_declaration`,
+            // `local_function_declaration`, `getter_declaration`,
+            // `function_signature`) and this signature only carries one.
+            // Widening it to a slice is the next change; until then the
+            // sequence subsystem refuses Dart outright (see
+            // `super::reject_unsupported`) rather than reporting on a
+            // fraction of its functions.
+            Self::Dart => "function_declaration",
         }
     }
 
@@ -47,6 +56,9 @@ impl SeqLang for Language {
         match self {
             Self::Rust => "impl_item",
             Self::Python => "class_definition",
+            // Provisional, same caveat as `fn_kind`: Dart has four method
+            // containers (`class`, `mixin`, `extension`, `enum`).
+            Self::Dart => "class_declaration",
         }
     }
 
@@ -61,6 +73,11 @@ impl SeqLang for Language {
                 .map(str::to_owned),
             // `class Widget:` — the class name is the `name` field.
             Self::Python => node
+                .child_by_field_name("name")
+                .and_then(|n| n.utf8_text(source.as_bytes()).ok())
+                .map(str::to_owned),
+            // `class Widget { … }` — same `name` field as Python.
+            Self::Dart => node
                 .child_by_field_name("name")
                 .and_then(|n| n.utf8_text(source.as_bytes()).ok())
                 .map(str::to_owned),

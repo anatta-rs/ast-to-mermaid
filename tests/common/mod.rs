@@ -19,6 +19,7 @@ pub fn build_store(root: &Path) -> Store {
         let parser = match lang {
             Language::Rust => CodeParser::rust(),
             Language::Python => CodeParser::python(),
+            Language::Dart => CodeParser::dart(),
         };
         let display = path
             .strip_prefix(root)

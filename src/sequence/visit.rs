@@ -390,6 +390,12 @@ impl State {
         let (scrutinee_field, arm_kind) = match self.lang {
             Language::Rust => ("value", "match_arm"),
             Language::Python => ("subject", "case_clause"),
+            // Dart spells it `switch`, whose node kinds are disjoint from
+            // both `match_expression` and `match_statement` — so this arm
+            // is unreachable until `switch_statement` gets its own entry
+            // in `walk_expr`. Recorded here so the field names are already
+            // right when it does.
+            Language::Dart => ("condition", "switch_statement_case"),
         };
         let scrutinee = short_text(node, scrutinee_field, source);
         let cond = format!("match {scrutinee}");
@@ -407,6 +413,10 @@ impl State {
                     let arm_body = match s.lang {
                         Language::Rust => child.child_by_field_name("value"),
                         Language::Python => child.child_by_field_name("consequence"),
+                        // See the note above: unreachable for now, and a
+                        // Dart case body is a statement list rather than a
+                        // single field, so it descends into the case node.
+                        Language::Dart => Some(child),
                     };
                     if let Some(arm_body) = arm_body {
                         s.walk_expr(&arm_body, source, depth);
