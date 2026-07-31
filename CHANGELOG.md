@@ -8,6 +8,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0](https://github.com/anatta-rs/ast-to-mermaid/compare/v0.7.1...v0.8.0) - 2026-07-31
+
+### Bug fixes
+
+- *(sequence)* Classify Dart null-aware `obj?.m()` receivers ([#174](https://github.com/anatta-rs/ast-to-mermaid/pull/174))
+
+### Features
+
+- *(resolve)* Cross-module Dart — package layout + `as` aliases ([#175](https://github.com/anatta-rs/ast-to-mermaid/pull/175))
+- *(sequence)* Dart semantics — receivers, cascades, switch, closures ([#173](https://github.com/anatta-rs/ast-to-mermaid/pull/173))
+- *(dart)* Parse Dart, render its module view, filter generated code ([#171](https://github.com/anatta-rs/ast-to-mermaid/pull/171))
+
+### Refactor
+
+- *(sequence)* Split the walker by operation, not by language pair ([#172](https://github.com/anatta-rs/ast-to-mermaid/pull/172))
+
 ## [0.7.1](https://github.com/anatta-rs/ast-to-mermaid/compare/v0.7.0...v0.7.1) - 2026-07-25
 
 ### Bug fixes
