@@ -13,16 +13,23 @@
 //!
 //! # Scope
 //!
-//! - Rust and Python (the same two languages the main parser supports).
+//! - Rust, Python and Dart (the three languages the main parser supports).
 //! - Calls are classified by syntactic receiver: bare ident, type path
 //!   (Rust `Type::method`), or `obj.method()` receiver root (Rust
-//!   `field_expression`, Python `attribute`).
-//! - Control flow lifted: `if` → `alt`, `match` → `alt`, `for`/`while`/
-//!   `loop` → `loop`. Nested closures (Rust) and comprehensions (Python)
-//!   are walked but their results are inlined (no spawn-style "par" blocks
-//!   yet).
-//! - Await: Rust postfix `.await` and Python prefix `await` both annotate
-//!   the arrow label (not a separate lifeline).
+//!   `field_expression`, Python `attribute`, Dart `member_expression`).
+//! - Control flow lifted: `if` → `alt`, `match`/`switch` → `alt`,
+//!   `for`/`while`/`loop` → `loop`. Nested closures (Rust, Dart) and
+//!   comprehensions (Python) are walked but their results are inlined:
+//!   a call inside a closure belongs to the enclosing function, not to a
+//!   lifeline of its own (no spawn-style "par" blocks yet).
+//! - Await: Rust postfix `.await`, Python and Dart prefix `await`, all
+//!   annotating the arrow label rather than adding a lifeline.
+//! - Dart cascades (`obj..a()..b()`) emit one call per link, each onto the
+//!   shared receiver — `..` re-applies to the original object rather than
+//!   chaining on the previous result.
+//!
+//! Which node kinds carry which label is per-grammar and lives in
+//! [`lang::SeqLang`]; see that module for where the boundary sits.
 
 use crate::error::{AstToMermaidError, Result};
 use crate::parser::Language;
@@ -159,18 +166,23 @@ pub fn parse_source_once(content: &[u8], file_path: &str, lang: Language) -> Res
 
 /// Whether the sequence subsystem can report faithfully on `lang`.
 ///
-/// Dart's *labels* are correct as of the `SeqLang` split — `for_statement`
-/// and `if_statement` now read their own fields, so nothing wrong is
-/// emitted. What is still missing is `cascade_call_expression`
-/// (`obj..a()..b()`), which carries `property:` but no `function:` and so
-/// slips past the call handler: roughly 1700 occurrences in the reference
-/// corpus would be *silently absent* from the diagram.
+/// All three supported languages now qualify. Dart was held back through
+/// two earlier changes — first because its `for`/`if` labels were read
+/// from fields it does not have, then because cascades were dropped
+/// silently — and both are closed:
 ///
-/// A missing call is a weaker failure than a wrong label, but a sequence
-/// diagram claiming to walk a body in order while dropping every cascade
-/// is still not honest. Kept off until cascades land.
-pub(crate) fn supports_sequences(lang: Language) -> bool {
-    !matches!(lang, Language::Dart)
+/// - labels come from [`lang::SeqLang`], per grammar;
+/// - `member_expression` receivers classify like their Python twin, so
+///   `obj.m()` names `obj` rather than the whole snippet;
+/// - `cascade_section` emits one call per link onto the shared receiver;
+/// - `switch` lifts to an `alt`, `default` arm included;
+/// - closures stay transparent — calls inside them are attributed to the
+///   enclosing function, which is what the argument descent already did.
+///
+/// Kept as a function rather than inlined: it is the single place to
+/// re-gate a language if a grammar regression is found.
+pub(crate) fn supports_sequences(_lang: Language) -> bool {
+    true
 }
 
 /// Extract a [`SequenceDiagram`] for every name in `targets` that resolves
@@ -234,9 +246,9 @@ fn build_fn_index<'tree>(
     let mut stack: Vec<(Node<'tree>, Option<String>)> = vec![(root, None)];
     while let Some((node, container)) = stack.pop() {
         if lang.fn_kinds().contains(&node.kind())
-            && let Some(name_node) = node.child_by_field_name("name")
-            && let Ok(name) = name_node.utf8_text(source.as_bytes())
+            && let Some(name) = lang.fn_name(&node, source)
         {
+            let name = name.as_str();
             // Free function: key on `name`. Method inside a container:
             // also insert `Owner::name`. Both forms are accepted by
             // [`extract`] and must resolve to the same node.
@@ -333,9 +345,9 @@ pub fn list_functions_in_tree(tree: &Tree, source: &str, lang: Language) -> Vec<
     // they pop left-to-right.
     while let Some((node, container)) = stack.pop() {
         if lang.fn_kinds().contains(&node.kind())
-            && let Some(name_node) = node.child_by_field_name("name")
-            && let Ok(name) = name_node.utf8_text(source.as_bytes())
+            && let Some(name) = lang.fn_name(&node, source)
         {
+            let name = name.as_str();
             let qualified = container
                 .as_deref()
                 .map_or_else(|| name.to_owned(), |c| format!("{c}::{name}"));
@@ -375,6 +387,147 @@ mod tests {
 
     fn extract_py(src: &str, target: &str) -> SequenceDiagram {
         extract(src.as_bytes(), "test.py", target, Language::Python).expect("extract")
+    }
+
+    fn extract_dart(src: &str, target: &str) -> SequenceDiagram {
+        extract(src.as_bytes(), "test.dart", target, Language::Dart).expect("extract")
+    }
+
+    /// `(participant, method)` for every call step, in order.
+    fn calls_of(d: &SequenceDiagram) -> Vec<(String, String)> {
+        fn walk(steps: &[Step], out: &mut Vec<(String, String)>) {
+            for s in steps {
+                match s {
+                    Step::Call { to, label, .. } => out.push((to.clone(), label.clone())),
+                    Step::Loop { body, .. } => walk(body, out),
+                    Step::Alt { then, else_, .. } => {
+                        walk(then, out);
+                        if let Some(e) = else_ {
+                            walk(e, out);
+                        }
+                    }
+                    Step::Note { .. } => {}
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(&d.steps, &mut out);
+        out
+    }
+
+    /// A Dart method call must name its receiver, not the whole snippet.
+    /// Before `member_expression` was classified this yielded a
+    /// participant literally called `cache.open`.
+    #[test]
+    fn dart_method_call_targets_receiver() {
+        let d = extract_dart("void run() { cache.open(); }\n", "run");
+        assert_eq!(calls_of(&d), vec![("cache".to_owned(), "open".to_owned())]);
+    }
+
+    /// Cascades carry `property:` but no `function:`, so the ordinary call
+    /// handler skips them. Each link targets the *original* receiver —
+    /// that is what `..` means.
+    #[test]
+    fn dart_cascade_emits_one_call_per_link_on_the_receiver() {
+        let d = extract_dart("void run() { buffer..write('a')..write('b'); }\n", "run");
+        assert_eq!(
+            calls_of(&d),
+            vec![
+                ("buffer".to_owned(), "write".to_owned()),
+                ("buffer".to_owned(), "write".to_owned()),
+            ]
+        );
+    }
+
+    /// `StringBuffer()..write(x)` — the receiver is itself a call, so two
+    /// steps are expected: constructing the buffer, then the cascade link
+    /// onto it.
+    #[test]
+    fn dart_cascade_on_a_constructed_receiver() {
+        let d = extract_dart("void run() { StringBuffer()..write('a'); }\n", "run");
+        let calls = calls_of(&d);
+        assert_eq!(
+            calls.iter().map(|(_, m)| m.as_str()).collect::<Vec<_>>(),
+            vec!["StringBuffer", "write"],
+            "the constructed receiver is a call in its own right"
+        );
+    }
+
+    /// Closures stay transparent: a call inside one is attributed to the
+    /// enclosing function rather than spawning its own lifeline.
+    #[test]
+    fn dart_closure_calls_surface_on_the_enclosing_function() {
+        let d = extract_dart(
+            "void run() { items.forEach((e) { tracker.count(e); }); }\n",
+            "run",
+        );
+        let calls = calls_of(&d);
+        assert!(calls.contains(&("items".to_owned(), "forEach".to_owned())));
+        assert!(
+            calls.contains(&("tracker".to_owned(), "count".to_owned())),
+            "closure body must not be dropped: {calls:?}"
+        );
+    }
+
+    /// A `default:` arm is not spelled like a `case:`; matching only the
+    /// latter would silently drop every fallback branch.
+    #[test]
+    fn dart_switch_lifts_both_case_and_default_arms() {
+        let d = extract_dart(
+            "void run(int n) { switch (n) { case 0: none(); break; default: some(); } }\n",
+            "run",
+        );
+        let calls = calls_of(&d);
+        assert!(
+            calls.iter().any(|(_, m)| m == "none"),
+            "case arm: {calls:?}"
+        );
+        assert!(
+            calls.iter().any(|(_, m)| m == "some"),
+            "default arm: {calls:?}"
+        );
+    }
+
+    /// `switch_expression` repeats `body:` per arm instead of wrapping
+    /// them in a block — both arms must still be walked.
+    #[test]
+    fn dart_switch_expression_walks_every_arm() {
+        let d = extract_dart(
+            "void run(int n) { final r = switch (n) { 1 => one(), _ => other() }; }\n",
+            "run",
+        );
+        let calls = calls_of(&d);
+        assert!(calls.iter().any(|(_, m)| m == "one"), "{calls:?}");
+        assert!(calls.iter().any(|(_, m)| m == "other"), "{calls:?}");
+    }
+
+    #[test]
+    fn dart_await_annotates_the_arrow() {
+        let d = extract_dart(
+            "Future<void> run() async { await client.fetch('u'); }\n",
+            "run",
+        );
+        let Some(Step::Call {
+            to,
+            label,
+            is_await,
+            ..
+        }) = d.steps.first()
+        else {
+            panic!("expected a call, got {:?}", d.steps);
+        };
+        assert_eq!((to.as_str(), label.as_str()), ("client", "fetch"));
+        assert!(*is_await, "prefix `await` must mark the arrow");
+    }
+
+    /// Dart methods live under `signature:` → `function_signature` →
+    /// `name:`, so a naive `name` read leaves them out of the index and
+    /// `--target Owner::method` reports "not found".
+    #[test]
+    fn dart_class_method_resolves_by_qualified_name() {
+        let src = "class Repo {\n  void sync() { store.flush(); }\n}\n";
+        let d = extract_dart(src, "Repo::sync");
+        assert_eq!(calls_of(&d), vec![("store".to_owned(), "flush".to_owned())]);
     }
 
     #[test]

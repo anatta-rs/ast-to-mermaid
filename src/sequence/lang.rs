@@ -41,10 +41,10 @@ use tree_sitter::Node;
 /// How a language spells a `match` / `switch`, for [`super::visit`]'s arm
 /// lifting.
 pub(super) struct MatchSpec {
-    /// Field holding the scrutinee (`match x` / `switch (x)`).
-    pub scrutinee_field: &'static str,
-    /// Node kind of one arm.
-    pub arm_kind: &'static str,
+    /// Node kinds that count as an arm. Dart needs two — a `default:` is
+    /// not spelled like a `case:`, and dropping it would silently lose
+    /// every fallback branch.
+    pub arm_kinds: &'static [&'static str],
     /// Field holding an arm's body, or `None` when the arm node *is* the
     /// body and should be descended into directly.
     pub arm_body_field: Option<&'static str>,
@@ -69,6 +69,15 @@ pub(super) trait SeqLang {
     /// `class Widget` → `Widget`). Returns `None` when the name can't be read.
     fn container_name(self, node: &Node, source: &str) -> Option<String>;
 
+    /// Name a function node declares.
+    ///
+    /// Rust and Python put it on `name:`. Dart buries it under `signature:`
+    /// → `function_signature` → `name:`, so reading `name` directly finds
+    /// nothing and the function never enters the index — `--target` then
+    /// reports it missing rather than wrong, which is why this is not
+    /// optional.
+    fn fn_name(self, node: &Node, source: &str) -> Option<String>;
+
     /// Label for a loop node (`for xs`, `while cond`, `loop`).
     ///
     /// First of the two places where the grammars genuinely disagree: a
@@ -85,6 +94,13 @@ pub(super) trait SeqLang {
 
     /// How this language spells `match` / `switch`.
     fn match_spec(self) -> MatchSpec;
+
+    /// Scrutinee text of a `match` / `switch` node, without the keyword.
+    ///
+    /// Rust keys it on `value`, Python on `subject`, Dart on `condition` —
+    /// and Dart additionally wraps it in parentheses that belong to the
+    /// syntax, which are stripped so captions read alike.
+    fn match_scrutinee(self, node: &Node, source: &str) -> String;
 }
 
 impl SeqLang for Language {
@@ -130,6 +146,13 @@ impl SeqLang for Language {
                 .and_then(|n| n.utf8_text(source.as_bytes()).ok())
                 .map(str::to_owned),
         }
+    }
+
+    fn fn_name(self, node: &Node, source: &str) -> Option<String> {
+        // Shared with the parser rather than reimplemented: if the two
+        // disagreed on a function's name, `--target` would stop matching
+        // the atoms the module view shows.
+        crate::parser::declared_name(node, source)
     }
 
     fn loop_label(self, node: &Node, source: &str) -> String {
@@ -195,23 +218,38 @@ impl SeqLang for Language {
     fn match_spec(self) -> MatchSpec {
         match self {
             Self::Rust => MatchSpec {
-                scrutinee_field: "value",
-                arm_kind: "match_arm",
+                arm_kinds: &["match_arm"],
                 arm_body_field: Some("value"),
             },
             Self::Python => MatchSpec {
-                scrutinee_field: "subject",
-                arm_kind: "case_clause",
+                arm_kinds: &["case_clause"],
                 arm_body_field: Some("consequence"),
             },
-            // Dart `switch (x) { case 0: … }`. A case body is a statement
-            // list rather than a single field, so the arm node is descended
-            // into directly.
+            // Dart `switch (x) { case 0: … default: … }`. A case body is a
+            // statement list rather than one field, so the arm node is
+            // descended into directly — and `default` is its own kind.
             Self::Dart => MatchSpec {
-                scrutinee_field: "condition",
-                arm_kind: "switch_statement_case",
+                arm_kinds: &[
+                    "switch_statement_case",
+                    "switch_statement_default",
+                    // Expression form: `switch (x) { 1 => a(), _ => b() }`.
+                    "switch_expression_case",
+                ],
                 arm_body_field: None,
             },
+        }
+    }
+
+    fn match_scrutinee(self, node: &Node, source: &str) -> String {
+        match self {
+            Self::Rust => field_text(node, "value", source),
+            Self::Python => field_text(node, "subject", source),
+            Self::Dart => node
+                .child_by_field_name("condition")
+                .map(|c| unwrap_parens(&c))
+                .and_then(|c| c.utf8_text(source.as_bytes()).ok())
+                .map(|t| cap_at(t.trim(), MAX_LABEL))
+                .unwrap_or_default(),
         }
     }
 }
