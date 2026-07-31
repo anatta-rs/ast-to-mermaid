@@ -1,4 +1,4 @@
-//! Code parser — tree-sitter Rust + Python → [`CodeAtom`]s.
+//! Code parser — tree-sitter Rust + Python + Dart → [`CodeAtom`]s.
 //!
 //! # Identity scheme
 //!
@@ -13,7 +13,8 @@
 //!
 //! # Layout
 //!
-//! Per-language extractors live in sibling modules — `rust`, `python`.
+//! Per-language extractors live in sibling modules — `rust`, `python`,
+//! `dart`.
 //! This file holds the shared types ([`Language`], [`CodeParser`],
 //! [`ParseFailure`], [`ParseUnit`]) and the dispatch that routes each file
 //! at its language module.
@@ -26,6 +27,7 @@ use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use tree_sitter::{Node, Parser as TsParser, QueryCursor, StreamingIterator};
 
+mod dart;
 mod python;
 mod queries;
 mod rust;
@@ -143,6 +145,8 @@ pub enum Language {
     Rust,
     /// Python source (`.py`).
     Python,
+    /// Dart source (`.dart`).
+    Dart,
 }
 
 impl Language {
@@ -152,6 +156,7 @@ impl Language {
         match self {
             Self::Rust => "rust",
             Self::Python => "python",
+            Self::Dart => "dart",
         }
     }
 
@@ -165,6 +170,7 @@ impl Language {
         match self {
             Self::Rust => tree_sitter_rust::LANGUAGE.into(),
             Self::Python => tree_sitter_python::LANGUAGE.into(),
+            Self::Dart => tree_sitter_dart::LANGUAGE.into(),
         }
     }
 
@@ -187,20 +193,40 @@ impl Language {
                 "class_definition",
                 "decorated_definition",
             ],
+            // Dart splits what Rust/Python express with one node: a
+            // top-level function is `function_declaration` (signature +
+            // body), while `class`/`mixin`/`extension`/`enum` are four
+            // distinct method containers rather than one.
+            Self::Dart => &[
+                "function_declaration",
+                "class_declaration",
+                "mixin_declaration",
+                "extension_declaration",
+                "enum_declaration",
+                "type_alias",
+            ],
         }
     }
 
     /// Map a tree-sitter node kind to a canonical atom kind string.
     fn map_node_kind(self, ts_kind: &str) -> Option<&'static str> {
         match (self, ts_kind) {
-            (Self::Rust, "function_item") | (Self::Python, "function_definition") => {
-                Some("function")
+            (Self::Rust, "function_item")
+            | (Self::Python, "function_definition")
+            | (Self::Dart, "function_declaration") => Some("function"),
+            // Dart's `mixin` and `extension` have no Rust/Python analogue.
+            // Both carry methods, so they land on `struct` for the module
+            // renderer's container grouping rather than inventing kinds the
+            // renderer would not know how to draw.
+            (Self::Rust, "struct_item")
+            | (Self::Python, "class_definition")
+            | (Self::Dart, "class_declaration" | "mixin_declaration" | "extension_declaration") => {
+                Some("struct")
             }
-            (Self::Rust, "struct_item") | (Self::Python, "class_definition") => Some("struct"),
             (Self::Rust, "trait_item") => Some("trait"),
             (Self::Rust, "impl_item") => Some("impl"),
-            (Self::Rust, "enum_item") => Some("enum"),
-            (Self::Rust, "type_item") => Some("type_alias"),
+            (Self::Rust, "enum_item") | (Self::Dart, "enum_declaration") => Some("enum"),
+            (Self::Rust, "type_item") | (Self::Dart, "type_alias") => Some("type_alias"),
             (Self::Rust, "const_item") => Some("const"),
             (Self::Rust, "static_item") => Some("static"),
             (Self::Rust, "macro_definition") => Some("macro"),
@@ -230,6 +256,14 @@ impl CodeParser {
     pub fn python() -> Self {
         Self {
             language: Language::Python,
+        }
+    }
+
+    /// Construct a Dart parser.
+    #[must_use]
+    pub fn dart() -> Self {
+        Self {
+            language: Language::Dart,
         }
     }
 
@@ -306,12 +340,14 @@ impl CodeParser {
                 Imports::Rust(rust::use_decls_to_imports(&decls))
             }
             Language::Python => Imports::Python(python::extract_imports(root, text)),
+            Language::Dart => Imports::Dart(dart::extract_imports(root, text)),
         };
 
         // ── Item atoms ────────────────────────────────────────────────────────
         let items_query = match self.language {
             Language::Rust => &queries::RUST.items,
             Language::Python => &queries::PYTHON.items,
+            Language::Dart => &queries::DART.items,
         };
         let mut name_to_id: HashMap<String, EntityId> = HashMap::new();
         let mut items: Vec<(EntityId, Vec<String>)> = Vec::new();
@@ -350,6 +386,19 @@ impl CodeParser {
                         item_name.as_str(),
                         item_name.as_str(),
                         &queries::PYTHON.class_methods,
+                    )),
+                    // Dart carries methods in four container kinds, all of
+                    // which key on the container's own name like Python.
+                    (
+                        Language::Dart,
+                        "class_declaration"
+                        | "mixin_declaration"
+                        | "extension_declaration"
+                        | "enum_declaration",
+                    ) => Some((
+                        item_name.as_str(),
+                        item_name.as_str(),
+                        &queries::DART.class_methods,
                     )),
                     _ => None,
                 };
@@ -555,11 +604,7 @@ fn extract_methods(
             } else {
                 capture.node
             };
-            let Some(method_name) = inner
-                .child_by_field_name("name")
-                .and_then(|n| n.utf8_text(source.as_bytes()).ok())
-                .map(str::to_owned)
-            else {
+            let Some(method_name) = declared_name(&inner, source) else {
                 continue;
             };
 
@@ -663,16 +708,49 @@ fn extract_name(node: &Node, source: &str, ts_kind: &str) -> Option<String> {
             Some(type_name.to_owned())
         };
     }
-    node.child_by_field_name("name")
+    declared_name(node, source)
+}
+
+/// Name a declaration binds, whatever depth the grammar hides it at.
+///
+/// Rust and Python expose `name:` on the declaration itself and return on
+/// the first branch. Dart buries it: `function_declaration` and
+/// `method_declaration` both carry `signature:`, which holds a
+/// `function_signature` (wrapped in a `method_signature` for methods)
+/// bearing the actual `name:`. Shared by the item and method extractors so
+/// the two cannot drift apart.
+fn declared_name(node: &Node, source: &str) -> Option<String> {
+    if let Some(name) = node
+        .child_by_field_name("name")
         .and_then(|n| n.utf8_text(source.as_bytes()).ok())
-        .map(str::to_owned)
+    {
+        return Some(name.to_owned());
+    }
+    let signature = node.child_by_field_name("signature")?;
+    signature_name(&signature, source)
+}
+
+/// Read the `name:` field of a Dart signature node, descending through the
+/// `method_signature` wrapper when there is one.
+fn signature_name(node: &Node, source: &str) -> Option<String> {
+    if let Some(name) = node
+        .child_by_field_name("name")
+        .and_then(|n| n.utf8_text(source.as_bytes()).ok())
+    {
+        return Some(name.to_owned());
+    }
+    let mut cursor = node.walk();
+    node.children(&mut cursor)
+        .find_map(|child| signature_name(&child, source))
 }
 
 // ── Doc + call dispatch ──────────────────────────────────────────────────────
 
 fn doc_for(language: Language, node: &Node, source: &str) -> String {
     match language {
-        Language::Rust => rust::doc_comment(source, node.start_position().row),
+        // Dart documents with `///` above the declaration — the same shape
+        // Rust uses, so the Rust scanner serves both.
+        Language::Rust | Language::Dart => rust::doc_comment(source, node.start_position().row),
         Language::Python => python::docstring(node, source),
     }
 }
@@ -705,6 +783,8 @@ enum Imports {
     Rust(HashMap<String, String>),
     /// Python `import` maps (symbol + module aliases).
     Python(python::PyImports),
+    /// Dart `import` maps (`show` symbols + `as` aliases).
+    Dart(dart::DartImports),
 }
 
 /// Dispatch call extraction to the matching language module, then
@@ -724,6 +804,9 @@ fn extract_calls(
         (Language::Rust, Imports::Rust(map)) => rust::extract_calls(node, source, map, &mut out),
         (Language::Python, Imports::Python(py)) => {
             python::extract_calls(node, source, py, &mut out);
+        }
+        (Language::Dart, Imports::Dart(d)) => {
+            dart::extract_calls(node, source, d, &mut out);
         }
         _ => {}
     }

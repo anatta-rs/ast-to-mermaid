@@ -159,9 +159,13 @@ fn collect_from_git_ref(root: &Path, git_ref: &str) -> Result<Vec<ParseInput>> {
         {
             continue;
         }
-        let Some(language) = language_for(Path::new(&entry.path)) else {
+        let entry_path = Path::new(&entry.path);
+        let Some(language) = language_for(entry_path) else {
             continue;
         };
+        if is_generated_dart(entry_path) {
+            continue;
+        }
         let content = reader.read_blob(&entry.blob_sha)?;
         out.push(ParseInput {
             display_path: entry.path,
@@ -375,6 +379,7 @@ fn parse_one_file(input: &ParseInput, cache: Option<&Cache>) -> Result<(ParseUni
     let parser = match input.language {
         Language::Rust => CodeParser::rust(),
         Language::Python => CodeParser::python(),
+        Language::Dart => CodeParser::dart(),
     };
     let unit = parser
         .parse(&input.content, &input.display_path)
@@ -571,6 +576,7 @@ fn walk_into(
             walk_into(&path, extra_exclude, out, visited)?;
         } else if file_type.is_file()
             && let Some(lang) = language_for(&path)
+            && !is_generated_dart(&path)
         {
             out.push((path, lang));
         }
@@ -585,8 +591,31 @@ pub(crate) fn language_for(path: &Path) -> Option<Language> {
     match path.extension().and_then(|e| e.to_str()) {
         Some("rs") => Some(Language::Rust),
         Some("py") => Some(Language::Python),
+        Some("dart") => Some(Language::Dart),
         _ => None,
     }
+}
+
+/// Suffixes of Dart files produced by `build_runner` code generators.
+///
+/// Enumerated explicitly rather than sniffed from file content: a
+/// heuristic on `_$` markers would also catch hand-written code that
+/// happens to reference generated symbols.
+const GENERATED_DART_SUFFIXES: [&str; 4] = [".g.dart", ".freezed.dart", ".mocks.dart", ".gr.dart"];
+
+/// Whether `path` is generated Dart source (`json_serializable`, Freezed,
+/// Mockito, Riverpod…).
+///
+/// Such files carry no architectural signal — they are `_$FooFromJson`
+/// boilerplate — yet they dominate the volume: on a 756-file reference
+/// corpus they were 53 files but **27% of the bytes**, one of them 893 KB
+/// on its own. Including them by default would drown the first diagram of
+/// any Flutter project, so callers skip them unless `--include-generated`
+/// is passed.
+pub(crate) fn is_generated_dart(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|name| GENERATED_DART_SUFFIXES.iter().any(|s| name.ends_with(s)))
 }
 
 /// Resolve `<root>` to a snapshot id used as the cache bundle key.
@@ -648,8 +677,39 @@ mod tests {
     fn language_for_recognizes_rs_and_py() {
         assert_eq!(language_for(Path::new("/x/foo.rs")), Some(Language::Rust));
         assert_eq!(language_for(Path::new("foo.py")), Some(Language::Python));
+        assert_eq!(language_for(Path::new("foo.dart")), Some(Language::Dart));
         assert_eq!(language_for(Path::new("Makefile")), None);
         assert_eq!(language_for(Path::new("a.txt")), None);
+    }
+
+    #[test]
+    fn generated_dart_is_recognised_by_suffix() {
+        for name in [
+            "user_database.g.dart",
+            "model.freezed.dart",
+            "api.mocks.dart",
+            "router.gr.dart",
+        ] {
+            assert!(is_generated_dart(Path::new(name)), "{name} must be flagged");
+        }
+    }
+
+    #[test]
+    fn hand_written_dart_is_not_flagged_as_generated() {
+        // `.dart` files whose stem merely ends in a generator-ish letter
+        // must survive: the check is on the full suffix, not a substring.
+        for name in [
+            "main.dart",
+            "log.dart",
+            "svg.dart",
+            "config.dart",
+            "widgets/g.dart",
+        ] {
+            assert!(
+                !is_generated_dart(Path::new(name)),
+                "{name} must not be flagged"
+            );
+        }
     }
 
     #[test]

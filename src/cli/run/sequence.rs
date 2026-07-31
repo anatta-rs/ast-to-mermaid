@@ -79,10 +79,24 @@ fn run_sequence_single(
         }
     }
     let Some((file_rel, diagram)) = diagram else {
-        eprintln!(
-            "sequence: function `{target}` not found under {}",
-            path.display()
-        );
+        // Distinguish "no such function" from "this language has no
+        // sequence support yet": reporting the former for a Dart file
+        // would send the caller hunting for a typo that isn't there.
+        if let Some((_, _, lang)) = candidates.first()
+            && candidates
+                .iter()
+                .all(|(_, _, l)| !sequence::supports_sequences(*l))
+        {
+            eprintln!(
+                "sequence: not supported for {} yet — `module` and `impact` do cover it",
+                lang.name()
+            );
+        } else {
+            eprintln!(
+                "sequence: function `{target}` not found under {}",
+                path.display()
+            );
+        }
         return ExitCode::Failure;
     };
     let rendered = sequence::render(&diagram);

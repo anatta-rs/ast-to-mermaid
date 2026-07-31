@@ -157,6 +157,19 @@ pub fn parse_source_once(content: &[u8], file_path: &str, lang: Language) -> Res
     })
 }
 
+/// Whether the sequence subsystem can report faithfully on `lang`.
+///
+/// Dart parses and renders correctly at the module level, but its node
+/// kinds collide with *both* Rust's and Python's — `for_statement`,
+/// `if_statement` and `await_expression` carry different fields in each
+/// grammar. Running the current walker over Dart would emit loop and
+/// branch labels read from fields that do not exist, i.e. plausible-looking
+/// but wrong diagrams. Until label extraction moves behind `SeqLang`, we
+/// return nothing rather than something false.
+pub(crate) fn supports_sequences(lang: Language) -> bool {
+    !matches!(lang, Language::Dart)
+}
+
 /// Extract a [`SequenceDiagram`] for every name in `targets` that resolves
 /// to a function in `tree`. The returned [`SequenceMap`] is keyed by the
 /// caller-supplied target string (the same form accepted by
@@ -171,6 +184,9 @@ pub fn parse_source_once(content: &[u8], file_path: &str, lang: Language) -> Res
 /// prior O(M·N) per-target tree re-walk.
 #[must_use]
 pub fn extract_all(tree: &Tree, source: &str, targets: &[&str], lang: Language) -> SequenceMap {
+    if !supports_sequences(lang) {
+        return SequenceMap::new();
+    }
     let root = tree.root_node();
     let fn_index = build_fn_index(root, source, lang);
     let mut out = SequenceMap::with_capacity(targets.len());
@@ -267,6 +283,12 @@ pub fn extract(
     let text = std::str::from_utf8(content).map_err(|e| {
         AstToMermaidError::InvalidInput(format!("invalid utf-8 in {file_path}: {e}"))
     })?;
+    if !supports_sequences(lang) {
+        return Err(AstToMermaidError::InvalidInput(format!(
+            "sequence diagrams are not supported for {} yet ({file_path})",
+            lang.name()
+        )));
+    }
     let tree = parse_source_once(content, file_path, lang)?;
     extract_all(&tree, text, &[target_fn], lang)
         .remove(target_fn)
