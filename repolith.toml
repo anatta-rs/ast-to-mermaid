@@ -31,12 +31,20 @@ path = "."
 # Coverage. `make coverage` and the `coverage (>= 85%)` CI job both shell out
 # to `cargo llvm-cov`; without it the gate cannot be reproduced locally, and
 # the Makefile fails with a bare "command not found".
+#
+# `package` is required, same as for cargo-semver-checks below: the repo
+# carries test fixtures that are themselves packages with binaries, and
+# `cargo install --git` scans the *whole* repository, so it finds
+# `bin_crate` / `cargo-llvm-cov` / `cargo_config_target` and refuses to
+# guess. Without this line the node fails with "multiple packages with
+# binaries found".
 [[node]]
 id = "cargo-llvm-cov"
 git = "https://github.com/taiki-e/cargo-llvm-cov"
 
   [[node.action]]
   kind = "cargo-install"
+  package = "cargo-llvm-cov"
   crate = "cargo-llvm-cov"
   install_to = "~/.cargo"
 
