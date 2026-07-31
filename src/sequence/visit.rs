@@ -149,6 +149,14 @@ impl State {
             "macro_invocation" => {
                 self.handle_macro(node, source, depth + 1);
             }
+            // Dart cascade: `obj..a()..b()`. Each `..a()` is a sibling of
+            // the receiver rather than a child of it, and carries
+            // `property:` with no `function:` — so the ordinary call
+            // handler skips it entirely. Left alone these vanish silently,
+            // which is why they get their own arm.
+            "cascade_section" => {
+                self.handle_cascade(node, source, depth + 1);
+            }
             // ── Await ──────────────────────────────────────────────────
             // Rust postfix `await_expression` (`<expr>.await`) and Python
             // prefix `await` (`await <expr>`) both wrap a single awaited
@@ -180,7 +188,9 @@ impl State {
             "if_expression" | "if_statement" => {
                 self.lift_if(node, source, depth + 1);
             }
-            "match_expression" | "match_statement" => {
+            // Dart spells it `switch`; the kinds are disjoint from both
+            // `match_*` kinds, so they join the same arm.
+            "match_expression" | "match_statement" | "switch_statement" | "switch_expression" => {
                 self.lift_match(node, source, depth + 1);
             }
             "block" => {
@@ -267,6 +277,68 @@ impl State {
         }
     }
 
+    /// Emit the call carried by a Dart `cascade_section` (`..write(x)`).
+    ///
+    /// A cascade's receiver is **not** inside the section — `obj..a()..b()`
+    /// parses as `[obj, cascade_section, cascade_section]` under one parent,
+    /// and `StringBuffer()..write(x)` as `[call_expression,
+    /// cascade_section]`. So the receiver is the parent's first named child
+    /// that isn't itself a cascade, and every section in the chain targets
+    /// that same receiver — which is what `..` means: each link applies to
+    /// the original object, not to the previous link's result.
+    fn handle_cascade(&mut self, node: &Node, source: &str, depth: usize) {
+        let receiver = node.parent().and_then(|parent| {
+            let mut cursor = parent.walk();
+            parent
+                .children(&mut cursor)
+                .find(|c| c.is_named() && c.kind() != "cascade_section")
+        });
+        let (to_id, to_label) = match receiver {
+            Some(r) => {
+                let root = attribute_receiver_root(&r, source, self.max_depth).unwrap_or("?");
+                if root == "self" {
+                    (SELF_ID.to_owned(), self.self_label())
+                } else {
+                    let display = cap_label(root);
+                    (sanitize_id(&display), display)
+                }
+            }
+            // Receiver unreadable: attribute to self rather than inventing
+            // a participant.
+            None => (SELF_ID.to_owned(), self.self_label()),
+        };
+
+        let mut cursor = node.walk();
+        let sections: Vec<Node> = node.children(&mut cursor).collect();
+        for call in sections {
+            if call.kind() != "cascade_call_expression" {
+                // e.g. `..field = x` — an assignment cascade, no call to
+                // emit, but nested calls on the right-hand side still count.
+                self.walk_expr(&call, source, depth);
+                continue;
+            }
+            let method = call
+                .child_by_field_name("property")
+                .and_then(|n| node_text(&n, source))
+                .unwrap_or("?")
+                .to_owned();
+            self.register(&to_id, &to_label);
+            self.steps.push(Step::Call {
+                from: SELF_ID.to_owned(),
+                to: to_id.clone(),
+                label: method,
+                is_await: false,
+            });
+            // Arguments can hold further calls (`..write(build())`).
+            if let Some(args) = call.child_by_field_name("arguments") {
+                let mut args_cursor = args.walk();
+                for child in args.children(&mut args_cursor) {
+                    self.walk_expr(&child, source, depth);
+                }
+            }
+        }
+    }
+
     /// Classify a callee node into `(participant_id, participant_label,
     /// method_label)`.
     fn classify_callee(&self, callee: &Node, source: &str) -> (String, String, String) {
@@ -306,14 +378,21 @@ impl State {
                     (sanitize_id(&display), display, method)
                 }
             }
-            "attribute" => {
-                // Python `obj.method` — `object` is the receiver chain,
-                // `attribute` is the method name. `obj.x.method` and
-                // `obj.chain().method` both collapse to `obj`.
+            "attribute" | "member_expression" => {
+                // Python `obj.method` (`attribute`) and Dart `obj.method`
+                // (`member_expression`) share a shape: an `object` receiver
+                // chain plus the method name. `obj.x.method` and
+                // `obj.chain().method` both collapse to `obj`. Only the
+                // field holding the method name differs.
                 let receiver_root =
                     attribute_receiver_root(callee, source, self.max_depth).unwrap_or("?");
+                let method_field = if callee.kind() == "attribute" {
+                    "attribute"
+                } else {
+                    "property"
+                };
                 let method = callee
-                    .child_by_field_name("attribute")
+                    .child_by_field_name(method_field)
                     .and_then(|n| node_text(&n, source))
                     .unwrap_or("?")
                     .to_owned();
@@ -391,24 +470,25 @@ impl State {
         // per-grammar — so it comes from `SeqLang` rather than a `match`
         // on the language here.
         let spec = self.lang.match_spec();
-        let scrutinee = short_text(node, spec.scrutinee_field, source);
+        let scrutinee = self.lang.match_scrutinee(node, source);
         let cond = format!("match {scrutinee}");
         // v1 collapses all arms into one branch — splitting onto separate
         // alt elses is a follow-up.
+        // Arms sit one level down in most grammars (`match_block` /
+        // `switch_block` under `body:`) but directly on the node for a Dart
+        // `switch_expression`, which repeats `body:` once per arm instead
+        // of wrapping them. Collecting from both levels covers all four
+        // shapes without a per-kind flag — an arm can only appear at one of
+        // them, so nothing is visited twice.
+        let arms = collect_arms(node, spec.arm_kinds);
         let arms_steps = self.walk_into(|s| {
-            if let Some(body) = node.child_by_field_name("body") {
-                let mut cursor = body.walk();
-                for child in body.children(&mut cursor) {
-                    if child.kind() != spec.arm_kind {
-                        continue;
-                    }
-                    // `None` means the arm node *is* its own body.
-                    let arm_body = spec
-                        .arm_body_field
-                        .map_or(Some(child), |f| child.child_by_field_name(f));
-                    if let Some(arm_body) = arm_body {
-                        s.walk_expr(&arm_body, source, depth);
-                    }
+            for arm in arms {
+                // `None` means the arm node *is* its own body.
+                let arm_body = spec
+                    .arm_body_field
+                    .map_or(Some(arm), |f| arm.child_by_field_name(f));
+                if let Some(arm_body) = arm_body {
+                    s.walk_expr(&arm_body, source, depth);
                 }
             }
         });
@@ -545,11 +625,15 @@ fn field_receiver_root<'a>(node: &Node, source: &'a str, limit: usize) -> Option
     node_text(&current, source)
 }
 
-/// Python counterpart of [`field_receiver_root`]: walk the receiver chain
-/// of `obj.method` / `obj.x.method` / `obj.chain().method` and return the
-/// leftmost identifier. Descends through `attribute` (chained access via the
-/// `object` field), `call` (chained calls via the `function` field),
-/// `parenthesized_expression`, and `subscript` (`d[k].method()` → `d`).
+/// Python **and Dart** counterpart of [`field_receiver_root`]: walk the
+/// receiver chain of `obj.method` / `obj.x.method` / `obj.chain().method`
+/// and return the leftmost identifier.
+///
+/// The two grammars name the same shape differently — Python `attribute` /
+/// `call` / `subscript` against Dart `member_expression` /
+/// `call_expression` / `index_expression` — but the chain is walked
+/// identically, so one function serves both. The kinds are disjoint between
+/// them, so no arm can fire for the wrong language.
 ///
 /// `limit` is the depth cap captured once on the enclosing [`State`], passed
 /// in for the same reason as [`field_receiver_root`]. On an adversarially
@@ -559,11 +643,21 @@ fn attribute_receiver_root<'a>(node: &Node, source: &'a str, limit: usize) -> Op
     let mut current = *node;
     for _ in 0..limit {
         match current.kind() {
-            "attribute" => {
+            // Python `attribute` and Dart `member_expression` both hang the
+            // receiver chain off `object`.
+            "attribute" | "member_expression" => {
                 current = current.child_by_field_name("object")?;
             }
-            "call" => {
+            // Python `call` keys the callee on `function`; Dart's
+            // `call_expression` uses the same field name.
+            "call" | "call_expression" => {
                 current = current.child_by_field_name("function")?;
+            }
+            // Dart `xs[0].m()` — the indexed value is `target`.
+            "index_expression" => {
+                current = current
+                    .child_by_field_name("target")
+                    .or_else(|| current.child_by_field_name("value"))?;
             }
             "subscript" => {
                 current = current.child_by_field_name("value")?;
@@ -592,17 +686,11 @@ fn attribute_receiver_root<'a>(node: &Node, source: &'a str, limit: usize) -> Op
     node_text(&current, source)
 }
 
-/// Short, single-line text of a child field — truncated for diagram
-/// labels. Mermaid auto-sizes the alt/loop header to the label, so an
-/// over-long condition pushes neighbouring participants off-screen.
-fn short_text(node: &Node, field: &str, source: &str) -> String {
-    const MAX: usize = 32;
-    let Some(child) = node.child_by_field_name(field) else {
-        return String::new();
-    };
-    let raw = node_text(&child, source).unwrap_or("").trim();
-    cap_at(raw, MAX)
-}
+// `short_text` lived here: it read a child field and truncated it for a
+// diagram label. Every remaining caller moved to `SeqLang`, which owns
+// field-name reads now — see `lang.rs`. Nothing in the walker reads a
+// field to build a label any more, which is the property that makes the
+// unified `match` safe across three grammars.
 
 /// Truncate a participant label so a giant fallback snippet (e.g. a
 /// chained-call expression we couldn't classify) doesn't blow the
@@ -618,6 +706,32 @@ fn cap_label(s: &str) -> String {
 /// breaks the Mermaid parser. The truncation marker is ASCII `...` —
 /// older Mermaid sequence lexers reject the Unicode ellipsis in alt/loop
 /// headers (#156).
+/// Collect a `match` / `switch`'s arms, looking both at the node's direct
+/// children and one level under them.
+///
+/// Rust, Python and Dart's `switch_statement` wrap their arms in a block
+/// (`match_block`, `block`, `switch_block`) reachable via `body:`. Dart's
+/// `switch_expression` instead repeats a `body:` field per arm, with no
+/// wrapper. Rather than branch, look at both depths and keep whatever
+/// matches `arm_kinds`.
+fn collect_arms<'t>(node: &Node<'t>, arm_kinds: &[&str]) -> Vec<Node<'t>> {
+    let mut out = Vec::new();
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if arm_kinds.contains(&child.kind()) {
+            out.push(child);
+            continue;
+        }
+        let mut inner = child.walk();
+        for grandchild in child.children(&mut inner) {
+            if arm_kinds.contains(&grandchild.kind()) {
+                out.push(grandchild);
+            }
+        }
+    }
+    out
+}
+
 pub(super) fn cap_at(s: &str, max: usize) -> String {
     let one_line: String = s
         .replace('"', "'")

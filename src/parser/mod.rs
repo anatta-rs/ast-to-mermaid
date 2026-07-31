@@ -719,7 +719,7 @@ fn extract_name(node: &Node, source: &str, ts_kind: &str) -> Option<String> {
 /// `function_signature` (wrapped in a `method_signature` for methods)
 /// bearing the actual `name:`. Shared by the item and method extractors so
 /// the two cannot drift apart.
-fn declared_name(node: &Node, source: &str) -> Option<String> {
+pub(crate) fn declared_name(node: &Node, source: &str) -> Option<String> {
     if let Some(name) = node
         .child_by_field_name("name")
         .and_then(|n| n.utf8_text(source.as_bytes()).ok())
