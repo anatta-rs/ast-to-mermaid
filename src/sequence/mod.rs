@@ -159,13 +159,16 @@ pub fn parse_source_once(content: &[u8], file_path: &str, lang: Language) -> Res
 
 /// Whether the sequence subsystem can report faithfully on `lang`.
 ///
-/// Dart parses and renders correctly at the module level, but its node
-/// kinds collide with *both* Rust's and Python's — `for_statement`,
-/// `if_statement` and `await_expression` carry different fields in each
-/// grammar. Running the current walker over Dart would emit loop and
-/// branch labels read from fields that do not exist, i.e. plausible-looking
-/// but wrong diagrams. Until label extraction moves behind `SeqLang`, we
-/// return nothing rather than something false.
+/// Dart's *labels* are correct as of the `SeqLang` split — `for_statement`
+/// and `if_statement` now read their own fields, so nothing wrong is
+/// emitted. What is still missing is `cascade_call_expression`
+/// (`obj..a()..b()`), which carries `property:` but no `function:` and so
+/// slips past the call handler: roughly 1700 occurrences in the reference
+/// corpus would be *silently absent* from the diagram.
+///
+/// A missing call is a weaker failure than a wrong label, but a sequence
+/// diagram claiming to walk a body in order while dropping every cascade
+/// is still not honest. Kept off until cascades land.
 pub(crate) fn supports_sequences(lang: Language) -> bool {
     !matches!(lang, Language::Dart)
 }
@@ -230,7 +233,7 @@ fn build_fn_index<'tree>(
     let mut out: HashMap<String, (Node<'tree>, Option<String>)> = HashMap::new();
     let mut stack: Vec<(Node<'tree>, Option<String>)> = vec![(root, None)];
     while let Some((node, container)) = stack.pop() {
-        if node.kind() == lang.fn_kind()
+        if lang.fn_kinds().contains(&node.kind())
             && let Some(name_node) = node.child_by_field_name("name")
             && let Ok(name) = name_node.utf8_text(source.as_bytes())
         {
@@ -244,7 +247,7 @@ fn build_fn_index<'tree>(
                     .or_insert_with(|| (node, container.clone()));
             }
         }
-        let next_container = if node.kind() == lang.container_kind() {
+        let next_container = if lang.container_kinds().contains(&node.kind()) {
             lang.container_name(&node, source)
                 .or_else(|| container.clone())
         } else {
@@ -329,7 +332,7 @@ pub fn list_functions_in_tree(tree: &Tree, source: &str, lang: Language) -> Vec<
     // Depth-first, but preserve source order: push children in reverse so
     // they pop left-to-right.
     while let Some((node, container)) = stack.pop() {
-        if node.kind() == lang.fn_kind()
+        if lang.fn_kinds().contains(&node.kind())
             && let Some(name_node) = node.child_by_field_name("name")
             && let Ok(name) = name_node.utf8_text(source.as_bytes())
         {
@@ -338,7 +341,7 @@ pub fn list_functions_in_tree(tree: &Tree, source: &str, lang: Language) -> Vec<
                 .map_or_else(|| name.to_owned(), |c| format!("{c}::{name}"));
             out.push(qualified);
         }
-        let next_container = if node.kind() == lang.container_kind() {
+        let next_container = if lang.container_kinds().contains(&node.kind()) {
             lang.container_name(&node, source).or(container)
         } else {
             container.clone()
