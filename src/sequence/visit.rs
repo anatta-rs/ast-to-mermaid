@@ -378,12 +378,17 @@ impl State {
                     (sanitize_id(&display), display, method)
                 }
             }
-            "attribute" | "member_expression" => {
-                // Python `obj.method` (`attribute`) and Dart `obj.method`
-                // (`member_expression`) share a shape: an `object` receiver
-                // chain plus the method name. `obj.x.method` and
-                // `obj.chain().method` both collapse to `obj`. Only the
-                // field holding the method name differs.
+            "attribute" | "member_expression" | "null_aware_member_expression" => {
+                // Python `obj.method` (`attribute`) and Dart `obj.method` /
+                // `obj?.method` (`member_expression` and its null-aware
+                // twin) share a shape: an `object` receiver chain plus the
+                // method name. `obj.x.method` and `obj.chain().method` both
+                // collapse to `obj`. Only the field holding the method name
+                // differs.
+                //
+                // The null-aware kind must be listed explicitly: `?.` is
+                // common in Dart, and without it the snippet fallback names
+                // the participant `obj?.method` instead of `obj`.
                 let receiver_root =
                     attribute_receiver_root(callee, source, self.max_depth).unwrap_or("?");
                 let method_field = if callee.kind() == "attribute" {
@@ -644,8 +649,9 @@ fn attribute_receiver_root<'a>(node: &Node, source: &'a str, limit: usize) -> Op
     for _ in 0..limit {
         match current.kind() {
             // Python `attribute` and Dart `member_expression` both hang the
-            // receiver chain off `object`.
-            "attribute" | "member_expression" => {
+            // receiver chain off `object`. Dart's null-aware `obj?.m()` is
+            // the same shape under another kind.
+            "attribute" | "member_expression" | "null_aware_member_expression" => {
                 current = current.child_by_field_name("object")?;
             }
             // Python `call` keys the callee on `function`; Dart's

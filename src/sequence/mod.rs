@@ -424,6 +424,26 @@ mod tests {
         assert_eq!(calls_of(&d), vec![("cache".to_owned(), "open".to_owned())]);
     }
 
+    /// `obj?.m()` is a distinct node kind from `obj.m()`. Left out, it
+    /// falls through to the snippet fallback and names the participant
+    /// `obj?.m` — spotted on real Flutter output, not in a fixture.
+    #[test]
+    fn dart_null_aware_call_targets_receiver() {
+        let d = extract_dart("void run() { session?.release(); }\n", "run");
+        assert_eq!(
+            calls_of(&d),
+            vec![("session".to_owned(), "release".to_owned())]
+        );
+    }
+
+    /// Chained null-aware access collapses to the leftmost identifier,
+    /// like its plain counterpart.
+    #[test]
+    fn dart_chained_null_aware_collapses_to_root() {
+        let d = extract_dart("void run() { xs?.first?.run(); }\n", "run");
+        assert_eq!(calls_of(&d), vec![("xs".to_owned(), "run".to_owned())]);
+    }
+
     /// Cascades carry `property:` but no `function:`, so the ordinary call
     /// handler skips them. Each link targets the *original* receiver —
     /// that is what `..` means.
