@@ -15,8 +15,9 @@
 #![deny(unsafe_code)]
 
 use ast_to_mermaid::cli::{
-    AnalyzeFlags, BundleFlags, DiffFlags, ExitCode, GcFlags, IndexFlags, SequenceFlags, WalkFlags,
-    run_analyze, run_bundle, run_diff, run_gc, run_index, run_sequence, run_walk,
+    AnalyzeFlags, BundleFlags, DiffFlags, ExitCode, FlowFlags, GcFlags, IndexFlags, SequenceFlags,
+    WalkFlags, run_analyze, run_bundle, run_diff, run_flow, run_gc, run_index, run_sequence,
+    run_walk,
 };
 use ast_to_mermaid::render::Level;
 use clap::{Parser, Subcommand};
@@ -57,6 +58,12 @@ enum Command {
     /// `match` lift to `alt`, loops lift to `loop`, `.await` annotates
     /// the arrow.
     Sequence(SequenceFlags),
+    /// Render the forward call graph from one entry point, each edge
+    /// annotated with the call's position in the caller's body and its
+    /// control-flow context (`await`, `alt`, `loop`). Complements
+    /// `impact` (both directions, no order) and `sequence` (one body,
+    /// full order).
+    Flow(FlowFlags),
     /// List source files under a path (no parsing).
     Walk(WalkFlags),
     /// Produce the 4-layer artifact bundle for a project.
@@ -82,6 +89,7 @@ fn main() -> std::process::ExitCode {
         Command::Function(f) => run_analyze(Level::Function, &f),
         Command::Impact(f) => run_analyze(Level::Impact, &f),
         Command::Sequence(f) => run_sequence(&f),
+        Command::Flow(f) => run_flow(&f),
         Command::Walk(f) => run_walk(&f),
         Command::Bundle(f) => run_bundle(&f),
         Command::Index(f) => run_index(&f),

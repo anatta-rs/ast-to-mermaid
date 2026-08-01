@@ -295,7 +295,7 @@ a2m project ./my-repo --exclude vendor,generated
 a2m project ./my-repo --trace=info
 ```
 
-## The eleven subcommands
+## The twelve subcommands
 
 | Subcommand | Output | Needs `--target` |
 |---|---|---|
@@ -305,15 +305,38 @@ a2m project ./my-repo --trace=info
 | `a2m function` | A single function with its callers, walked back N hops | yes — function name |
 | `a2m impact` | Forward + backward call chain from a function (default 3 hops) | yes — function name |
 | `a2m sequence` | One function body as a Mermaid `sequenceDiagram` (statement order, lifelines per receiver) | yes — function name, or `--all` |
+| `a2m flow` | Forward call graph from an entry point, each edge annotated with call order and control flow (`await` / `alt` / `loop`) | yes — function name |
 | `a2m walk` | List source files under a path (no parsing) — handy for shell pipelines | no |
 | `a2m bundle` | Full 4-layer artifact bundle (`+ sequences/` with `--with-sequences`, see below) | no — needs `--out` |
 | `a2m index` | Materialize a bundle for a git ref into the cache (`./.a2m/cache/refs/<sha>/`) | no — defaults to working tree |
 | `a2m diff` | Set-diff between two cached bundles, colour-coded Mermaid or JSON | yes — `<ref-a>..<ref-b>` |
 | `a2m gc` | Evict old / oversized cache entries by mtime + soft size cap | no |
 
-The first eight accept `--ref <git-ref>` to read from any ref instead of the working tree. The last three accept `--cache-dir <path>` to relocate the cache and `--no-cache` to bypass it (ephemeral tempdir).
+The first nine accept `--ref <git-ref>` to read from any ref instead of the working tree. The last three accept `--cache-dir <path>` to relocate the cache and `--no-cache` to bypass it (ephemeral tempdir).
 
 The five analyze-flavoured subcommands (`project`, `overview`, `module`, `function`, `impact`) also accept `--format <mermaid|dot>` — see [When the graph is too big for Mermaid](#when-the-graph-is-too-big-for-mermaid).
+
+### Order of operations, across functions: `a2m flow`
+
+`sequence` walks one body; `impact` walks the graph both ways but says nothing about *when* a call happens. `flow` is the third axis: forward from one entry point, transitively, with each edge carrying its call's rank in the caller's body and its control-flow context.
+
+```bash
+$ a2m flow --target main lib/ --depth 2
+```
+
+```
+main -->|"2 await"| NotificationService::initialize
+main -->|"3 await"| initCoverStorage
+main -->|"6 await"| initOnboardingFlag
+main -->|"7 alt"|   _parseThemeMode
+initOnboardingFlag -->|"1 await"| UserDao::onboardingVersionSeen
+```
+
+`7 alt` says `_parseThemeMode` is the seventh call in `main` **and** that it sits under an `if` — it may never run. The rank is never shown without that context: on its own it would imply a sequence the code does not promise.
+
+Calls into code outside the graph (the Flutter SDK, another crate) appear as dashed leaves at depth 1 — enough to see that `main` ends on `runApp` — and are dropped deeper, where the ratio drowns your own code. `--include-external` keeps them at every depth, `--no-external` removes them entirely.
+
+Recursion is shown, not hidden: the nodes of a cycle are styled, expansion stops at the return edge, and a cycle that `--depth` would have truncated still emits a dotted `cycle (depth limit)` edge — otherwise the graph would look acyclic.
 
 ## When the graph is too big for Mermaid
 

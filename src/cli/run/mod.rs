@@ -10,6 +10,7 @@
 mod analyze;
 mod bundle;
 mod diff;
+mod flow;
 mod gc;
 mod index;
 mod sequence;
@@ -18,6 +19,7 @@ mod walk;
 pub use analyze::run_analyze;
 pub use bundle::run_bundle;
 pub use diff::run_diff;
+pub use flow::run_flow;
 pub use gc::run_gc;
 pub use index::run_index;
 pub use sequence::run_sequence;

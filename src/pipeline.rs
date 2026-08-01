@@ -54,6 +54,10 @@ pub struct AnalyzeOptions {
     /// 893 KB, and no architectural signal. Turn this on to audit what a
     /// generator actually emitted.
     pub include_generated: bool,
+    /// Forward depth for [`Level::Flow`]. Ignored by every other level.
+    pub flow_depth: u8,
+    /// How [`Level::Flow`] treats calls into code outside the graph.
+    pub flow_external: crate::render::flow::External,
 }
 
 impl Default for AnalyzeOptions {
@@ -67,6 +71,8 @@ impl Default for AnalyzeOptions {
             with_sequences: false,
             allow_empty: false,
             include_generated: false,
+            flow_depth: crate::render::flow::DEFAULT_DEPTH,
+            flow_external: crate::render::flow::External::NearOnly,
         }
     }
 }
@@ -85,6 +91,8 @@ impl std::fmt::Debug for AnalyzeOptions {
             .field("with_sequences", &self.with_sequences)
             .field("allow_empty", &self.allow_empty)
             .field("include_generated", &self.include_generated)
+            .field("flow_depth", &self.flow_depth)
+            .field("flow_external", &self.flow_external)
             .finish()
     }
 }
@@ -262,6 +270,19 @@ pub fn analyze(root: &Path, opts: &AnalyzeOptions) -> Result<AnalyzeReport> {
     // RwLock acquisitions per render call.
     let mermaid = store.with_atoms(|atoms| {
         let snapshot = AtomSnapshot::build(atoms);
+        // `flow` needs depth + external options the shared dispatcher
+        // does not take, so it is called directly here rather than
+        // widening `render`'s signature for one level.
+        if opts.level == Level::Flow {
+            let target = opts.target.as_deref().unwrap_or_default();
+            return crate::render::flow::render(
+                &adj,
+                &snapshot,
+                target,
+                opts.flow_depth,
+                opts.flow_external,
+            );
+        }
         render(opts.level, &adj, &snapshot, opts.target.as_deref())
     })?;
 
@@ -896,6 +917,8 @@ mod tests {
                 git_ref: None,
                 cache: None,
                 include_generated: false,
+                flow_depth: crate::render::flow::DEFAULT_DEPTH,
+                flow_external: crate::render::flow::External::NearOnly,
                 with_sequences: false,
                 allow_empty: false,
             },
