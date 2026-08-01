@@ -13,7 +13,7 @@
 //! showed up.
 
 use ast_to_mermaid::Store;
-use ast_to_mermaid::model::{CodeAtom, EntityId};
+use ast_to_mermaid::model::{CallSite, CodeAtom, EntityId};
 use ast_to_mermaid::resolve::resolve_cross_module_calls;
 use criterion::{Criterion, black_box, criterion_group, criterion_main};
 
@@ -49,7 +49,7 @@ fn function_atom(file_path: &str, name: &str, calls: Vec<String>) -> CodeAtom {
         doc: String::new(),
         signature: String::new(),
         content_hash: "h".to_owned(),
-        calls,
+        calls: calls.into_iter().map(CallSite::bare).collect(),
         method_calls: Vec::new(),
         parent: None,
     }

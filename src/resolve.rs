@@ -222,8 +222,8 @@ pub fn resolve_cross_module_calls(store: &Store) -> usize {
             let caller_crate = crate_root(caller);
             let caller_lang = lang_of(&caller.file_path);
 
-            for call_name in &caller.calls {
-                let (path_prefix, fn_name) = split_call_name(call_name);
+            for site in &caller.calls {
+                let (path_prefix, fn_name) = split_call_name(&site.name);
                 if skip_set.contains(fn_name) {
                     continue;
                 }
@@ -704,6 +704,7 @@ fn crate_root(atom: &CodeAtom) -> Option<String> {
 mod tests {
     use super::*;
     use crate::graph::Store;
+    use crate::model::CallSite;
     use crate::model::{CodeAtom, EntityId};
 
     fn function_atom(file_path: &str, name: &str, calls: &[&str]) -> CodeAtom {
@@ -717,7 +718,7 @@ mod tests {
             doc: String::new(),
             signature: String::new(),
             content_hash: "deadbeef".to_owned(),
-            calls: calls.iter().map(|s| (*s).to_owned()).collect(),
+            calls: calls.iter().map(|s| CallSite::bare(*s)).collect(),
             method_calls: Vec::new(),
             parent: None,
         }
@@ -1349,7 +1350,7 @@ mod tests {
             doc: String::new(),
             signature: String::new(),
             content_hash: "deadbeef".to_owned(),
-            calls: calls.iter().map(|s| (*s).to_owned()).collect(),
+            calls: calls.iter().map(|s| CallSite::bare(*s)).collect(),
             method_calls: Vec::new(),
             parent: Some(owner.to_owned()),
         }

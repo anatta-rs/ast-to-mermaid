@@ -10,6 +10,7 @@ use tree_sitter::{Node, QueryCursor, StreamingIterator};
 
 use super::ExtractedCalls;
 use super::queries;
+use crate::parser::Language;
 
 // ── Import extraction ─────────────────────────────────────────────────────────
 
@@ -341,12 +342,11 @@ pub(super) fn extract_calls(
                     let Some(name) = node_text(&cap.node, source) else {
                         continue;
                     };
-                    out.calls.push(
-                        imports
-                            .symbols
-                            .get(name)
-                            .map_or_else(|| name.to_owned(), String::clone),
-                    );
+                    let resolved = imports
+                        .symbols
+                        .get(name)
+                        .map_or_else(|| name.to_owned(), String::clone);
+                    out.push_call(resolved, &cap.node, Language::Dart);
                 }
                 // `obj.method()` and its null-aware twin `obj?.method()`
                 // share a shape; #174 handled the latter in the sequence
@@ -361,7 +361,11 @@ pub(super) fn extract_calls(
                         // resolver-eligible qualified call. Checked first:
                         // an alias could in principle be capitalised, and
                         // the import is the stronger signal.
-                        out.calls.push(format!("{module_stem}::{method}"));
+                        out.push_call(
+                            format!("{module_stem}::{method}"),
+                            &cap.node,
+                            Language::Dart,
+                        );
                     } else if direct_receiver(&cap.node, source).is_some_and(is_type_name) {
                         // `NotificationService.initialize()` — a leading
                         // capital is Dart's type convention, enforced by
@@ -382,7 +386,7 @@ pub(super) fn extract_calls(
                         // exists in the graph and is unique, so an SDK class
                         // such as `MediaQuery.of()` resolves to nothing
                         // rather than to something wrong.
-                        out.calls.push(format!("{root}::{method}"));
+                        out.push_call(format!("{root}::{method}"), &cap.node, Language::Dart);
                     } else if let Some(ty) =
                         direct_receiver(&cap.node, source).and_then(|r| imports.receivers.get(r))
                     {
@@ -394,7 +398,7 @@ pub(super) fn extract_calls(
                         // Direct receiver only, for the reason spelled out
                         // above: in `a.b.method()` the method belongs to the
                         // type of `a.b`, which the table does not know.
-                        out.calls.push(format!("{ty}::{method}"));
+                        out.push_call(format!("{ty}::{method}"), &cap.node, Language::Dart);
                     } else {
                         // Type unknown or ambiguous. Intra-container linking
                         // only; binding it to a same-named method elsewhere
@@ -465,6 +469,13 @@ fn node_text<'a>(node: &Node, source: &'a str) -> Option<&'a str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Call names only — tests assert on what is called, the rank and
+    /// flags are covered by their own tests.
+    fn names(sites: &[crate::model::CallSite]) -> Vec<String> {
+        sites.iter().map(|s| s.name.clone()).collect()
+    }
+
     use crate::parser::Language;
 
     fn imports_of(src: &str) -> DartImports {
@@ -569,7 +580,7 @@ mod tests {
             .find(|a| a.name == "main" && a.kind == "function")
             .expect("main atom");
         assert_eq!(
-            main_atom.calls,
+            names(&main_atom.calls),
             vec!["helper".to_owned()],
             "a top-level function must report what it calls"
         );
@@ -580,7 +591,7 @@ mod tests {
     #[test]
     fn bare_call_without_import_is_left_alone() {
         let c = calls_of("void f() { helper(); }\n");
-        assert_eq!(c.calls, vec!["helper".to_owned()]);
+        assert_eq!(names(&c.calls), vec!["helper".to_owned()]);
         assert!(c.method_calls.is_empty());
     }
 
@@ -592,7 +603,7 @@ mod tests {
             "import '../models/user.dart' show parseUser;\nvoid f() { parseUser('x'); }\n",
         );
         assert!(
-            c.calls.contains(&"user::parseUser".to_owned()),
+            names(&c.calls).contains(&"user::parseUser".to_owned()),
             "got {:?}",
             c.calls
         );
@@ -606,7 +617,7 @@ mod tests {
             "import 'package:demo/models/user.dart' as models;\nvoid f() { models.parseUser('x'); }\n",
         );
         assert!(
-            c.calls.contains(&"user::parseUser".to_owned()),
+            names(&c.calls).contains(&"user::parseUser".to_owned()),
             "got {:?}",
             c.calls
         );
@@ -619,7 +630,7 @@ mod tests {
     fn unknown_receiver_lands_in_method_calls() {
         let c = calls_of("void f() { widget.build(); }\n");
         assert_eq!(c.method_calls, vec!["build".to_owned()]);
-        assert!(c.calls.is_empty(), "got {:?}", c.calls);
+        assert!(c.calls.is_empty(), "got {:?}", names(&c.calls));
     }
 
     /// A capitalised receiver is a type, not an instance — Dart's
@@ -629,7 +640,10 @@ mod tests {
     #[test]
     fn capitalised_receiver_is_a_qualified_type_call() {
         let c = calls_of("void f() { NotificationService.initialize(); }\n");
-        assert_eq!(c.calls, vec!["NotificationService::initialize".to_owned()]);
+        assert_eq!(
+            names(&c.calls),
+            vec!["NotificationService::initialize".to_owned()]
+        );
         assert!(c.method_calls.is_empty(), "got {:?}", c.method_calls);
     }
 
@@ -638,7 +652,7 @@ mod tests {
     #[test]
     fn private_type_receiver_is_still_a_type() {
         let c = calls_of("void f() { _CacheEntry.parse('x'); }\n");
-        assert_eq!(c.calls, vec!["_CacheEntry::parse".to_owned()]);
+        assert_eq!(names(&c.calls), vec!["_CacheEntry::parse".to_owned()]);
     }
 
     /// An import alias wins over the capital rule: the import is the
@@ -648,7 +662,7 @@ mod tests {
         let c = calls_of(
             "import 'package:demo/models/user.dart' as Models;\nvoid f() { Models.parseUser('x'); }\n",
         );
-        assert_eq!(c.calls, vec!["user::parseUser".to_owned()]);
+        assert_eq!(names(&c.calls), vec!["user::parseUser".to_owned()]);
     }
 
     /// Lowercase receivers whose type the file never states keep the old
@@ -657,7 +671,7 @@ mod tests {
     fn lowercase_receiver_of_unknown_type_lands_in_method_calls() {
         let c = calls_of("void f() { notificationService.initialize(); }\n");
         assert_eq!(c.method_calls, vec!["initialize".to_owned()]);
-        assert!(c.calls.is_empty(), "got {:?}", c.calls);
+        assert!(c.calls.is_empty(), "got {:?}", names(&c.calls));
     }
 
     // ── Receiver-type inference ──────────────────────────────────────────
@@ -667,7 +681,7 @@ mod tests {
     #[test]
     fn field_declaration_types_its_receiver() {
         let c = calls_of("class R {\n  final UserDao dao;\n  void run() { dao.fetch(); }\n}\n");
-        assert_eq!(c.calls, vec!["UserDao::fetch".to_owned()]);
+        assert_eq!(names(&c.calls), vec!["UserDao::fetch".to_owned()]);
         assert!(c.method_calls.is_empty(), "got {:?}", c.method_calls);
     }
 
@@ -675,14 +689,14 @@ mod tests {
     #[test]
     fn parameter_declaration_types_its_receiver() {
         let c = calls_of("void run(NotifService svc) { svc.notify(); }\n");
-        assert_eq!(c.calls, vec!["NotifService::notify".to_owned()]);
+        assert_eq!(names(&c.calls), vec!["NotifService::notify".to_owned()]);
     }
 
     #[test]
     fn annotated_local_types_its_receiver() {
         let c = calls_of("void f() { final Logger log = Logger(); log.warn(); }\n");
         assert!(
-            c.calls.contains(&"Logger::warn".to_owned()),
+            names(&c.calls).contains(&"Logger::warn".to_owned()),
             "got {:?}",
             c.calls
         );
@@ -693,7 +707,7 @@ mod tests {
     fn constructed_local_types_its_receiver() {
         let c = calls_of("void f() { final buf = StringBuffer(); buf.write('x'); }\n");
         assert!(
-            c.calls.contains(&"StringBuffer::write".to_owned()),
+            names(&c.calls).contains(&"StringBuffer::write".to_owned()),
             "got {:?}",
             c.calls
         );
@@ -717,7 +731,7 @@ mod tests {
     fn a_name_repeated_with_one_type_stays_usable() {
         let c = calls_of("void a(UserDao x) { x.run(); }\nvoid b(UserDao x) { x.run(); }\n");
         assert_eq!(
-            c.calls,
+            names(&c.calls),
             vec!["UserDao::run".to_owned(), "UserDao::run".to_owned()]
         );
     }
@@ -728,7 +742,7 @@ mod tests {
     #[test]
     fn generic_type_binds_the_container_not_its_argument() {
         let c = calls_of("void f(List<Note> xs) { xs.add(1); }\n");
-        assert_eq!(c.calls, vec!["List::add".to_owned()]);
+        assert_eq!(names(&c.calls), vec!["List::add".to_owned()]);
     }
 
     /// The chain rule from #184 still applies: only a direct receiver is
@@ -738,7 +752,7 @@ mod tests {
         let c =
             calls_of("class R {\n  final UserDao dao;\n  void run() { dao.cache.clear(); }\n}\n");
         assert_eq!(c.method_calls, vec!["clear".to_owned()]);
-        assert!(c.calls.is_empty(), "got {:?}", c.calls);
+        assert!(c.calls.is_empty(), "got {:?}", names(&c.calls));
     }
 
     /// `session?.release()` used to hit `_ => {}` and disappear from the
@@ -751,7 +765,7 @@ mod tests {
 
         let upper = calls_of("void f() { NotificationService?.initialize(); }\n");
         assert_eq!(
-            upper.calls,
+            names(&upper.calls),
             vec!["NotificationService::initialize".to_owned()]
         );
     }
@@ -774,7 +788,9 @@ mod tests {
         let c = calls_of("void f() { AppTextStyles.caption.copyWith(); }\n");
         assert_eq!(c.method_calls, vec!["copyWith".to_owned()]);
         assert!(
-            !c.calls.iter().any(|s| s.starts_with("AppTextStyles::")),
+            !names(&c.calls)
+                .iter()
+                .any(|s| s.starts_with("AppTextStyles::")),
             "must not attribute copyWith to AppTextStyles: {:?}",
             c.calls
         );
@@ -784,7 +800,7 @@ mod tests {
     #[test]
     fn direct_type_receiver_is_qualified() {
         let c = calls_of("void f() { AppTextStyles.caption(); }\n");
-        assert_eq!(c.calls, vec!["AppTextStyles::caption".to_owned()]);
+        assert_eq!(names(&c.calls), vec!["AppTextStyles::caption".to_owned()]);
     }
 
     /// `a.b.method()` collapses to the leftmost identifier, so an aliased
@@ -808,7 +824,11 @@ mod tests {
     #[test]
     fn call_receiver_drops_the_outer_call_like_python_does() {
         let c = calls_of("void f() { build().render(); }\n");
-        assert!(c.calls.contains(&"build".to_owned()), "got {:?}", c.calls);
+        assert!(
+            names(&c.calls).contains(&"build".to_owned()),
+            "got {:?}",
+            names(&c.calls)
+        );
         assert!(
             !c.method_calls.contains(&"render".to_owned()),
             "known limitation shared with python.rs: {c:?}"
@@ -820,8 +840,16 @@ mod tests {
     #[test]
     fn nested_argument_calls_are_captured() {
         let c = calls_of("void f() { outer(inner()); }\n");
-        assert!(c.calls.contains(&"outer".to_owned()), "got {:?}", c.calls);
-        assert!(c.calls.contains(&"inner".to_owned()), "got {:?}", c.calls);
+        assert!(
+            names(&c.calls).contains(&"outer".to_owned()),
+            "got {:?}",
+            names(&c.calls)
+        );
+        assert!(
+            names(&c.calls).contains(&"inner".to_owned()),
+            "got {:?}",
+            names(&c.calls)
+        );
     }
 
     /// Cascades carry `property:` and no `function:`, so the call query
@@ -832,7 +860,8 @@ mod tests {
     fn cascade_links_are_not_call_query_matches() {
         let c = calls_of("void f() { buffer..write('a'); }\n");
         assert!(
-            !c.calls.contains(&"write".to_owned()) && !c.method_calls.contains(&"write".to_owned()),
+            !names(&c.calls).contains(&"write".to_owned())
+                && !c.method_calls.contains(&"write".to_owned()),
             "cascade must not surface here: {c:?}"
         );
     }

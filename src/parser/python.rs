@@ -7,6 +7,7 @@ use tree_sitter::{Node, QueryCursor, StreamingIterator};
 use super::ExtractedCalls;
 use super::queries;
 use crate::limits::max_ast_depth;
+use crate::parser::Language;
 
 // ── Import extraction ─────────────────────────────────────────────────────────
 
@@ -236,12 +237,11 @@ pub(super) fn extract_calls(
                     let Some(name) = node_text(&cap.node, source) else {
                         continue;
                     };
-                    out.calls.push(
-                        imports
-                            .symbols
-                            .get(name)
-                            .map_or_else(|| name.to_owned(), String::clone),
-                    );
+                    let resolved = imports
+                        .symbols
+                        .get(name)
+                        .map_or_else(|| name.to_owned(), String::clone);
+                    out.push_call(resolved, &cap.node, Language::Python);
                 }
                 "attribute" => {
                     let Some((root, method)) = attribute_root_method(&cap.node, source) else {
@@ -250,7 +250,11 @@ pub(super) fn extract_calls(
                     if let Some(module_last) = imports.modules.get(root) {
                         // `mod.fn()` where `mod` is an imported module →
                         // resolver-eligible qualified call.
-                        out.calls.push(format!("{module_last}::{method}"));
+                        out.push_call(
+                            format!("{module_last}::{method}"),
+                            &cap.node,
+                            Language::Python,
+                        );
                     } else {
                         // Unknown receiver type — intra-class linking only.
                         out.method_calls.push(method.to_owned());
@@ -364,7 +368,10 @@ mod tests {
         let imp = imports_of("from lib.catalog import load_catalog\n");
         let calls = calls_of("load_catalog()\n", &imp);
         assert!(
-            calls.calls.iter().any(|c| c == "catalog::load_catalog"),
+            calls
+                .calls
+                .iter()
+                .any(|c| c.name == "catalog::load_catalog"),
             "calls={:?}",
             calls.calls
         );
@@ -375,7 +382,7 @@ mod tests {
         let imp = imports_of("import lib.config as config\n");
         let calls = calls_of("config.current()\n", &imp);
         assert!(
-            calls.calls.iter().any(|c| c == "config::current"),
+            calls.calls.iter().any(|c| c.name == "config::current"),
             "calls={:?}",
             calls.calls
         );
@@ -385,7 +392,7 @@ mod tests {
     fn unimported_bare_call_stays_bare() {
         let calls = calls_of("helper()\n", &PyImports::default());
         assert!(
-            calls.calls.iter().any(|c| c == "helper"),
+            calls.calls.iter().any(|c| c.name == "helper"),
             "{:?}",
             calls.calls
         );
