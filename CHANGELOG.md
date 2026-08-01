@@ -8,6 +8,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.0](https://github.com/anatta-rs/ast-to-mermaid/compare/v0.9.0...v0.10.0) - 2026-08-01
+
+### Bug fixes
+
+- *(parser)* Record every call occurrence, in source order ([#196](https://github.com/anatta-rs/ast-to-mermaid/pull/196))
+
+### Breaking
+
+- `CodeAtom::method_calls` is now `Vec<CallSite>` instead of `Vec<String>`,
+  so each receiver-style call carries its rank and control-flow context.
+  `cargo-semver-checks` did not flag the field's type change; the minor
+  bump is deliberate. Migration: read `site.name` where a `String` was
+  used before.
+
 ## [0.9.0](https://github.com/anatta-rs/ast-to-mermaid/compare/v0.8.0...v0.9.0) - 2026-08-01
 
 ### Bug fixes
