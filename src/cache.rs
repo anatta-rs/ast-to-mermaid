@@ -139,7 +139,11 @@ const SCHEMA_VERSION: u32 = 6;
 /// invisible on any tree that has been indexed before — which is how it
 /// was found: a project with a warm `.a2m` still showed `main()` with no
 /// callees while a fresh copy of the same source showed four.
-const GRAMMAR_VERSION: u32 = 4;
+///
+/// `5`: Dart receiver-type inference (#188). `obj.method()` now emits
+/// `Type::method` whenever the file declares `obj`'s type, so cached
+/// units carry method names where qualified calls are now produced.
+const GRAMMAR_VERSION: u32 = 5;
 
 /// Compute the cache version string written to `<root>/version`.
 fn cache_version() -> String {
