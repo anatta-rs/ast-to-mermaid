@@ -638,7 +638,25 @@ fn crate_root(atom: &CodeAtom) -> Option<String> {
     if atom.file_path.is_empty() {
         return None;
     }
-    if matches!(lang_of(&atom.file_path), "py" | "dart") {
+    // Dart: one pub package is one resolution unit, and the analysed root
+    // *is* that package (`lib/`). Every `.dart` file therefore shares a
+    // root — the same answer Rust gives for a top-level `src/`.
+    //
+    // Deliberately not Python's rule. Splitting on the first path segment
+    // carves a Flutter project into `main.dart` (root `""`), `core`,
+    // `features` and `l10n`, and the same-crate filter then rejects every
+    // call between them: on a 98-file project that left 19 of 20 edges
+    // intra-directory and `main.dart` with none at all, despite importing
+    // `core/router/app_router.dart` by name and calling into it.
+    //
+    // Analysing a parent holding several pub packages merges their roots.
+    // Accepted: the unicity filter in `pick_unique_with_same_crate_pref`
+    // still refuses ambiguous names, so a wider crate yields more
+    // resolution, not more guessing.
+    if lang_of(&atom.file_path) == "dart" {
+        return Some(String::new());
+    }
+    if lang_of(&atom.file_path) == "py" {
         return Some(match atom.file_path.split_once('/') {
             Some((head, _)) => head.to_owned(),
             None => String::new(),
@@ -724,8 +742,48 @@ mod tests {
     fn dart_files_in_one_package_share_a_crate_root() {
         let a = function_atom("lib/models/user.dart", "parseUser", &[]);
         let b = function_atom("lib/svc/repo.dart", "load", &[]);
-        assert_eq!(crate_root(&a), Some("lib".to_owned()));
         assert_eq!(crate_root(&a), crate_root(&b));
+    }
+
+    /// The regression this fix addresses: on a Flutter layout the analysed
+    /// root is the package itself, so paths are `main.dart`, `core/…`,
+    /// `features/…`. Splitting on the first segment gave four disjoint
+    /// roots and the same-crate filter dropped every call between them —
+    /// `main.dart` ended up with no edges at all.
+    #[test]
+    fn dart_entrypoint_and_subdirectories_share_a_crate_root() {
+        let main = function_atom("main.dart", "main", &[]);
+        let core = function_atom("core/router/app_router.dart", "initOnboardingFlag", &[]);
+        let feature = function_atom("features/reader/reader_screen.dart", "build", &[]);
+        assert_eq!(crate_root(&main), crate_root(&core));
+        assert_eq!(crate_root(&core), crate_root(&feature));
+    }
+
+    /// The whole point, end to end: `main.dart` calling into `core/`
+    /// resolves. Before the fix this produced zero edges.
+    #[test]
+    fn dart_entrypoint_call_into_a_subdirectory_resolves() {
+        let store = build_store(
+            "main.dart",
+            &[("main", &["app_router::initOnboardingFlag"])],
+        );
+        add_to_store(
+            &store,
+            "core/router/app_router.dart",
+            &[("initOnboardingFlag", &[])],
+        );
+        assert_eq!(resolve_cross_module_calls(&store), 1);
+    }
+
+    /// Python keeps the first-segment rule — it is analysed from a parent
+    /// that may hold several packages, unlike a pub package.
+    #[test]
+    fn python_keeps_its_own_package_rule() {
+        let a = function_atom("lib/translator.py", "f", &[]);
+        let b = function_atom("other/thing.py", "f", &[]);
+        assert_eq!(crate_root(&a), Some("lib".to_owned()));
+        assert_eq!(crate_root(&b), Some("other".to_owned()));
+        assert_ne!(crate_root(&a), crate_root(&b));
     }
 
     /// Rust must keep its Cargo-layout rule — this is the regression the
