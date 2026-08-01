@@ -496,8 +496,18 @@ fn extract_item(
 
     let doc = doc_for(language, &node, source);
 
-    // Call names for functions.
-    let extracted = if ts_kind == "function_item" || ts_kind == "function_definition" {
+    // Call names for functions. Derived from `map_node_kind` rather than
+    // an inline list of kinds: that list said `function_item` (Rust) and
+    // `function_definition` (Python) and silently omitted Dart's
+    // `function_declaration`, so every top-level Dart function was
+    // extracted as an atom and then never asked what it called. Methods
+    // were unaffected — `extract_methods` calls the extractor
+    // unconditionally — which left the graph populated enough to hide it.
+    //
+    // Keying on the canonical kind means a fourth language cannot fall
+    // into the same hole: whatever it maps to `"function"` gets its calls
+    // read, with no second list to remember to update.
+    let extracted = if language.map_node_kind(ts_kind) == Some("function") {
         extract_calls(&node, source, language, imports)
     } else {
         ExtractedCalls::default()
