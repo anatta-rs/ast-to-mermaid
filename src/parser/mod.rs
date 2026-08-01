@@ -25,7 +25,7 @@ use crate::limits::max_ast_depth;
 use crate::model::{CallSite, CodeAtom, Edge, EdgeKind, EntityId};
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use tree_sitter::{Node, Parser as TsParser, QueryCursor, StreamingIterator};
 
 mod dart;
@@ -426,9 +426,12 @@ impl CodeParser {
 
         // ── Intra-file call edges ─────────────────────────────────────────────
         //
-        // Each edge records the rank of the site that produced it, so a
-        // consumer can tell which of a body's calls this edge accounts
-        // for — see `Edge::sites` and `render::flow`.
+        // One edge per caller→callee pair, carrying the ranks of every
+        // site that produced it. This is where repeated calls collapse —
+        // the sites themselves are all kept, so `flow` can still show
+        // that a body calls the same function twice, while the views
+        // that only care about connectivity see one edge as before.
+        let mut edge_sites: BTreeMap<(EntityId, EntityId), Vec<u16>> = BTreeMap::new();
         for (caller_id, call_sites) in items {
             for site in call_sites {
                 if site.name.contains("::") {
@@ -437,13 +440,15 @@ impl CodeParser {
                 if let Some(callee_id) = name_to_id.get(&site.name)
                     && *callee_id != caller_id
                 {
-                    edges.push(Edge::calls_from_sites(
-                        caller_id.clone(),
-                        callee_id.clone(),
-                        vec![site.rank],
-                    ));
+                    edge_sites
+                        .entry((caller_id.clone(), callee_id.clone()))
+                        .or_default()
+                        .push(site.rank);
                 }
             }
+        }
+        for ((from, to), sites) in edge_sites {
+            edges.push(Edge::calls_from_sites(from, to, sites));
         }
 
         Ok(ParseUnit { atoms, edges })
@@ -674,20 +679,14 @@ fn extract_methods(
         // *is* known here — it's this container — so we do want to bind
         // a sibling method when the bare name matches.
         //
-        // Only `calls` carry a rank; `method_calls` are bare names. An
-        // edge from the latter therefore records no site, which readers
-        // must treat as "unknown" rather than "no site" — see
-        // `Edge::sites`.
+        // Both lists now carry ranks from one shared sequence, so an edge
+        // can name every site behind it whichever list it came from.
         let local_names = extracted
             .calls
             .iter()
-            .map(|c| (c.name.as_str(), Some(c.rank)))
-            .chain(
-                extracted
-                    .method_calls
-                    .iter()
-                    .map(|n| (n.as_str(), Option::<u16>::None)),
-            );
+            .chain(extracted.method_calls.iter())
+            .map(|c| (c.name.as_str(), c.rank));
+        let mut local_edges: BTreeMap<EntityId, Vec<u16>> = BTreeMap::new();
         for (call_name, rank) in local_names {
             // Normalise: bare `foo`, `Self::foo`, `<container>::foo`, and
             // `<parent_type>::foo` all refer to a sibling method of the
@@ -708,12 +707,11 @@ fn extract_methods(
             if let Some(target_id) = method_id_by_name.get(target_name)
                 && *target_id != method_id
             {
-                out_edges.push(Edge::calls_from_sites(
-                    method_id.clone(),
-                    target_id.clone(),
-                    rank.map(|r| vec![r]).unwrap_or_default(),
-                ));
+                local_edges.entry(target_id.clone()).or_default().push(rank);
             }
+        }
+        for (target_id, sites) in local_edges {
+            out_edges.push(Edge::calls_from_sites(method_id.clone(), target_id, sites));
         }
         out_atoms.push(atom);
         // Hand the resolver-eligible calls back to the caller so they
@@ -799,21 +797,67 @@ fn doc_for(language: Language, node: &Node, source: &str) -> String {
 #[derive(Debug, Default, Clone)]
 pub(super) struct ExtractedCalls {
     pub(super) calls: Vec<CallSite>,
-    pub(super) method_calls: Vec<String>,
+    pub(super) method_calls: Vec<CallSite>,
+    /// Next rank to hand out. Shared by both lists so a body's calls keep
+    /// one numbering whichever list they land in — otherwise two
+    /// independent sequences would each start at 1 and the order of the
+    /// body could not be reconstructed.
+    next_rank: u16,
+    /// Source offset of each handed-out rank, indexed by that rank.
+    /// Queries report the outermost expression of a chain first, so
+    /// `a().b().c()` arrives as `c, b, a`; [`sort_by_source_order`] uses
+    /// these to restore what `CallSite::rank` promises.
+    offsets: Vec<usize>,
 }
 
 impl ExtractedCalls {
     /// Record a resolver-eligible call, reading its control-flow context
     /// from `callee`'s position in the tree.
-    ///
-    /// `rank` is left at 0 here and assigned in [`extract_calls`] after
-    /// dedup, so it numbers the sites the graph actually keeps.
     pub(super) fn push_call(&mut self, name: String, callee: &Node, language: Language) {
-        self.calls.push(CallSite {
+        let site = self.site(name, callee, language);
+        self.calls.push(site);
+    }
+
+    /// Record a receiver-style call whose type is unknown.
+    pub(super) fn push_method_call(&mut self, name: String, callee: &Node, language: Language) {
+        let site = self.site(name, callee, language);
+        self.method_calls.push(site);
+    }
+
+    fn site(&mut self, name: String, callee: &Node, language: Language) -> CallSite {
+        let rank = self.next_rank;
+        self.next_rank = self.next_rank.saturating_add(1);
+        // End, not start: a captured `a.b.c` spans the whole chain, so
+        // its start is the start of `a` for every link. The end lands on
+        // the called name itself, which is what orders the chain.
+        self.offsets.push(callee.end_byte());
+        CallSite {
             name,
-            rank: 0,
+            rank,
             flags: control_flags(callee, language),
-        });
+        }
+    }
+
+    /// Renumber every site so ranks follow source position.
+    ///
+    /// A tree-sitter query yields a chain's outermost node first, so
+    /// `jsonDecode(x).map(f).toList()` is captured as `toList`, `map`,
+    /// `jsonDecode` — the reverse of how the code reads. Ranks are the
+    /// only thing a reader has to order a body by, so they must not
+    /// encode traversal order.
+    fn sort_by_source_order(&mut self) {
+        let n = self.offsets.len();
+        let mut order: Vec<usize> = (0..n).collect();
+        order.sort_by_key(|&r| self.offsets[r]);
+        let mut renumbered = vec![0u16; n];
+        for (new, &old) in order.iter().enumerate() {
+            renumbered[old] = u16::try_from(new).unwrap_or(u16::MAX);
+        }
+        for site in self.calls.iter_mut().chain(self.method_calls.iter_mut()) {
+            if let Some(&r) = renumbered.get(site.rank as usize) {
+                site.rank = r;
+            }
+        }
     }
 }
 
@@ -832,10 +876,14 @@ enum Imports {
     Dart(dart::DartImports),
 }
 
-/// Dispatch call extraction to the matching language module, then
-/// deduplicate the resulting lists in-place. Per-language extractors
-/// append to `out` without worrying about duplicates so the dedupe pass
-/// stays in one place.
+/// Dispatch call extraction to the matching language module.
+///
+/// Every occurrence is kept. An earlier version collapsed same-named
+/// sites here, which silently erased a body's second call to the same
+/// function — `container.read(a)` followed by `container.read(b)` became
+/// one site, and no consumer could tell. De-duplication belongs on the
+/// *edges* (one edge per caller→callee pair, carrying every rank that
+/// produced it), not on the record of what the body does.
 fn extract_calls(
     node: &Node,
     source: &str,
@@ -855,15 +903,7 @@ fn extract_calls(
         }
         _ => {}
     }
-    let mut seen: HashSet<String> = HashSet::new();
-    out.calls.retain(|c| seen.insert(c.name.clone()));
-    seen.clear();
-    out.method_calls.retain(|c| seen.insert(c.clone()));
-    // Rank after dedup, so it numbers what the graph will actually see.
-    // `retain` keeps first-appearance order, which is source order.
-    for (i, site) in out.calls.iter_mut().enumerate() {
-        site.rank = u16::try_from(i).unwrap_or(u16::MAX);
-    }
+    out.sort_by_source_order();
     out
 }
 

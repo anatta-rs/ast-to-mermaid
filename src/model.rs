@@ -201,6 +201,11 @@ pub struct CodeAtom {
     /// Call sites in this atom's body, in source order. Each carries the
     /// resolver-eligible name plus its rank and control-flow context —
     /// see [`CallSite`].
+    ///
+    /// Every occurrence is kept, including repeats: calling `read()`
+    /// twice yields two sites. Collapsing them here would erase the
+    /// second call from every consumer, and the graph's own edge
+    /// de-duplication already keeps that from multiplying edges.
     pub calls: Vec<CallSite>,
     /// Names captured from receiver-style call sites — `obj.method()` in
     /// Rust (`field_expression`) or `obj.method()` in Python (`attribute`
@@ -210,8 +215,11 @@ pub struct CodeAtom {
     /// impl/class). Splitting them out is what prevents a stray
     /// `client.build()` from ghost-binding to an unrelated free fn
     /// named `build` somewhere else in the graph.
+    ///
+    /// Ranks share one sequence with [`CodeAtom::calls`], so the two
+    /// lists interleave back into source order.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub method_calls: Vec<String>,
+    pub method_calls: Vec<CallSite>,
     /// Type owner for methods (Rust impl owner type, Python class). `None`
     /// for free functions and non-method items. The resolver uses this to
     /// keep bare-name calls (`obj.method()`) from binding to lifted methods

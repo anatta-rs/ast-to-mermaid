@@ -293,7 +293,7 @@ pub(super) fn extract_calls(
                 // unknown, so this never feeds the resolver — it
                 // only powers intra-container `self.method()`
                 // linking.
-                out.method_calls.push(text.to_owned());
+                out.push_method_call(text.to_owned(), &cap.node, Language::Rust);
             }
         }
     }

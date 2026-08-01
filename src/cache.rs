@@ -152,7 +152,13 @@ const SCHEMA_VERSION: u32 = 6;
 /// to empty — but empty means "unknown", which puts `flow` into its
 /// degraded mode for the whole file and hides the very leaves the change
 /// adds. The edges must be rebuilt, not merely read.
-const GRAMMAR_VERSION: u32 = 7;
+/// `8`: every call occurrence is recorded (#196). Cached units hold the
+/// de-duplicated lists — one site per distinct name, ranked after the
+/// collapse — so a warm cache would keep serving bodies with their
+/// repeated calls missing and their ranks renumbered. `method_calls` also
+/// changed shape (`Vec<String>` → `Vec<CallSite>`) and would not
+/// deserialise.
+const GRAMMAR_VERSION: u32 = 8;
 
 /// Compute the cache version string written to `<root>/version`.
 fn cache_version() -> String {

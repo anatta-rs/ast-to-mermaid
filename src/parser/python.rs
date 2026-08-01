@@ -247,6 +247,13 @@ pub(super) fn extract_calls(
                     let Some((root, method)) = attribute_root_method(&cap.node, source) else {
                         continue;
                     };
+                    let Some(root) = root else {
+                        // Receiver is not a name (a chained call, a
+                        // subscript): the owner is unknowable, but the
+                        // call happened. Intra-class linking only.
+                        out.push_method_call(method.to_owned(), &cap.node, Language::Python);
+                        continue;
+                    };
                     if let Some(module_last) = imports.modules.get(root) {
                         // `mod.fn()` where `mod` is an imported module →
                         // resolver-eligible qualified call.
@@ -257,7 +264,7 @@ pub(super) fn extract_calls(
                         );
                     } else {
                         // Unknown receiver type — intra-class linking only.
-                        out.method_calls.push(method.to_owned());
+                        out.push_method_call(method.to_owned(), &cap.node, Language::Python);
                     }
                 }
                 _ => {}
@@ -273,17 +280,29 @@ pub(super) fn extract_calls(
 /// identifier reached by descending the `object` chain. Returns `None` when
 /// the receiver root isn't a plain identifier (e.g. `f().method`,
 /// `d[k].method`) — those can't be mapped to an imported module.
-fn attribute_root_method<'a>(node: &Node, source: &'a str) -> Option<(&'a str, &'a str)> {
+fn attribute_root_method<'a>(node: &Node, source: &'a str) -> Option<(Option<&'a str>, &'a str)> {
     let method = node
         .child_by_field_name("attribute")
         .and_then(|n| node_text(&n, source))?;
-    let mut current = node.child_by_field_name("object")?;
+    let Some(mut current) = node.child_by_field_name("object") else {
+        return Some((None, method));
+    };
     for _ in 0..max_ast_depth() {
         match current.kind() {
-            "identifier" => return Some((node_text(&current, source)?, method)),
-            "attribute" => current = current.child_by_field_name("object")?,
-            // Non-identifier receiver root (call/subscript/paren) — give up.
-            _ => return None,
+            "identifier" => return Some((node_text(&current, source), method)),
+            "attribute" => {
+                let Some(next) = current.child_by_field_name("object") else {
+                    return Some((None, method));
+                };
+                current = next;
+            }
+            // Non-identifier receiver root (call / subscript / paren), as
+            // in `build().render()`. Nothing can be said about what owns
+            // the method — but the call is real, and returning `None`
+            // dropped it from the graph entirely. Report the method with
+            // no root so it lands in `method_calls`, which is exactly the
+            // "receiver type unknown" bucket.
+            _ => return Some((None, method)),
         }
     }
     None
@@ -404,8 +423,8 @@ mod tests {
         // become a resolver-eligible qualified call.
         let calls = calls_of("self.gettext(k)\nobj.run()\n", &PyImports::default());
         assert!(calls.calls.is_empty(), "calls leaked: {:?}", calls.calls);
-        assert!(calls.method_calls.iter().any(|m| m == "gettext"));
-        assert!(calls.method_calls.iter().any(|m| m == "run"));
+        assert!(calls.method_calls.iter().any(|m| m.name == "gettext"));
+        assert!(calls.method_calls.iter().any(|m| m.name == "run"));
     }
 
     #[test]
