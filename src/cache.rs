@@ -132,7 +132,14 @@ const SCHEMA_VERSION: u32 = 6;
 /// qualified `ClassName::method` instead of a bare method name, and
 /// `null_aware_member_expression` stopped being dropped — the same file
 /// therefore yields different `calls` than it did under `2`.
-const GRAMMAR_VERSION: u32 = 3;
+///
+/// `4`: Dart top-level functions (#186). Their calls were never extracted
+/// at all, so every cached `ParseUnit` for a `.dart` file holding free
+/// functions carries an empty `calls` list. Without this bump the fix is
+/// invisible on any tree that has been indexed before — which is how it
+/// was found: a project with a warm `.a2m` still showed `main()` with no
+/// callees while a fresh copy of the same source showed four.
+const GRAMMAR_VERSION: u32 = 4;
 
 /// Compute the cache version string written to `<root>/version`.
 fn cache_version() -> String {

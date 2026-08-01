@@ -384,6 +384,29 @@ mod tests {
         out
     }
 
+    /// Top-level Dart functions had their calls silently dropped for the
+    /// whole life of the Dart support: the caller in `parser/mod.rs` only
+    /// tested `function_item` and `function_definition`. Methods were
+    /// unaffected, which kept the graph populated enough to hide it. This
+    /// pins the property at the level where it broke.
+    #[test]
+    fn a_top_level_function_reports_its_calls() {
+        let src = "void main() { helper(); }\nvoid helper() {}\n";
+        let unit = super::super::CodeParser::dart()
+            .parse(src.as_bytes(), "solo.dart")
+            .expect("parse");
+        let main_atom = unit
+            .atoms
+            .iter()
+            .find(|a| a.name == "main" && a.kind == "function")
+            .expect("main atom");
+        assert_eq!(
+            main_atom.calls,
+            vec!["helper".to_owned()],
+            "a top-level function must report what it calls"
+        );
+    }
+
     /// A bare call with no matching import stays bare — the resolver's
     /// same-package pass is what links it, not a rewrite here.
     #[test]
