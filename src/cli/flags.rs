@@ -352,3 +352,41 @@ mod tests {
         assert!(handle.is_none());
     }
 }
+
+/// CLI args for the `flow` subcommand.
+#[derive(Debug, Clone, clap::Args)]
+pub struct FlowFlags {
+    /// Path to a source root (file or directory).
+    pub path: PathBuf,
+
+    /// Entry point to walk forward from: `name` for a free function,
+    /// `Type::method` to disambiguate by owner.
+    #[arg(short, long)]
+    pub target: String,
+
+    /// How many call hops to follow. `1` shows only direct calls.
+    #[arg(long, default_value_t = crate::render::flow::DEFAULT_DEPTH)]
+    pub depth: u8,
+
+    /// Show external leaves (calls into code outside the graph) at every
+    /// depth, not just the first.
+    #[arg(long, conflicts_with = "no_external")]
+    pub include_external: bool,
+
+    /// Hide external leaves entirely.
+    #[arg(long)]
+    pub no_external: bool,
+
+    /// Extra directory basenames to skip during walk (comma-separated).
+    #[arg(short = 'x', long, default_value = "")]
+    pub exclude: String,
+
+    /// Include generated Dart (`.g.dart`, `.freezed.dart`, `.mocks.dart`,
+    /// `.gr.dart`). Skipped by default.
+    #[arg(long)]
+    pub include_generated: bool,
+
+    /// Write output to this file instead of stdout.
+    #[arg(short, long)]
+    pub out: Option<PathBuf>,
+}

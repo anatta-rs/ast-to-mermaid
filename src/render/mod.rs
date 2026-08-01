@@ -16,6 +16,7 @@
 
 pub mod adj;
 pub mod dot;
+pub mod flow;
 mod function;
 mod impact;
 pub mod lookup;
@@ -49,6 +50,12 @@ pub enum Level {
     Function,
     /// Reverse call chain from target up to N hops.
     Impact,
+    /// Forward call graph from an entry point, edges annotated with call
+    /// order and control-flow context. Rendered by [`flow::render`],
+    /// which takes depth and external-leaf options the shared [`render`]
+    /// dispatcher does not carry — `pipeline::analyze` branches on it
+    /// before reaching the dispatcher.
+    Flow,
 }
 
 impl Level {
@@ -61,13 +68,17 @@ impl Level {
             Self::Module => "module",
             Self::Function => "function",
             Self::Impact => "impact",
+            Self::Flow => "flow",
         }
     }
 
     /// Whether this level requires a `--target` argument from the caller.
     #[must_use]
     pub fn requires_target(self) -> bool {
-        matches!(self, Self::Module | Self::Function | Self::Impact)
+        matches!(
+            self,
+            Self::Module | Self::Function | Self::Impact | Self::Flow
+        )
     }
 }
 
@@ -125,6 +136,15 @@ pub fn render(
         Level::Impact => {
             impact::render(adj, snapshot, require_target(level, target)?, DEFAULT_HOPS)?
         }
+        // Handled upstream in `pipeline::analyze`, which has the depth
+        // and external options this dispatcher does not receive.
+        Level::Flow => flow::render(
+            adj,
+            snapshot,
+            require_target(level, target)?,
+            flow::DEFAULT_DEPTH,
+            flow::External::NearOnly,
+        )?,
     };
     Ok(s)
 }

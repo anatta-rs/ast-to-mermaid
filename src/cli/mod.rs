@@ -20,7 +20,9 @@ pub mod format;
 pub mod run;
 
 pub use flags::{
-    AnalyzeFlags, AnalyzeFormat, BundleFlags, CacheArgs, DiffFlags, DiffFormat, ExitCode, GcFlags,
-    IndexFlags, SequenceFlags, WalkFlags,
+    AnalyzeFlags, AnalyzeFormat, BundleFlags, CacheArgs, DiffFlags, DiffFormat, ExitCode,
+    FlowFlags, GcFlags, IndexFlags, SequenceFlags, WalkFlags,
 };
-pub use run::{run_analyze, run_bundle, run_diff, run_gc, run_index, run_sequence, run_walk};
+pub use run::{
+    run_analyze, run_bundle, run_diff, run_flow, run_gc, run_index, run_sequence, run_walk,
+};
