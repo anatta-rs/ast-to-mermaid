@@ -8,6 +8,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.0](https://github.com/anatta-rs/ast-to-mermaid/compare/v0.8.0...v0.9.0) - 2026-08-01
+
+### Bug fixes
+
+- *(dart)* Top-level functions never had their calls extracted ([#187](https://github.com/anatta-rs/ast-to-mermaid/pull/187))
+- *(dart)* ClassName.method() is a qualified call, not an unknown receiver ([#185](https://github.com/anatta-rs/ast-to-mermaid/pull/185))
+- *(resolve)* One pub package is one crate, not one per directory ([#183](https://github.com/anatta-rs/ast-to-mermaid/pull/183))
+- *(repolith)* Select the package for cargo-llvm-cov ([#179](https://github.com/anatta-rs/ast-to-mermaid/pull/179))
+
+### Documentation
+
+- README status says v0.8.0 ([#177](https://github.com/anatta-rs/ast-to-mermaid/pull/177))
+
+### Features
+
+- *(flow)* Account for every recorded call, resolved or not ([#195](https://github.com/anatta-rs/ast-to-mermaid/pull/195))
+- *(cli)* A2m flow — forward call graph annotated with order and control flow ([#193](https://github.com/anatta-rs/ast-to-mermaid/pull/193))
+- *(dart)* Infer receiver types from file-scope declarations ([#189](https://github.com/anatta-rs/ast-to-mermaid/pull/189))
+- *(cli)* --include-generated, and bump GRAMMAR_VERSION for Dart ([#180](https://github.com/anatta-rs/ast-to-mermaid/pull/180))
+
+### Refactor
+
+- *(model)* Call sites carry rank and control-flow flags ([#191](https://github.com/anatta-rs/ast-to-mermaid/pull/191))
+
 ## [0.8.0](https://github.com/anatta-rs/ast-to-mermaid/compare/v0.7.1...v0.8.0) - 2026-07-31
 
 ### Bug fixes
