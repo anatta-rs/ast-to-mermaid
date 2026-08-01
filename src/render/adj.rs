@@ -28,6 +28,11 @@ use std::sync::Arc;
 #[derive(Default)]
 pub struct AdjMaps {
     callees: HashMap<Arc<EntityId>, Vec<Arc<EntityId>>>,
+    /// Call-site ranks per forward `Calls` edge, kept index-for-index
+    /// with `callees`: `callee_sites[id][i]` describes `callees[id][i]`.
+    /// The two are pushed in lockstep in [`AdjMaps::build`] and nowhere
+    /// else, which is what makes the invariant hold.
+    callee_sites: HashMap<Arc<EntityId>, Vec<Vec<u16>>>,
     callers: HashMap<Arc<EntityId>, Vec<Arc<EntityId>>>,
     children: HashMap<Arc<EntityId>, Vec<Arc<EntityId>>>,
     uses_out: HashMap<Arc<EntityId>, Vec<Arc<EntityId>>>,
@@ -70,6 +75,10 @@ impl AdjMaps {
                             .entry(Arc::clone(&from))
                             .or_default()
                             .push(Arc::clone(&to));
+                        maps.callee_sites
+                            .entry(Arc::clone(&from))
+                            .or_default()
+                            .push(edge.sites.clone());
                         maps.callers.entry(to).or_default().push(from);
                     }
                     EdgeKind::Contains => {
@@ -99,6 +108,29 @@ impl AdjMaps {
     #[must_use]
     pub fn callees(&self, id: &EntityId) -> &[Arc<EntityId>] {
         self.callees.get(id).map_or(&[], Vec::as_slice)
+    }
+
+    /// Forward `Calls` paired with the call-site ranks each edge came
+    /// from, ascending.
+    ///
+    /// An empty rank slice means "unknown", not "no site": edges built
+    /// before the ranks were recorded — a bundle read back from an older
+    /// cache, or any `Edge::new` — carry none. Callers must not read that
+    /// as evidence about the caller's body.
+    pub fn callees_with_sites(
+        &self,
+        id: &EntityId,
+    ) -> impl Iterator<Item = (&Arc<EntityId>, &[u16])> {
+        let sites = self.callee_sites.get(id);
+        self.callees
+            .get(id)
+            .map_or(&[][..], Vec::as_slice)
+            .iter()
+            .enumerate()
+            .map(move |(i, callee)| {
+                let ranks = sites.and_then(|s| s.get(i)).map_or(&[][..], Vec::as_slice);
+                (callee, ranks)
+            })
     }
 
     /// Reverse `Calls`: ids that call `id`.
