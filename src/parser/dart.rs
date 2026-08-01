@@ -29,6 +29,10 @@ use super::queries;
 /// fallback matches against.
 #[derive(Debug, Default, Clone)]
 pub(super) struct DartImports {
+    /// Declared types of the identifiers this file binds, used to qualify
+    /// `obj.method()`. Lives here rather than in a second parameter so a
+    /// file's scope stays one value threaded through one call.
+    pub receivers: ReceiverTypes,
     /// `import '…/user.dart' show User, Role;` → `User` → `user::User`.
     /// Rewrites bare calls (`User()` → `user::User`).
     pub symbols: HashMap<String, String>,
@@ -40,7 +44,10 @@ pub(super) struct DartImports {
 /// Walk every `import` / `export` directive reachable from `root` and
 /// build the [`DartImports`] rewrite maps.
 pub(super) fn extract_imports(root: Node, source: &str) -> DartImports {
-    let mut out = DartImports::default();
+    let mut out = DartImports {
+        receivers: collect_receiver_types(root, source),
+        ..DartImports::default()
+    };
     let mut cursor = QueryCursor::new();
     let mut matches = cursor.matches(&queries::DART.imports, root, source.as_bytes());
     while let Some(m) = matches.next() {
@@ -160,6 +167,156 @@ fn find_uri_text<'a>(node: &Node, source: &'a str) -> Option<&'a str> {
     None
 }
 
+// ── Receiver types ────────────────────────────────────────────────────────────
+
+/// Declared types of the identifiers a file binds, used to turn
+/// `obj.method()` into a qualified `Type::method`.
+///
+/// Scope is the **file**, not the exact lexical scope. Following nested
+/// scopes (function → block → closure) would be more faithful but much
+/// heavier, and the same name rarely carries two types in one Dart file.
+/// Precision is traded for a guard instead: a name seen with two different
+/// types becomes ambiguous and is never used, the same unicity rule
+/// `resolve.rs` applies to candidates.
+#[derive(Debug, Default, Clone)]
+pub(super) struct ReceiverTypes {
+    /// `name → Some(type)` when unambiguous, `name → None` once a second,
+    /// different type has been seen for it.
+    types: HashMap<String, Option<String>>,
+}
+
+impl ReceiverTypes {
+    /// Type bound to `name`, or `None` when unknown or ambiguous.
+    fn get(&self, name: &str) -> Option<&str> {
+        self.types.get(name)?.as_deref()
+    }
+
+    fn insert(&mut self, name: &str, ty: &str) {
+        match self.types.get_mut(name) {
+            // Second, different type for this name — poison the entry
+            // rather than pick a side.
+            Some(slot @ Some(_)) if slot.as_deref() != Some(ty) => *slot = None,
+            Some(_) => {}
+            None => {
+                self.types.insert(name.to_owned(), Some(ty.to_owned()));
+            }
+        }
+    }
+}
+
+/// Walk `root` and record every identifier whose type the syntax states.
+///
+/// Four shapes carry a type without any semantic analysis:
+///   - class fields — `declaration` with a `type` sibling and an
+///     `initialized_identifier_list`;
+///   - parameters — `formal_parameter` with `type` + `name:`;
+///   - annotated locals — `initialized_variable_definition` with `type`;
+///   - constructed locals — the same node without a `type`, where the
+///     initialiser is a constructor call (`final buf = StringBuffer()`).
+pub(super) fn collect_receiver_types(root: Node, source: &str) -> ReceiverTypes {
+    let mut out = ReceiverTypes::default();
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        match node.kind() {
+            "declaration" => collect_field_types(&node, source, &mut out),
+            "formal_parameter" => {
+                if let (Some(ty), Some(name)) = (
+                    first_type_name(&node, source),
+                    node.child_by_field_name("name")
+                        .and_then(|n| node_text(&n, source)),
+                ) {
+                    out.insert(name, ty);
+                }
+            }
+            "initialized_variable_definition" => {
+                let Some(name) = node
+                    .child_by_field_name("name")
+                    .and_then(|n| node_text(&n, source))
+                else {
+                    continue;
+                };
+                if let Some(ty) = first_type_name(&node, source) {
+                    out.insert(name, ty);
+                } else if let Some(ty) = constructed_type(&node, source) {
+                    out.insert(name, ty);
+                }
+            }
+            _ => {}
+        }
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            stack.push(child);
+        }
+    }
+    out
+}
+
+/// `final UserDao dao;` — the type is a sibling of the identifier list
+/// rather than a field of either, so both are read off the `declaration`.
+fn collect_field_types(node: &Node, source: &str, out: &mut ReceiverTypes) {
+    let Some(ty) = first_type_name(node, source) else {
+        return;
+    };
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if child.kind() != "initialized_identifier_list" {
+            continue;
+        }
+        let mut inner = child.walk();
+        for ident in child.children(&mut inner) {
+            if ident.kind() != "initialized_identifier" {
+                continue;
+            }
+            if let Some(name) = ident
+                .child_by_field_name("name")
+                .and_then(|n| node_text(&n, source))
+            {
+                out.insert(name, ty);
+            }
+        }
+    }
+}
+
+/// First `type_identifier` under `node`'s `type` child.
+///
+/// `List<Foo> xs` yields `List`, not `Foo` — the receiver's own type is
+/// what a later `xs.add()` needs. `List` is not in the graph, so nothing
+/// is emitted for it, which is the correct outcome rather than a wrong one.
+fn first_type_name<'a>(node: &Node, source: &'a str) -> Option<&'a str> {
+    let mut cursor = node.walk();
+    let ty = node.children(&mut cursor).find(|c| c.kind() == "type")?;
+    // Breadth-first, and shallowest-first within a level: `List<Note>`
+    // nests `Note` under `type_arguments`, so a depth-first walk reaches
+    // the type *argument* before the container and would bind `xs.add()`
+    // to `Note` instead of `List`.
+    let mut queue = std::collections::VecDeque::from([ty]);
+    while let Some(n) = queue.pop_front() {
+        if n.kind() == "type_identifier" {
+            return node_text(&n, source);
+        }
+        let mut c = n.walk();
+        for child in n.children(&mut c) {
+            queue.push_back(child);
+        }
+    }
+    None
+}
+
+/// `final buf = StringBuffer();` — no annotation, but the initialiser is a
+/// constructor call and its callee names the type.
+fn constructed_type<'a>(node: &Node, source: &'a str) -> Option<&'a str> {
+    let value = node.child_by_field_name("value")?;
+    if value.kind() != "call_expression" {
+        return None;
+    }
+    let callee = value.child_by_field_name("function")?;
+    if callee.kind() != "identifier" {
+        return None;
+    }
+    let name = node_text(&callee, source)?;
+    is_type_name(name).then_some(name)
+}
+
 // ── Call extraction ───────────────────────────────────────────────────────────
 
 /// Collect call sites under `node`, rewriting them against `imports`.
@@ -226,11 +383,22 @@ pub(super) fn extract_calls(
                         // such as `MediaQuery.of()` resolves to nothing
                         // rather than to something wrong.
                         out.calls.push(format!("{root}::{method}"));
+                    } else if let Some(ty) =
+                        direct_receiver(&cap.node, source).and_then(|r| imports.receivers.get(r))
+                    {
+                        // Lowercase receiver whose type the file states —
+                        // `final UserDao dao;` then `dao.fetch()`. Same
+                        // qualified shape as a capitalised receiver, and the
+                        // resolver applies the same unicity rule to it.
+                        //
+                        // Direct receiver only, for the reason spelled out
+                        // above: in `a.b.method()` the method belongs to the
+                        // type of `a.b`, which the table does not know.
+                        out.calls.push(format!("{ty}::{method}"));
                     } else {
-                        // Lowercase receiver — an instance whose type we do
-                        // not know. Intra-container linking only; binding it
-                        // to a same-named method elsewhere is exactly the
-                        // ghost-bind `resolve.rs` refuses.
+                        // Type unknown or ambiguous. Intra-container linking
+                        // only; binding it to a same-named method elsewhere
+                        // is exactly the ghost-bind `resolve.rs` refuses.
                         out.method_calls.push(method.to_owned());
                     }
                 }
@@ -483,12 +651,93 @@ mod tests {
         assert_eq!(c.calls, vec!["user::parseUser".to_owned()]);
     }
 
-    /// Lowercase receivers keep the old behaviour — this is the
-    /// ghost-bind guard, and widening it is not what this change does.
+    /// Lowercase receivers whose type the file never states keep the old
+    /// behaviour — this is the ghost-bind guard.
     #[test]
-    fn lowercase_receiver_still_lands_in_method_calls() {
+    fn lowercase_receiver_of_unknown_type_lands_in_method_calls() {
         let c = calls_of("void f() { notificationService.initialize(); }\n");
         assert_eq!(c.method_calls, vec!["initialize".to_owned()]);
+        assert!(c.calls.is_empty(), "got {:?}", c.calls);
+    }
+
+    // ── Receiver-type inference ──────────────────────────────────────────
+
+    /// A class field states its type: `final UserDao dao;` then
+    /// `dao.fetch()` is as qualified as `UserDao.fetch()` would be.
+    #[test]
+    fn field_declaration_types_its_receiver() {
+        let c = calls_of("class R {\n  final UserDao dao;\n  void run() { dao.fetch(); }\n}\n");
+        assert_eq!(c.calls, vec!["UserDao::fetch".to_owned()]);
+        assert!(c.method_calls.is_empty(), "got {:?}", c.method_calls);
+    }
+
+    /// The single largest source on a real project: 921 typed parameters.
+    #[test]
+    fn parameter_declaration_types_its_receiver() {
+        let c = calls_of("void run(NotifService svc) { svc.notify(); }\n");
+        assert_eq!(c.calls, vec!["NotifService::notify".to_owned()]);
+    }
+
+    #[test]
+    fn annotated_local_types_its_receiver() {
+        let c = calls_of("void f() { final Logger log = Logger(); log.warn(); }\n");
+        assert!(
+            c.calls.contains(&"Logger::warn".to_owned()),
+            "got {:?}",
+            c.calls
+        );
+    }
+
+    /// No annotation, but the initialiser names the type.
+    #[test]
+    fn constructed_local_types_its_receiver() {
+        let c = calls_of("void f() { final buf = StringBuffer(); buf.write('x'); }\n");
+        assert!(
+            c.calls.contains(&"StringBuffer::write".to_owned()),
+            "got {:?}",
+            c.calls
+        );
+    }
+
+    /// File scope is a deliberate approximation, so the guard has to hold:
+    /// one name with two types is unusable, not a coin flip.
+    #[test]
+    fn a_name_with_two_types_is_ambiguous_and_unused() {
+        let c = calls_of("void a(UserDao x) { x.run(); }\nvoid b(OrderDao x) { x.run(); }\n");
+        assert_eq!(c.method_calls, vec!["run".to_owned(), "run".to_owned()]);
+        assert!(
+            c.calls.is_empty(),
+            "ambiguous name must not qualify: {:?}",
+            c.calls
+        );
+    }
+
+    /// Re-declaring the *same* type is not ambiguity.
+    #[test]
+    fn a_name_repeated_with_one_type_stays_usable() {
+        let c = calls_of("void a(UserDao x) { x.run(); }\nvoid b(UserDao x) { x.run(); }\n");
+        assert_eq!(
+            c.calls,
+            vec!["UserDao::run".to_owned(), "UserDao::run".to_owned()]
+        );
+    }
+
+    /// `List<Foo> xs` binds `xs` to `List`, not `Foo` — a later `xs.add()`
+    /// belongs to the container. `List` is not in the graph, so nothing is
+    /// emitted, which is right rather than wrong.
+    #[test]
+    fn generic_type_binds_the_container_not_its_argument() {
+        let c = calls_of("void f(List<Note> xs) { xs.add(1); }\n");
+        assert_eq!(c.calls, vec!["List::add".to_owned()]);
+    }
+
+    /// The chain rule from #184 still applies: only a direct receiver is
+    /// typed by the table.
+    #[test]
+    fn chained_receiver_is_not_typed_from_the_table() {
+        let c =
+            calls_of("class R {\n  final UserDao dao;\n  void run() { dao.cache.clear(); }\n}\n");
+        assert_eq!(c.method_calls, vec!["clear".to_owned()]);
         assert!(c.calls.is_empty(), "got {:?}", c.calls);
     }
 
