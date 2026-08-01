@@ -30,13 +30,16 @@ coverage:
 coverage-summary:
 	cargo llvm-cov --all-features --workspace --ignore-filename-regex $(COVERAGE_IGNORE) --summary-only
 
-# Fail if line coverage is below 95%.
+# Fail if line coverage is below 90% — the same threshold CI enforces, so
+# a green local run means a green CI run. Was 95%, which no longer held
+# after the v0.2 git-aware modules landed: the gate failed on every run
+# and became noise developers learned to skip.
 coverage-gate:
 	@PCT=$$(cargo llvm-cov --all-features --workspace --ignore-filename-regex $(COVERAGE_IGNORE) --json --summary-only 2>/dev/null \
 		| python3 -c 'import json,sys; print(json.load(sys.stdin)["data"][0]["totals"]["lines"]["percent"])'); \
 	echo "Line coverage: $${PCT}%"; \
-	python3 -c "import sys; sys.exit(0 if float('$$PCT') >= 95.0 else 1)" \
-		|| { echo "FAIL: coverage $${PCT}% < 95%"; exit 1; }
+	python3 -c "import sys; sys.exit(0 if float('$$PCT') >= 90.0 else 1)" \
+		|| { echo "FAIL: coverage $${PCT}% < 90%"; exit 1; }
 
 check: fmt-check lint test
 

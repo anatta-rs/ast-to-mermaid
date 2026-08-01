@@ -510,7 +510,7 @@ No async, no persistence layer, no graph backend. The cache is plain CBOR + JSON
 ```bash
 make check          # fmt + clippy (pedantic) + test
 make ci             # check + coverage-gate
-make coverage-gate  # fail if line coverage < 95 %
+make coverage-gate  # fail if line coverage < 90 % (same threshold as CI)
 make hooks          # install pre-commit + pre-push hooks (.githooks/)
 ```
 
