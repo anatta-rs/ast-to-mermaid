@@ -7,6 +7,7 @@ use tree_sitter::{Node, QueryCursor, StreamingIterator};
 use super::ExtractedCalls;
 use super::queries;
 use crate::limits::max_ast_depth;
+use crate::parser::Language;
 
 // ── Use-import extraction ─────────────────────────────────────────────────────
 
@@ -275,16 +276,15 @@ pub(super) fn extract_calls(
                 match cap.node.kind() {
                     "identifier" => {
                         // Bare call: expand via use imports if available.
-                        out.calls.push(
-                            imports
-                                .get(text)
-                                .map_or_else(|| text.to_owned(), String::clone),
-                        );
+                        let resolved = imports
+                            .get(text)
+                            .map_or_else(|| text.to_owned(), String::clone);
+                        out.push_call(resolved, &cap.node, Language::Rust);
                     }
                     "scoped_identifier" => {
                         // Qualified — keep verbatim so the resolver
                         // can disambiguate by module / type.
-                        out.calls.push(text.to_owned());
+                        out.push_call(text.to_owned(), &cap.node, Language::Rust);
                     }
                     _ => {}
                 }
@@ -302,6 +302,7 @@ pub(super) fn extract_calls(
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use crate::graph::Store;
     use crate::model::EntityId;
     use crate::parser::CodeParser;
@@ -472,7 +473,7 @@ fn caller() { helper(); }\n";
         let atom = store.get_atom(&id).expect("atom");
         // Bare `helper()` should be normalised to the imported full path.
         assert!(
-            atom.calls.iter().any(|c| c == "crate::other::helper"),
+            atom.calls.iter().any(|c| c.name == "crate::other::helper"),
             "calls={:?}",
             atom.calls
         );
@@ -489,7 +490,7 @@ fn caller() { helper(); }\n";
         let id = EntityId::new("code:src/lib.rs::function::caller");
         let atom = store.get_atom(&id).expect("atom");
         assert!(
-            atom.calls.iter().any(|c| c == "project::render"),
+            atom.calls.iter().any(|c| c.name == "project::render"),
             "calls={:?}",
             atom.calls
         );

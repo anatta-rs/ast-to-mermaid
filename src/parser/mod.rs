@@ -21,7 +21,8 @@
 
 use crate::error::{AstToMermaidError, Result};
 use crate::graph::Store;
-use crate::model::{CodeAtom, Edge, EdgeKind, EntityId};
+use crate::limits::max_ast_depth;
+use crate::model::{CallSite, CodeAtom, Edge, EdgeKind, EntityId};
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
@@ -350,7 +351,7 @@ impl CodeParser {
             Language::Dart => &queries::DART.items,
         };
         let mut name_to_id: HashMap<String, EntityId> = HashMap::new();
-        let mut items: Vec<(EntityId, Vec<String>)> = Vec::new();
+        let mut items: Vec<(EntityId, Vec<CallSite>)> = Vec::new();
 
         let mut cursor = QueryCursor::new();
         let mut matches = cursor.matches(items_query, root, text.as_bytes());
@@ -424,12 +425,12 @@ impl CodeParser {
         }
 
         // ── Intra-file call edges ─────────────────────────────────────────────
-        for (caller_id, call_names) in items {
-            for callee_name in call_names {
-                if callee_name.contains("::") {
+        for (caller_id, call_sites) in items {
+            for site in call_sites {
+                if site.name.contains("::") {
                     continue;
                 }
-                if let Some(callee_id) = name_to_id.get(&callee_name)
+                if let Some(callee_id) = name_to_id.get(&site.name)
                     && *callee_id != caller_id
                 {
                     edges.push(Edge::new(
@@ -456,7 +457,7 @@ fn extract_item(
     file_path: &str,
     language: Language,
     imports: &Imports,
-) -> Option<(CodeAtom, Vec<String>)> {
+) -> Option<(CodeAtom, Vec<CallSite>)> {
     // Python decorators — unwrap inner definition iteratively. Tree-sitter
     // can in principle hand us arbitrarily nested `decorated_definition`
     // nodes (a malicious or pathological source — `@a` then `@b` etc.
@@ -584,7 +585,7 @@ fn extract_methods(
     ctx: &MethodCtx,
     out_atoms: &mut Vec<CodeAtom>,
     out_edges: &mut Vec<Edge>,
-) -> Vec<(EntityId, Vec<String>)> {
+) -> Vec<(EntityId, Vec<CallSite>)> {
     let MethodCtx {
         container_atom_id,
         container_name,
@@ -657,7 +658,7 @@ fn extract_methods(
     // Pass 2: emit atoms + Contains edges + intra-container Calls edges.
     let owner_prefix = format!("{container_name}::");
     let parent_prefix = format!("{parent_type}::");
-    let mut out: Vec<(EntityId, Vec<String>)> = Vec::with_capacity(pending.len());
+    let mut out: Vec<(EntityId, Vec<CallSite>)> = Vec::with_capacity(pending.len());
     for (method_id, atom, extracted) in pending {
         out_edges.push(Edge::new(
             container_atom_id.clone(),
@@ -668,7 +669,12 @@ fn extract_methods(
         // AND `method_calls` (`self.method()`-shaped). The receiver type
         // *is* known here — it's this container — so we do want to bind
         // a sibling method when the bare name matches.
-        for call_name in extracted.calls.iter().chain(extracted.method_calls.iter()) {
+        let local_names = extracted
+            .calls
+            .iter()
+            .map(|c| c.name.as_str())
+            .chain(extracted.method_calls.iter().map(String::as_str));
+        for call_name in local_names {
             // Normalise: bare `foo`, `Self::foo`, `<container>::foo`, and
             // `<parent_type>::foo` all refer to a sibling method of the
             // same container. The two prefixes differ for Rust trait impls
@@ -676,7 +682,7 @@ fn extract_methods(
             let local_target = if let Some(rest) = call_name.strip_prefix("Self::") {
                 Some(rest)
             } else if !call_name.contains("::") {
-                Some(call_name.as_str())
+                Some(call_name)
             } else if let Some(rest) = call_name.strip_prefix(&owner_prefix) {
                 Some(rest)
             } else {
@@ -778,8 +784,23 @@ fn doc_for(language: Language, node: &Node, source: &str) -> String {
 /// to a free fn `build` defined in some unrelated module.
 #[derive(Debug, Default, Clone)]
 pub(super) struct ExtractedCalls {
-    pub(super) calls: Vec<String>,
+    pub(super) calls: Vec<CallSite>,
     pub(super) method_calls: Vec<String>,
+}
+
+impl ExtractedCalls {
+    /// Record a resolver-eligible call, reading its control-flow context
+    /// from `callee`'s position in the tree.
+    ///
+    /// `rank` is left at 0 here and assigned in [`extract_calls`] after
+    /// dedup, so it numbers the sites the graph actually keeps.
+    pub(super) fn push_call(&mut self, name: String, callee: &Node, language: Language) {
+        self.calls.push(CallSite {
+            name,
+            rank: 0,
+            flags: control_flags(callee, language),
+        });
+    }
 }
 
 /// File-scope import maps used to rewrite call sites into the qualified
@@ -821,10 +842,59 @@ fn extract_calls(
         _ => {}
     }
     let mut seen: HashSet<String> = HashSet::new();
-    out.calls.retain(|c| seen.insert(c.clone()));
+    out.calls.retain(|c| seen.insert(c.name.clone()));
     seen.clear();
     out.method_calls.retain(|c| seen.insert(c.clone()));
+    // Rank after dedup, so it numbers what the graph will actually see.
+    // `retain` keeps first-appearance order, which is source order.
+    for (i, site) in out.calls.iter_mut().enumerate() {
+        site.rank = u16::try_from(i).unwrap_or(u16::MAX);
+    }
     out
+}
+
+/// Control-flow context of a call site, found by walking up from the
+/// callee to the enclosing function.
+///
+/// Only the *presence* of a control node is tested — never a field — so a
+/// single set of kinds serves Rust, Python and Dart. Reading a field here
+/// would reintroduce the collision `sequence::lang` exists to avoid
+/// (`for_statement` means different fields in Python and Dart).
+///
+/// The walk stops at the function boundary: a call in a nested function
+/// must not inherit the outer function's `if`.
+pub(super) fn control_flags(callee: &Node, language: Language) -> u8 {
+    use crate::model::call_flags;
+
+    let mut flags = 0u8;
+    let mut current = *callee;
+    for _ in 0..max_ast_depth() {
+        let Some(parent) = current.parent() else {
+            break;
+        };
+        // Stop at the enclosing function: anything above belongs to a
+        // different body.
+        if language.map_node_kind(parent.kind()) == Some("function") {
+            break;
+        }
+        match parent.kind() {
+            "await_expression" | "await" => flags |= call_flags::AWAIT,
+            "if_expression"
+            | "if_statement"
+            | "match_expression"
+            | "match_statement"
+            | "switch_statement"
+            | "switch_expression"
+            | "conditional_expression" => {
+                flags |= call_flags::CONDITIONAL;
+            }
+            "for_expression" | "for_statement" | "while_expression" | "while_statement"
+            | "loop_expression" | "do_statement" => flags |= call_flags::REPEATED,
+            _ => {}
+        }
+        current = parent;
+    }
+    flags
 }
 
 // ── Utilities ─────────────────────────────────────────────────────────────────
@@ -865,6 +935,174 @@ fn impl_owner_type(owner: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::call_flags;
+
+    /// Parse `src` and return the call sites of the function named `name`.
+    fn sites_of(src: &str, file: &str, lang: Language, name: &str) -> Vec<CallSite> {
+        let parser = match lang {
+            Language::Rust => CodeParser::rust(),
+            Language::Python => CodeParser::python(),
+            Language::Dart => CodeParser::dart(),
+        };
+        let unit = parser.parse(src.as_bytes(), file).expect("parse");
+        unit.atoms
+            .iter()
+            .find(|a| a.name == name && a.kind == "function")
+            .unwrap_or_else(|| panic!("no function `{name}` in {file}"))
+            .calls
+            .clone()
+    }
+
+    fn site<'a>(sites: &'a [CallSite], name: &str) -> &'a CallSite {
+        sites
+            .iter()
+            .find(|s| s.name == name)
+            .unwrap_or_else(|| panic!("no call to `{name}` in {sites:?}"))
+    }
+
+    /// Rank numbers the sites the graph keeps, in source order. It was
+    /// already implicit in the `Vec` — dedup uses `retain`, which
+    /// preserves first appearance — but nothing named it.
+    #[test]
+    fn rank_follows_source_order() {
+        let s = sites_of(
+            "fn run() { first(); second(); third(); }\n",
+            "a.rs",
+            Language::Rust,
+            "run",
+        );
+        assert_eq!(site(&s, "first").rank, 0);
+        assert_eq!(site(&s, "second").rank, 1);
+        assert_eq!(site(&s, "third").rank, 2);
+    }
+
+    /// A call at the top of a body carries no context at all — the flags
+    /// must not fire spuriously.
+    #[test]
+    fn unconditional_call_has_no_flags() {
+        let s = sites_of("fn run() { plain(); }\n", "a.rs", Language::Rust, "run");
+        assert_eq!(site(&s, "plain").flags, 0);
+    }
+
+    /// The whole reason this refactor precedes `flow`: a rank without its
+    /// conditional context implies a sequence the code does not promise.
+    #[test]
+    fn conditional_call_is_flagged_in_every_language() {
+        let cases = [
+            (
+                Language::Rust,
+                "a.rs",
+                "fn run() { if ok { guarded(); } }\n",
+            ),
+            (
+                Language::Python,
+                "a.py",
+                "def run():\n    if ok:\n        guarded()\n",
+            ),
+            (
+                Language::Dart,
+                "a.dart",
+                "void run() { if (ok) { guarded(); } }\n",
+            ),
+        ];
+        for (lang, file, src) in cases {
+            let s = sites_of(src, file, lang, "run");
+            assert!(
+                site(&s, "guarded").has(call_flags::CONDITIONAL),
+                "{lang:?}: guarded() must be flagged conditional"
+            );
+        }
+    }
+
+    #[test]
+    fn loop_call_is_flagged_in_every_language() {
+        let cases = [
+            (
+                Language::Rust,
+                "a.rs",
+                "fn run() { for x in xs { each(); } }\n",
+            ),
+            (
+                Language::Python,
+                "a.py",
+                "def run():\n    for x in xs:\n        each()\n",
+            ),
+            (
+                Language::Dart,
+                "a.dart",
+                "void run() { for (final x in xs) { each(); } }\n",
+            ),
+        ];
+        for (lang, file, src) in cases {
+            let s = sites_of(src, file, lang, "run");
+            assert!(
+                site(&s, "each").has(call_flags::REPEATED),
+                "{lang:?}: each() must be flagged repeated"
+            );
+        }
+    }
+
+    /// Rust puts `await` after the call, Python and Dart before it — the
+    /// ancestor walk sees the same node either way.
+    #[test]
+    fn awaited_call_is_flagged_in_every_language() {
+        let cases = [
+            (
+                Language::Rust,
+                "a.rs",
+                "async fn run() { fetch().await; }\n",
+            ),
+            (
+                Language::Python,
+                "a.py",
+                "async def run():\n    await fetch()\n",
+            ),
+            (
+                Language::Dart,
+                "a.dart",
+                "Future<void> run() async { await fetch(); }\n",
+            ),
+        ];
+        for (lang, file, src) in cases {
+            let s = sites_of(src, file, lang, "run");
+            assert!(
+                site(&s, "fetch").has(call_flags::AWAIT),
+                "{lang:?}: fetch() must be flagged await"
+            );
+        }
+    }
+
+    /// Flags accumulate: an awaited call inside a loop carries both.
+    #[test]
+    fn flags_combine() {
+        let s = sites_of(
+            "async fn run() { for x in xs { fetch().await; } }\n",
+            "a.rs",
+            Language::Rust,
+            "run",
+        );
+        let f = site(&s, "fetch");
+        assert!(
+            f.has(call_flags::AWAIT) && f.has(call_flags::REPEATED),
+            "{f:?}"
+        );
+    }
+
+    /// The walk stops at the function boundary. Without that stop it
+    /// would keep climbing into the file and could pick up control nodes
+    /// belonging to a neighbouring function.
+    #[test]
+    fn context_does_not_leak_between_sibling_functions() {
+        let src = "fn guarded() { if ok { inside(); } }\nfn plain() { outside(); }\n";
+        let a = sites_of(src, "a.rs", Language::Rust, "guarded");
+        let b = sites_of(src, "a.rs", Language::Rust, "plain");
+        assert!(site(&a, "inside").has(call_flags::CONDITIONAL));
+        assert_eq!(
+            site(&b, "outside").flags,
+            0,
+            "plain()'s call must not inherit guarded()'s if"
+        );
+    }
 
     #[test]
     fn invalid_utf8_errors() {

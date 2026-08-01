@@ -103,6 +103,77 @@ impl std::fmt::Display for AtomKind {
     }
 }
 
+// ── Call site ────────────────────────────────────────────────────────────────
+
+/// Control-flow context a call site sits in, as a bitfield.
+///
+/// Detected by walking the callee's ancestors up to the enclosing
+/// function. Only the *presence* of a control node matters — no field is
+/// read — so one set of kinds covers all three grammars. That is the
+/// boundary drawn in `sequence::lang`: structural dispatch is shared,
+/// field reads are per-language.
+pub mod call_flags {
+    /// The call is `await`ed — Rust postfix `.await`, Python and Dart
+    /// prefix `await`.
+    pub const AWAIT: u8 = 1 << 0;
+    /// The call sits under an `if` / `match` / `switch`, so it may not run
+    /// at all. Without this, a rank alone implies a sequence that the code
+    /// does not guarantee.
+    pub const CONDITIONAL: u8 = 1 << 1;
+    /// The call sits in a loop and may run many times.
+    pub const REPEATED: u8 = 1 << 2;
+}
+
+/// One call site in an atom's body: what it calls, where, and under what
+/// control flow.
+///
+/// Replaces the bare `String` the parser used to emit. `name` is what the
+/// resolver consumes and is unchanged; `rank` and `flags` are what lets a
+/// view state *when* a call happens rather than merely *that* it happens.
+///
+/// `rank` was already implicit — the parser's dedup uses `retain`, which
+/// preserves first-appearance order — but nothing named it, so no view
+/// could use it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CallSite {
+    /// Resolver-eligible name: a bare identifier, or a qualified
+    /// `module::foo` / `Owner::method` path.
+    pub name: String,
+    /// Position in the enclosing body, in source order, 0-based.
+    #[serde(default)]
+    pub rank: u16,
+    /// Control-flow context — see [`call_flags`].
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub flags: u8,
+}
+
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde's skip_serializing_if requires a by-ref predicate"
+)]
+fn is_zero(v: &u8) -> bool {
+    *v == 0
+}
+
+impl CallSite {
+    /// A call site with no recorded context — used by tests and by
+    /// callers that only care about the name.
+    #[must_use]
+    pub fn bare(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            rank: 0,
+            flags: 0,
+        }
+    }
+
+    /// Whether this site carries `flag` (one of [`call_flags`]).
+    #[must_use]
+    pub fn has(&self, flag: u8) -> bool {
+        self.flags & flag != 0
+    }
+}
+
 // ── Code atom ────────────────────────────────────────────────────────────────
 
 /// A single named code entity parsed from a source file.
@@ -127,10 +198,10 @@ pub struct CodeAtom {
     /// Git blob SHA-1 hex hash of the atom's source text (`SHA1("blob N\0" + content)`).
     /// Same value as `git hash-object` on the enclosing source slice.
     pub content_hash: String,
-    /// Names of functions this atom calls in resolver-eligible form:
-    /// bare identifiers (free-fn calls, possibly expanded via `use`
-    /// imports) and qualified `module::foo` / `Owner::method` paths.
-    pub calls: Vec<String>,
+    /// Call sites in this atom's body, in source order. Each carries the
+    /// resolver-eligible name plus its rank and control-flow context —
+    /// see [`CallSite`].
+    pub calls: Vec<CallSite>,
     /// Names captured from receiver-style call sites — `obj.method()` in
     /// Rust (`field_expression`) or `obj.method()` in Python (`attribute`
     /// access). These carry no usable receiver type, so the resolver

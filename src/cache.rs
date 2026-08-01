@@ -143,7 +143,10 @@ const SCHEMA_VERSION: u32 = 6;
 /// `5`: Dart receiver-type inference (#188). `obj.method()` now emits
 /// `Type::method` whenever the file declares `obj`'s type, so cached
 /// units carry method names where qualified calls are now produced.
-const GRAMMAR_VERSION: u32 = 5;
+///
+/// `6`: call sites carry rank and control-flow flags (#190). Cached units
+/// hold bare strings and would deserialise without the new fields.
+const GRAMMAR_VERSION: u32 = 6;
 
 /// Compute the cache version string written to `<root>/version`.
 fn cache_version() -> String {
