@@ -191,16 +191,46 @@ pub(super) fn extract_calls(
                             .map_or_else(|| name.to_owned(), String::clone),
                     );
                 }
-                "member_expression" => {
+                // `obj.method()` and its null-aware twin `obj?.method()`
+                // share a shape; #174 handled the latter in the sequence
+                // walker but not here, so it used to fall through to
+                // `_ => {}` and vanish from the graph entirely.
+                "member_expression" | "null_aware_member_expression" => {
                     let Some((root, method)) = member_root_method(&cap.node, source) else {
                         continue;
                     };
                     if let Some(module_stem) = imports.modules.get(root) {
                         // `models.fn()` where `models` is an import alias →
-                        // resolver-eligible qualified call.
+                        // resolver-eligible qualified call. Checked first:
+                        // an alias could in principle be capitalised, and
+                        // the import is the stronger signal.
                         out.calls.push(format!("{module_stem}::{method}"));
+                    } else if direct_receiver(&cap.node, source).is_some_and(is_type_name) {
+                        // `NotificationService.initialize()` — a leading
+                        // capital is Dart's type convention, enforced by
+                        // `camel_case_types` in the official lints. This is
+                        // the same shape Rust spells `Type::method`, which
+                        // the resolver already indexes by `(owner, name)`.
+                        //
+                        // The receiver must be *direct*. `member_root_method`
+                        // collapses a whole chain, so `AppTextStyles.caption
+                        // .copyWith()` would report `AppTextStyles` — but
+                        // `copyWith` belongs to whatever `caption` is, not to
+                        // `AppTextStyles`. Qualifying that invents a method
+                        // the class does not have, and the resolver then
+                        // manufactures an extern for it.
+                        //
+                        // Emitting it qualified does not weaken anything
+                        // else: the resolver still requires a target that
+                        // exists in the graph and is unique, so an SDK class
+                        // such as `MediaQuery.of()` resolves to nothing
+                        // rather than to something wrong.
+                        out.calls.push(format!("{root}::{method}"));
                     } else {
-                        // Unknown receiver type — intra-container linking only.
+                        // Lowercase receiver — an instance whose type we do
+                        // not know. Intra-container linking only; binding it
+                        // to a same-named method elsewhere is exactly the
+                        // ghost-bind `resolve.rs` refuses.
                         out.method_calls.push(method.to_owned());
                     }
                 }
@@ -208,6 +238,33 @@ pub(super) fn extract_calls(
             }
         }
     }
+}
+
+/// The callee's **immediate** receiver, when it is a plain identifier.
+///
+/// Distinct from [`member_root_method`], which walks a whole chain down to
+/// its leftmost identifier. Here only `A.method()` qualifies — in
+/// `A.b.method()` the method belongs to the type of `A.b`, which we do not
+/// know, so treating `A` as the owner would attribute a method to a class
+/// that never declared it.
+fn direct_receiver<'a>(node: &Node, source: &'a str) -> Option<&'a str> {
+    let object = node.child_by_field_name("object")?;
+    if object.kind() != "identifier" {
+        return None;
+    }
+    node_text(&object, source)
+}
+
+/// Whether `name` reads as a Dart type rather than an instance.
+///
+/// Dart's `camel_case_types` lint — on by default through `flutter_lints`
+/// and `lints` — makes the leading capital a reliable signal. A private
+/// type is `_Foo`, so the underscore is skipped before testing.
+fn is_type_name(name: &str) -> bool {
+    name.trim_start_matches('_')
+        .chars()
+        .next()
+        .is_some_and(char::is_uppercase)
 }
 
 /// From a `member_expression` callee (`obj.method`, `a.b.method`), return
@@ -222,7 +279,9 @@ fn member_root_method<'a>(node: &Node, source: &'a str) -> Option<(&'a str, &'a 
     let mut current = node.child_by_field_name("object")?;
     loop {
         match current.kind() {
-            "member_expression" => {
+            // Both spellings chain through `object`, so `a?.b.method()`
+            // collapses to `a` like its plain counterpart.
+            "member_expression" | "null_aware_member_expression" => {
                 current = current.child_by_field_name("object")?;
             }
             "identifier" => return Some((node_text(&current, source)?, method)),
@@ -370,6 +429,90 @@ mod tests {
         let c = calls_of("void f() { widget.build(); }\n");
         assert_eq!(c.method_calls, vec!["build".to_owned()]);
         assert!(c.calls.is_empty(), "got {:?}", c.calls);
+    }
+
+    /// A capitalised receiver is a type, not an instance — Dart's
+    /// `camel_case_types` lint makes that reliable. The call is the same
+    /// shape Rust spells `Type::method`, which the resolver already
+    /// indexes, so emitting it qualified is what lets it link at all.
+    #[test]
+    fn capitalised_receiver_is_a_qualified_type_call() {
+        let c = calls_of("void f() { NotificationService.initialize(); }\n");
+        assert_eq!(c.calls, vec!["NotificationService::initialize".to_owned()]);
+        assert!(c.method_calls.is_empty(), "got {:?}", c.method_calls);
+    }
+
+    /// Private types are spelled `_Foo`; the underscore must not hide the
+    /// capital.
+    #[test]
+    fn private_type_receiver_is_still_a_type() {
+        let c = calls_of("void f() { _CacheEntry.parse('x'); }\n");
+        assert_eq!(c.calls, vec!["_CacheEntry::parse".to_owned()]);
+    }
+
+    /// An import alias wins over the capital rule: the import is the
+    /// stronger signal about where the symbol actually lives.
+    #[test]
+    fn import_alias_takes_priority_over_the_capital_rule() {
+        let c = calls_of(
+            "import 'package:demo/models/user.dart' as Models;\nvoid f() { Models.parseUser('x'); }\n",
+        );
+        assert_eq!(c.calls, vec!["user::parseUser".to_owned()]);
+    }
+
+    /// Lowercase receivers keep the old behaviour — this is the
+    /// ghost-bind guard, and widening it is not what this change does.
+    #[test]
+    fn lowercase_receiver_still_lands_in_method_calls() {
+        let c = calls_of("void f() { notificationService.initialize(); }\n");
+        assert_eq!(c.method_calls, vec!["initialize".to_owned()]);
+        assert!(c.calls.is_empty(), "got {:?}", c.calls);
+    }
+
+    /// `session?.release()` used to hit `_ => {}` and disappear from the
+    /// graph entirely — #174 fixed this kind in the sequence walker but
+    /// not in the parser.
+    #[test]
+    fn null_aware_receiver_is_classified_like_its_plain_twin() {
+        let lower = calls_of("void f() { session?.release(); }\n");
+        assert_eq!(lower.method_calls, vec!["release".to_owned()]);
+
+        let upper = calls_of("void f() { NotificationService?.initialize(); }\n");
+        assert_eq!(
+            upper.calls,
+            vec!["NotificationService::initialize".to_owned()]
+        );
+    }
+
+    /// A chained null-aware receiver collapses to its leftmost identifier.
+    #[test]
+    fn chained_null_aware_collapses_to_root() {
+        let c = calls_of("void f() { xs?.first?.run(); }\n");
+        assert_eq!(c.method_calls, vec!["run".to_owned()]);
+    }
+
+    /// The capital rule needs a *direct* receiver. In
+    /// `AppTextStyles.caption.copyWith()` the method belongs to whatever
+    /// `caption` is — a `TextStyle` from the SDK — not to `AppTextStyles`.
+    /// Qualifying it would attribute `copyWith` to a class that never
+    /// declared it, and the resolver would mint an extern for the
+    /// invented pair. Found on a real project: 164 such externs.
+    #[test]
+    fn chained_type_receiver_is_not_qualified() {
+        let c = calls_of("void f() { AppTextStyles.caption.copyWith(); }\n");
+        assert_eq!(c.method_calls, vec!["copyWith".to_owned()]);
+        assert!(
+            !c.calls.iter().any(|s| s.starts_with("AppTextStyles::")),
+            "must not attribute copyWith to AppTextStyles: {:?}",
+            c.calls
+        );
+    }
+
+    /// The direct case still qualifies — this is what the change is for.
+    #[test]
+    fn direct_type_receiver_is_qualified() {
+        let c = calls_of("void f() { AppTextStyles.caption(); }\n");
+        assert_eq!(c.calls, vec!["AppTextStyles::caption".to_owned()]);
     }
 
     /// `a.b.method()` collapses to the leftmost identifier, so an aliased

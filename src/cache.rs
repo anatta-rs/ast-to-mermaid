@@ -127,7 +127,12 @@ const SCHEMA_VERSION: u32 = 6;
 /// `2`: Dart support (#170). Added `tree-sitter-dart`, and across #171 to
 /// #175 changed what the parser emits for Rust and Python files too
 /// (`declared_name` is shared by all three).
-const GRAMMAR_VERSION: u32 = 2;
+///
+/// `3`: Dart typed receivers (#184). `ClassName.method()` now emits a
+/// qualified `ClassName::method` instead of a bare method name, and
+/// `null_aware_member_expression` stopped being dropped — the same file
+/// therefore yields different `calls` than it did under `2`.
+const GRAMMAR_VERSION: u32 = 3;
 
 /// Compute the cache version string written to `<root>/version`.
 fn cache_version() -> String {
