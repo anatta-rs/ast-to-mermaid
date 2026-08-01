@@ -325,21 +325,24 @@ $ a2m flow --target main lib/ --depth 2
 ```
 
 ```
-main -.->|"1"|       WidgetsFlutterBinding::ensureInitialized
-main -->|"2 await"|  NotificationService::initialize
-main -->|"3 await"|  initCoverStorage
-main -.->|"4"|       ProviderContainer
-main -.->|"5 await"| ProviderContainer::read
-main -->|"6 await"|  initOnboardingFlag
-main -->|"7 alt"|    _parseThemeMode
-main -.->|"8"|       runApp
-main -.->|"9"|       UncontrolledProviderScope
+main -.->|"1"|          WidgetsFlutterBinding::ensureInitialized
+main -->|"2 await"|     NotificationService::initialize
+main -->|"3 await"|     initCoverStorage
+main -.->|"4"|          ProviderContainer
+main -.->|"5 await x4"| ProviderContainer::read
+main -->|"7 await"|     initOnboardingFlag
+main -.->|"8 await"|    getPreferences
+main -.->|"10 alt"|     setTheme
+main -->|"11 alt"|      _parseThemeMode
+main -.->|"14"|         runApp
+main -.->|"15"|         UncontrolledProviderScope
 initOnboardingFlag -->|"1 await"| UserDao::onboardingVersionSeen
+%% 1 stdlib call(s) hidden (SKIP_CALLS)
 ```
 
-`7 alt` says `_parseThemeMode` is the seventh call in `main` **and** that it sits under an `if` — it may never run. The rank is never shown without that context: on its own it would imply a sequence the code does not promise.
+`11 alt` says `_parseThemeMode` is the eleventh call in `main` **and** that it sits under an `if` — it may never run. The rank is never shown without that context: on its own it would imply a sequence the code does not promise. `x4` on `ProviderContainer::read` says one edge stands for four call sites.
 
-**Every call the parser recorded is accounted for.** Solid arrows are calls the resolver bound to an atom in the graph; dashed ones are calls it could not — a Flutter SDK entry point, a method on a receiver whose type is not inferable, a symbol from a package you do not build. Showing only the solid ones is how this view used to render four of the nine calls above, with the rank gaps as the only clue.
+**Every call site in the body is accounted for** — as an edge, as a leaf, or in the hidden-call count. Nothing is silently dropped. Solid arrows are calls the resolver bound to an atom in the graph; dashed ones are calls it could not: a Flutter SDK entry point, a method on a receiver whose type is not inferable, a symbol from a package you do not build.
 
 The two kinds of leaf are styled apart on purpose. An `external` leaf is an atom the resolver *created* from a qualifier it recognised as an outside module; an `unresolved` leaf is a call site nothing is known about. Drawing them alike would claim knowledge that does not exist.
 
@@ -347,7 +350,7 @@ By default leaves show at depth 1 only — enough to see that `main` ends on `ru
 
 Stdlib noise (`clone`, `unwrap`, `len`, `push` — 74 names) stays out, as it does everywhere else in the tool, but the count is emitted as a Mermaid comment rather than left as an unexplained gap in the ranks.
 
-One limit worth knowing: the parser records each *distinct* call name once per body, so a function called twice contributes one site, and a call chained onto another call (`a.b().c()`) is not recorded at all. `flow` shows everything that was recorded — it cannot show what the extractor never saw. `a2m sequence` walks the syntax directly and does see both.
+Ranks follow **source order**, including through a chain: in `jsonDecode(x).map(f).toList()` they read 1, 2, 3 left to right. Source order is not evaluation order — an argument evaluates before the call it is passed to — so `setTheme` above precedes the `_parseThemeMode` whose result it receives.
 
 Recursion is shown, not hidden: the nodes of a cycle are styled, expansion stops at the return edge, and a cycle that `--depth` would have truncated still emits a dotted `cycle (depth limit)` edge — otherwise the graph would look acyclic.
 

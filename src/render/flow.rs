@@ -294,14 +294,11 @@ fn show_leaf(external: External, is_leaf: bool, depth_used: usize) -> bool {
 ///
 /// Two populations, kept apart because only one of them has ranks:
 ///
-/// - `calls` whose rank is not in `claimed`. The resolver either found
-///   no target, found several, or the target lives outside the graph.
-/// - **every** `method_calls` entry, which the resolver never even
-///   looks at (it holds `obj.m()` shapes whose receiver type is
-///   unknown). The exception is a name the parser's intra-container
-///   linker already bound to a sibling: that edge exists but carries no
-///   rank, so it is recognised the one way it was created — by exact
-///   name. This mirrors the linker's own rule rather than guessing.
+/// Both lists are read the same way — a site is a leaf when its rank is
+/// not in `claimed`. `method_calls` mostly qualify, since the resolver
+/// never looks at them (they hold `obj.m()` shapes whose receiver type is
+/// unknown), except where the intra-container linker bound one to a
+/// sibling and claimed its rank.
 #[expect(
     clippy::too_many_arguments,
     reason = "one call site; bundling these into a struct would only move the list"
@@ -323,24 +320,27 @@ fn unresolved_leaves(
         return;
     }
 
-    let linked_names: HashSet<&str> = merged
-        .keys()
-        .filter_map(|id| snapshot.get(id))
-        .map(|atom| atom.name.as_str())
-        .collect();
-
     // Degraded mode: some edge out of here carries no rank at all, so
     // `claimed` cannot be trusted to be complete and a site it misses
     // may well be one that edge already stands for. Fall back to the
     // name for those — a leaf duplicating an edge is a worse lie than a
-    // site folded into it. When every edge has its ranks (the normal
-    // case) this stays off, and names are never consulted.
+    // site folded into it. Only bundles written before ranks existed
+    // reach this; every edge the current parser builds carries them.
     let degraded = merged.values().any(Vec::is_empty);
+    let linked_names: HashSet<&str> = if degraded {
+        merged
+            .keys()
+            .filter_map(|id| snapshot.get(id))
+            .map(|atom| atom.name.as_str())
+            .collect()
+    } else {
+        HashSet::new()
+    };
 
     // Group by name so two calls to the same unknown target share one
     // leaf, the way two calls to a known one share one edge.
     let mut leaves: BTreeMap<&str, Vec<&CallSite>> = BTreeMap::new();
-    for site in &from_atom.calls {
+    for site in from_atom.calls.iter().chain(from_atom.method_calls.iter()) {
         if claimed.contains(&site.rank) {
             continue;
         }
@@ -355,16 +355,6 @@ fn unresolved_leaves(
             }
         }
         leaves.entry(site.name.as_str()).or_default().push(site);
-    }
-    for name in &from_atom.method_calls {
-        if is_skipped(name) {
-            state.skipped += 1;
-            continue;
-        }
-        if linked_names.contains(name.as_str()) {
-            continue;
-        }
-        leaves.entry(name.as_str()).or_default();
     }
 
     for (name, sites) in leaves {
@@ -390,8 +380,8 @@ fn unresolved_leaves(
 fn count_skipped(atom: &CodeAtom) -> usize {
     atom.calls
         .iter()
+        .chain(atom.method_calls.iter())
         .map(|s| s.name.as_str())
-        .chain(atom.method_calls.iter().map(String::as_str))
         .filter(|name| is_skipped(name))
         .count()
 }
@@ -423,14 +413,22 @@ fn reaches_path(adj: &AdjMaps, node: &EntityId, path: &[String]) -> Option<Strin
 /// and a multiplicity marker is appended, since one edge stands for all
 /// of them.
 ///
+/// Both call lists are searched: the intra-container linker binds
+/// `method_calls` too, and its edges carry those sites' ranks.
+///
 /// Returns `None` when the edge carries no rank — a bundle from before
-/// the ranks were recorded, or an edge the intra-container linker built
-/// from a `method_calls` entry, which has no rank to give. Emitting a
-/// bare `1` there would be inventing one.
+/// the ranks were recorded. Emitting a bare `1` there would be inventing
+/// one.
 fn edge_label(from_atom: &CodeAtom, ranks: &[u16]) -> Option<String> {
     let sites: Vec<&CallSite> = ranks
         .iter()
-        .filter_map(|rank| from_atom.calls.iter().find(|s| s.rank == *rank))
+        .filter_map(|rank| {
+            from_atom
+                .calls
+                .iter()
+                .chain(from_atom.method_calls.iter())
+                .find(|s| s.rank == *rank)
+        })
         .collect();
     sites_label(&sites)
 }
@@ -775,19 +773,31 @@ mod tests {
 
     /// `method_calls` are never resolved, so each is a leaf — but one the
     /// intra-container linker already bound is not, or the graph would
-    /// show the same call twice.
+    /// show the same call twice. Both lists share one rank sequence, so
+    /// the edge names the site it came from just like any other.
     #[test]
     fn method_calls_become_leaves_unless_already_linked() {
         let store = Store::new();
         let mut caller = atom("main", &[]);
-        caller.method_calls = vec!["getPreferences".to_owned(), "sibling".to_owned()];
+        caller.method_calls = vec![
+            CallSite {
+                name: "getPreferences".to_owned(),
+                rank: 0,
+                flags: 0,
+            },
+            CallSite {
+                name: "sibling".to_owned(),
+                rank: 1,
+                flags: 0,
+            },
+        ];
         store.add_atom(caller);
         store.add_atom(atom("sibling", &[]));
-        // The linker's edge: built from a `method_calls` entry, so no rank.
-        store.add_edge(crate::model::Edge::new(
+        // The linker's edge, carrying the rank of the `method_calls` site.
+        store.add_edge(crate::model::Edge::calls_from_sites(
             id_of("main"),
             id_of("sibling"),
-            EdgeKind::Calls,
+            vec![1],
         ));
         let adj = AdjMaps::build(&store);
         let out = store

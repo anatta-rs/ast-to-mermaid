@@ -356,6 +356,13 @@ pub(super) fn extract_calls(
                     let Some((root, method)) = member_root_method(&cap.node, source) else {
                         continue;
                     };
+                    let Some(root) = root else {
+                        // Receiver is not a name (a chained call, a
+                        // literal): the owner is unknowable, but the call
+                        // happened. Intra-container linking only.
+                        out.push_method_call(method.to_owned(), &cap.node, Language::Dart);
+                        continue;
+                    };
                     if let Some(module_stem) = imports.modules.get(root) {
                         // `models.fn()` where `models` is an import alias →
                         // resolver-eligible qualified call. Checked first:
@@ -403,7 +410,7 @@ pub(super) fn extract_calls(
                         // Type unknown or ambiguous. Intra-container linking
                         // only; binding it to a same-named method elsewhere
                         // is exactly the ghost-bind `resolve.rs` refuses.
-                        out.method_calls.push(method.to_owned());
+                        out.push_method_call(method.to_owned(), &cap.node, Language::Dart);
                     }
                 }
                 _ => {}
@@ -446,7 +453,7 @@ fn is_type_name(name: &str) -> bool {
 /// `object:` once nested member expressions are peeled off. A receiver that
 /// is itself a call (`f().g()`) has no stable identifier, so it yields
 /// `None` and the call lands in `method_calls`.
-fn member_root_method<'a>(node: &Node, source: &'a str) -> Option<(&'a str, &'a str)> {
+fn member_root_method<'a>(node: &Node, source: &'a str) -> Option<(Option<&'a str>, &'a str)> {
     let method = node_text(&node.child_by_field_name("property")?, source)?;
     let mut current = node.child_by_field_name("object")?;
     loop {
@@ -454,10 +461,18 @@ fn member_root_method<'a>(node: &Node, source: &'a str) -> Option<(&'a str, &'a 
             // Both spellings chain through `object`, so `a?.b.method()`
             // collapses to `a` like its plain counterpart.
             "member_expression" | "null_aware_member_expression" => {
-                current = current.child_by_field_name("object")?;
+                let Some(next) = current.child_by_field_name("object") else {
+                    return Some((None, method));
+                };
+                current = next;
             }
-            "identifier" => return Some((node_text(&current, source)?, method)),
-            _ => return None,
+            "identifier" => return Some((node_text(&current, source), method)),
+            // The receiver is not a name — typically another call, as in
+            // `container.read(x).setTheme(y)`. Nothing can be said about
+            // what owns `setTheme`, but the call is real and returning
+            // `None` here used to drop it from the graph outright. Report
+            // the method without a root so it lands in `method_calls`.
+            _ => return Some((None, method)),
         }
     }
 }
@@ -560,7 +575,28 @@ mod tests {
         let imports = extract_imports(root, src);
         let mut out = ExtractedCalls::default();
         extract_calls(&root, src, &imports, &mut out);
+        // Mirror `parser::extract_calls`, which sorts before handing the
+        // sites on — otherwise these tests would assert on ranks no
+        // consumer ever sees.
+        out.sort_by_source_order();
         out
+    }
+
+    /// Ranks must read like the code, not like the query. A chain is
+    /// captured outermost-first, so without the sort `toList` would come
+    /// out ahead of the `jsonDecode` it consumes.
+    #[test]
+    fn ranks_follow_source_order_through_a_chain() {
+        let c = calls_of("void f() { jsonDecode(x).map(g).toList(); }\n");
+        let mut ordered: Vec<(u16, &str)> = c
+            .calls
+            .iter()
+            .chain(c.method_calls.iter())
+            .map(|s| (s.rank, s.name.as_str()))
+            .collect();
+        ordered.sort_unstable();
+        let names: Vec<&str> = ordered.into_iter().map(|(_, n)| n).collect();
+        assert_eq!(names, vec!["jsonDecode", "map", "toList"], "got {c:?}");
     }
 
     /// Top-level Dart functions had their calls silently dropped for the
@@ -629,7 +665,7 @@ mod tests {
     #[test]
     fn unknown_receiver_lands_in_method_calls() {
         let c = calls_of("void f() { widget.build(); }\n");
-        assert_eq!(c.method_calls, vec!["build".to_owned()]);
+        assert_eq!(names(&c.method_calls), vec!["build".to_owned()]);
         assert!(c.calls.is_empty(), "got {:?}", names(&c.calls));
     }
 
@@ -670,7 +706,7 @@ mod tests {
     #[test]
     fn lowercase_receiver_of_unknown_type_lands_in_method_calls() {
         let c = calls_of("void f() { notificationService.initialize(); }\n");
-        assert_eq!(c.method_calls, vec!["initialize".to_owned()]);
+        assert_eq!(names(&c.method_calls), vec!["initialize".to_owned()]);
         assert!(c.calls.is_empty(), "got {:?}", names(&c.calls));
     }
 
@@ -718,7 +754,10 @@ mod tests {
     #[test]
     fn a_name_with_two_types_is_ambiguous_and_unused() {
         let c = calls_of("void a(UserDao x) { x.run(); }\nvoid b(OrderDao x) { x.run(); }\n");
-        assert_eq!(c.method_calls, vec!["run".to_owned(), "run".to_owned()]);
+        assert_eq!(
+            names(&c.method_calls),
+            vec!["run".to_owned(), "run".to_owned()]
+        );
         assert!(
             c.calls.is_empty(),
             "ambiguous name must not qualify: {:?}",
@@ -751,7 +790,7 @@ mod tests {
     fn chained_receiver_is_not_typed_from_the_table() {
         let c =
             calls_of("class R {\n  final UserDao dao;\n  void run() { dao.cache.clear(); }\n}\n");
-        assert_eq!(c.method_calls, vec!["clear".to_owned()]);
+        assert_eq!(names(&c.method_calls), vec!["clear".to_owned()]);
         assert!(c.calls.is_empty(), "got {:?}", names(&c.calls));
     }
 
@@ -761,7 +800,7 @@ mod tests {
     #[test]
     fn null_aware_receiver_is_classified_like_its_plain_twin() {
         let lower = calls_of("void f() { session?.release(); }\n");
-        assert_eq!(lower.method_calls, vec!["release".to_owned()]);
+        assert_eq!(names(&lower.method_calls), vec!["release".to_owned()]);
 
         let upper = calls_of("void f() { NotificationService?.initialize(); }\n");
         assert_eq!(
@@ -774,7 +813,7 @@ mod tests {
     #[test]
     fn chained_null_aware_collapses_to_root() {
         let c = calls_of("void f() { xs?.first?.run(); }\n");
-        assert_eq!(c.method_calls, vec!["run".to_owned()]);
+        assert_eq!(names(&c.method_calls), vec!["run".to_owned()]);
     }
 
     /// The capital rule needs a *direct* receiver. In
@@ -786,7 +825,7 @@ mod tests {
     #[test]
     fn chained_type_receiver_is_not_qualified() {
         let c = calls_of("void f() { AppTextStyles.caption.copyWith(); }\n");
-        assert_eq!(c.method_calls, vec!["copyWith".to_owned()]);
+        assert_eq!(names(&c.method_calls), vec!["copyWith".to_owned()]);
         assert!(
             !names(&c.calls)
                 .iter()
@@ -808,21 +847,19 @@ mod tests {
     #[test]
     fn chained_receiver_collapses_to_its_root() {
         let c = calls_of("void f() { obj.inner.method(); }\n");
-        assert_eq!(c.method_calls, vec!["method".to_owned()]);
+        assert_eq!(names(&c.method_calls), vec!["method".to_owned()]);
     }
 
     /// A receiver that is itself a call has no stable identifier to key
-    /// on, and the extractor gives up on the outer call entirely — so
-    /// `render` is **dropped**, while the inner `build` still surfaces.
+    /// on, so nothing can be said about what owns the method — but the
+    /// call is real. It goes to `method_calls`, the bucket for "receiver
+    /// type unknown", instead of being dropped.
     ///
-    /// This mirrors `python.rs::attribute_root_method`, which bails the
-    /// same way on a call/subscript/paren receiver. Pinned rather than
-    /// fixed: making Dart alone recover the method would diverge the two
-    /// extractors, and the fix belongs in both at once. The sequence
-    /// walker does not share the limitation — its own receiver walk
-    /// descends through `call_expression`.
+    /// This used to bail entirely, matching
+    /// `python.rs::attribute_root_method`. Both were changed together:
+    /// the limitation was shared, so the fix had to be too.
     #[test]
-    fn call_receiver_drops_the_outer_call_like_python_does() {
+    fn call_receiver_keeps_the_outer_call_as_a_method_call() {
         let c = calls_of("void f() { build().render(); }\n");
         assert!(
             names(&c.calls).contains(&"build".to_owned()),
@@ -830,8 +867,22 @@ mod tests {
             names(&c.calls)
         );
         assert!(
-            !c.method_calls.contains(&"render".to_owned()),
-            "known limitation shared with python.rs: {c:?}"
+            names(&c.method_calls).contains(&"render".to_owned()),
+            "the outer call must survive: {c:?}"
+        );
+    }
+
+    /// The shape that motivated it: `container.read(x).setTheme(y)` in a
+    /// Flutter `main`. `read` qualifies through its receiver, `setTheme`
+    /// cannot — and used to vanish.
+    #[test]
+    fn chained_call_on_a_call_keeps_both_links() {
+        let c = calls_of("void f() { container.read(x).setTheme(y); }\n");
+        assert!(
+            names(&c.method_calls).contains(&"setTheme".to_owned()),
+            "got calls={:?} method_calls={:?}",
+            names(&c.calls),
+            names(&c.method_calls)
         );
     }
 
@@ -861,7 +912,7 @@ mod tests {
         let c = calls_of("void f() { buffer..write('a'); }\n");
         assert!(
             !names(&c.calls).contains(&"write".to_owned())
-                && !c.method_calls.contains(&"write".to_owned()),
+                && !names(&c.method_calls).contains(&"write".to_owned()),
             "cascade must not surface here: {c:?}"
         );
     }
