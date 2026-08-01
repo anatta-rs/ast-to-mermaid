@@ -325,16 +325,29 @@ $ a2m flow --target main lib/ --depth 2
 ```
 
 ```
-main -->|"2 await"| NotificationService::initialize
-main -->|"3 await"| initCoverStorage
-main -->|"6 await"| initOnboardingFlag
-main -->|"7 alt"|   _parseThemeMode
+main -.->|"1"|       WidgetsFlutterBinding::ensureInitialized
+main -->|"2 await"|  NotificationService::initialize
+main -->|"3 await"|  initCoverStorage
+main -.->|"4"|       ProviderContainer
+main -.->|"5 await"| ProviderContainer::read
+main -->|"6 await"|  initOnboardingFlag
+main -->|"7 alt"|    _parseThemeMode
+main -.->|"8"|       runApp
+main -.->|"9"|       UncontrolledProviderScope
 initOnboardingFlag -->|"1 await"| UserDao::onboardingVersionSeen
 ```
 
 `7 alt` says `_parseThemeMode` is the seventh call in `main` **and** that it sits under an `if` — it may never run. The rank is never shown without that context: on its own it would imply a sequence the code does not promise.
 
-Calls into code outside the graph (the Flutter SDK, another crate) appear as dashed leaves at depth 1 — enough to see that `main` ends on `runApp` — and are dropped deeper, where the ratio drowns your own code. `--include-external` keeps them at every depth, `--no-external` removes them entirely.
+**Every call the parser recorded is accounted for.** Solid arrows are calls the resolver bound to an atom in the graph; dashed ones are calls it could not — a Flutter SDK entry point, a method on a receiver whose type is not inferable, a symbol from a package you do not build. Showing only the solid ones is how this view used to render four of the nine calls above, with the rank gaps as the only clue.
+
+The two kinds of leaf are styled apart on purpose. An `external` leaf is an atom the resolver *created* from a qualifier it recognised as an outside module; an `unresolved` leaf is a call site nothing is known about. Drawing them alike would claim knowledge that does not exist.
+
+By default leaves show at depth 1 only — enough to see that `main` ends on `runApp` — and are dropped deeper, where the ratio drowns your own code (past depth 1 on a Flutter widget tree it can exceed 10:1). `--include-external` keeps them at every depth, `--no-external` removes them entirely.
+
+Stdlib noise (`clone`, `unwrap`, `len`, `push` — 74 names) stays out, as it does everywhere else in the tool, but the count is emitted as a Mermaid comment rather than left as an unexplained gap in the ranks.
+
+One limit worth knowing: the parser records each *distinct* call name once per body, so a function called twice contributes one site, and a call chained onto another call (`a.b().c()`) is not recorded at all. `flow` shows everything that was recorded — it cannot show what the extractor never saw. `a2m sequence` walks the syntax directly and does see both.
 
 Recursion is shown, not hidden: the nodes of a cycle are styled, expansion stops at the return edge, and a cycle that `--depth` would have truncated still emits a dotted `cycle (depth limit)` edge — otherwise the graph would look acyclic.
 

@@ -155,7 +155,15 @@ pub fn resolve_cross_module_calls(store: &Store) -> usize {
     });
 
     // Staged outputs: applied after the read guard drops.
-    let mut staged_edges: Vec<(EntityId, EntityId)> = Vec::new();
+    //
+    // An edge is keyed by its endpoints and carries the ranks of every
+    // call site that produced it, in source order. Keeping the ranks is
+    // what lets `flow` tell a site that resolved from one that did not
+    // without matching on names; the `Vec` (rather than one edge per
+    // site) is the de-duplication that `existing_fn` used to perform
+    // inside the loop.
+    let mut staged_edges: Vec<(EntityId, EntityId, Vec<u16>)> = Vec::new();
+    let mut staged_idx: HashMap<(EntityId, EntityId), usize> = HashMap::new();
     let mut new_extern_atoms: Vec<CodeAtom> = Vec::new();
 
     store.with_atoms(|atoms| {
@@ -241,14 +249,31 @@ pub fn resolve_cross_module_calls(store: &Store) -> usize {
                 );
 
                 if let Some(target_idx) = pick.target {
-                    staged_edges.push((caller.id.clone(), functions[target_idx].id.clone()));
-                    existing_fn.insert((caller_idx, target_idx));
+                    // Note the rank on the edge rather than suppressing
+                    // the site. Inserting into `existing_fn` here would
+                    // make a *second* call to the same target resolve to
+                    // nothing, and `flow` would then have no way to tell
+                    // it from a genuinely unresolved call.
+                    let key = (caller.id.clone(), functions[target_idx].id.clone());
+                    if let Some(&i) = staged_idx.get(&key) {
+                        staged_edges[i].2.push(site.rank);
+                    } else {
+                        staged_idx.insert(key.clone(), staged_edges.len());
+                        staged_edges.push((key.0, key.1, vec![site.rank]));
+                    }
                 } else if !pick.suppress_extern
                     && let Some(prefix) = path_prefix.filter(|p| is_external_qualifier(p))
                     && !is_unknown_dart_type(caller_lang, prefix, &methods_by_owner_name)
                 {
                     let extern_id = EntityId::new(format!("extern:{prefix}::{fn_name}"));
                     if existing_extern.contains(&(caller.id.clone(), extern_id.clone())) {
+                        continue;
+                    }
+                    // Same rank bookkeeping as the resolved branch: a
+                    // second call to the same extern extends the edge
+                    // instead of vanishing.
+                    if let Some(&i) = staged_idx.get(&(caller.id.clone(), extern_id.clone())) {
+                        staged_edges[i].2.push(site.rank);
                         continue;
                     }
                     if new_extern_set.insert(extern_id.clone()) {
@@ -267,7 +292,11 @@ pub fn resolve_cross_module_calls(store: &Store) -> usize {
                             parent: None,
                         });
                     }
-                    staged_edges.push((caller.id.clone(), extern_id.clone()));
+                    staged_idx.insert(
+                        (caller.id.clone(), extern_id.clone()),
+                        staged_edges.len(),
+                    );
+                    staged_edges.push((caller.id.clone(), extern_id.clone(), vec![site.rank]));
                     existing_extern.insert((caller.id.clone(), extern_id));
                 }
             }
@@ -279,8 +308,8 @@ pub fn resolve_cross_module_calls(store: &Store) -> usize {
         store.add_atom(atom);
     }
     let added = staged_edges.len();
-    for (from, to) in staged_edges {
-        store.add_edge(Edge::new(from, to, EdgeKind::Calls));
+    for (from, to, sites) in staged_edges {
+        store.add_edge(Edge::calls_from_sites(from, to, sites));
     }
     added
 }
@@ -602,7 +631,7 @@ pub fn resolve_implements_edges(store: &Store) -> usize {
 /// `foo` → `(None, "foo")`.
 /// `module::foo` → `(Some("module"), "foo")`.
 /// `crate::render::render` → `(Some("crate::render"), "render")`.
-fn split_call_name(name: &str) -> (Option<&str>, &str) {
+pub(crate) fn split_call_name(name: &str) -> (Option<&str>, &str) {
     if let Some(idx) = name.rfind("::") {
         let (prefix, rest) = name.split_at(idx);
         (Some(prefix), &rest[2..])

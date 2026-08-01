@@ -425,6 +425,10 @@ impl CodeParser {
         }
 
         // ── Intra-file call edges ─────────────────────────────────────────────
+        //
+        // Each edge records the rank of the site that produced it, so a
+        // consumer can tell which of a body's calls this edge accounts
+        // for — see `Edge::sites` and `render::flow`.
         for (caller_id, call_sites) in items {
             for site in call_sites {
                 if site.name.contains("::") {
@@ -433,10 +437,10 @@ impl CodeParser {
                 if let Some(callee_id) = name_to_id.get(&site.name)
                     && *callee_id != caller_id
                 {
-                    edges.push(Edge::new(
+                    edges.push(Edge::calls_from_sites(
                         caller_id.clone(),
                         callee_id.clone(),
-                        EdgeKind::Calls,
+                        vec![site.rank],
                     ));
                 }
             }
@@ -669,12 +673,22 @@ fn extract_methods(
         // AND `method_calls` (`self.method()`-shaped). The receiver type
         // *is* known here — it's this container — so we do want to bind
         // a sibling method when the bare name matches.
+        //
+        // Only `calls` carry a rank; `method_calls` are bare names. An
+        // edge from the latter therefore records no site, which readers
+        // must treat as "unknown" rather than "no site" — see
+        // `Edge::sites`.
         let local_names = extracted
             .calls
             .iter()
-            .map(|c| c.name.as_str())
-            .chain(extracted.method_calls.iter().map(String::as_str));
-        for call_name in local_names {
+            .map(|c| (c.name.as_str(), Some(c.rank)))
+            .chain(
+                extracted
+                    .method_calls
+                    .iter()
+                    .map(|n| (n.as_str(), Option::<u16>::None)),
+            );
+        for (call_name, rank) in local_names {
             // Normalise: bare `foo`, `Self::foo`, `<container>::foo`, and
             // `<parent_type>::foo` all refer to a sibling method of the
             // same container. The two prefixes differ for Rust trait impls
@@ -694,10 +708,10 @@ fn extract_methods(
             if let Some(target_id) = method_id_by_name.get(target_name)
                 && *target_id != method_id
             {
-                out_edges.push(Edge::new(
+                out_edges.push(Edge::calls_from_sites(
                     method_id.clone(),
                     target_id.clone(),
-                    EdgeKind::Calls,
+                    rank.map(|r| vec![r]).unwrap_or_default(),
                 ));
             }
         }

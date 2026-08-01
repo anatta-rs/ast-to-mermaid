@@ -277,10 +277,24 @@ pub struct Edge {
     pub kind: EdgeKind,
     /// Optional role label (e.g. field name for a `Uses` edge).
     pub role: Option<String>,
+    /// For a `Calls` edge: the ranks of `from`'s call sites that produced
+    /// it, ascending. Empty for every other kind.
+    ///
+    /// The resolver collapses repeated calls to one target into a single
+    /// edge, so this is a `Vec`: it is what lets a reader recover *which*
+    /// sites an edge stands for, and how many. Without it the only way
+    /// back to a site is matching on the name, which confuses homonyms —
+    /// see [`crate::render::flow`].
+    ///
+    /// Left empty by [`Edge::new`] and by bundles written before the
+    /// field existed; consumers must treat "empty" as "unknown", never as
+    /// "no site".
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sites: Vec<u16>,
 }
 
 impl Edge {
-    /// Convenience constructor.
+    /// Convenience constructor. Leaves [`Edge::sites`] empty.
     #[must_use]
     pub fn new(from: EntityId, to: EntityId, kind: EdgeKind) -> Self {
         Self {
@@ -288,6 +302,19 @@ impl Edge {
             to,
             kind,
             role: None,
+            sites: Vec::new(),
+        }
+    }
+
+    /// A `Calls` edge that remembers the call sites it came from.
+    #[must_use]
+    pub fn calls_from_sites(from: EntityId, to: EntityId, sites: Vec<u16>) -> Self {
+        Self {
+            from,
+            to,
+            kind: EdgeKind::Calls,
+            role: None,
+            sites,
         }
     }
 }

@@ -146,7 +146,13 @@ const SCHEMA_VERSION: u32 = 6;
 ///
 /// `6`: call sites carry rank and control-flow flags (#190). Cached units
 /// hold bare strings and would deserialise without the new fields.
-const GRAMMAR_VERSION: u32 = 6;
+///
+/// `7`: intra-file `Calls` edges carry the rank of the site that produced
+/// them (#194). A cached unit deserialises fine — `Edge::sites` defaults
+/// to empty — but empty means "unknown", which puts `flow` into its
+/// degraded mode for the whole file and hides the very leaves the change
+/// adds. The edges must be rebuilt, not merely read.
+const GRAMMAR_VERSION: u32 = 7;
 
 /// Compute the cache version string written to `<root>/version`.
 fn cache_version() -> String {
