@@ -245,6 +245,7 @@ pub fn resolve_cross_module_calls(store: &Store) -> usize {
                     existing_fn.insert((caller_idx, target_idx));
                 } else if !pick.suppress_extern
                     && let Some(prefix) = path_prefix.filter(|p| is_external_qualifier(p))
+                    && !is_unknown_dart_type(caller_lang, prefix, &methods_by_owner_name)
                 {
                     let extern_id = EntityId::new(format!("extern:{prefix}::{fn_name}"));
                     if existing_extern.contains(&(caller.id.clone(), extern_id.clone())) {
@@ -484,6 +485,34 @@ fn pick_unique_with_same_crate_pref(
 fn is_external_qualifier(prefix: &str) -> bool {
     let head = prefix.split("::").next().unwrap_or(prefix);
     !matches!(head, "crate" | "self" | "super" | "Self") && !head.is_empty()
+}
+
+/// Whether a Dart qualifier names a type the graph has never seen, in
+/// which case no extern atom should be minted for it.
+///
+/// A Rust `serde_json::to_string` earns its extern node: the qualifier is
+/// a crate, and showing the dependency is informative. Dart qualifiers
+/// produced by the typed-receiver rule are *classes*, and the SDK supplies
+/// hundreds of them — `BorderRadius`, `EdgeInsets`, `MediaQuery`,
+/// `ListView`. Minting one node per SDK widget buried the project's own
+/// graph: measured on a real Flutter project, +382 extern nodes against
+/// +64 genuine internal edges.
+///
+/// So for Dart the qualifier must correspond to a class the graph knows —
+/// i.e. one that owns at least one method atom. Unknown classes yield no
+/// edge at all, which is what "the SDK is not part of this graph" means.
+fn is_unknown_dart_type(
+    caller_lang: &str,
+    prefix: &str,
+    methods_by_owner_name: &HashMap<(&str, &str), Vec<usize>>,
+) -> bool {
+    if caller_lang != "dart" {
+        return false;
+    }
+    let head = prefix.split("::").next().unwrap_or(prefix);
+    !methods_by_owner_name
+        .keys()
+        .any(|(owner, _)| *owner == head)
 }
 
 /// Walk the store, resolve `impl Trait for Type` blocks to their target
@@ -773,6 +802,34 @@ mod tests {
             &[("initOnboardingFlag", &[])],
         );
         assert_eq!(resolve_cross_module_calls(&store), 1);
+    }
+
+    /// A Dart call qualified by a class the graph has never seen — an SDK
+    /// widget such as `BorderRadius.circular()` — must produce nothing.
+    /// Minting an extern per SDK class buried the project's own graph:
+    /// +382 extern nodes against +64 real edges on a Flutter project.
+    #[test]
+    fn dart_call_on_an_unknown_class_mints_no_extern() {
+        let store = build_store(
+            "lib/ui/card.dart",
+            &[("build", &["BorderRadius::circular"])],
+        );
+        assert_eq!(resolve_cross_module_calls(&store), 0);
+        let externs = store.with_atoms(|a| a.iter().filter(|x| x.kind == EXTERN_KIND).count());
+        assert_eq!(externs, 0, "no extern for an SDK class");
+    }
+
+    /// Rust keeps its externs: a crate qualifier is a real dependency and
+    /// showing it is the point.
+    ///
+    /// `from_reader` rather than `to_string` — the latter is in
+    /// [`SKIP_CALLS`] and never reaches the extern path at all.
+    #[test]
+    fn rust_call_on_an_unknown_crate_still_mints_an_extern() {
+        let store = build_store("src/lib.rs", &[("f", &["serde_json::from_reader"])]);
+        resolve_cross_module_calls(&store);
+        let externs = store.with_atoms(|a| a.iter().filter(|x| x.kind == EXTERN_KIND).count());
+        assert_eq!(externs, 1, "crate dependency must still surface");
     }
 
     /// Python keeps the first-segment rule — it is analysed from a parent
