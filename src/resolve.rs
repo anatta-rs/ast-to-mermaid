@@ -292,10 +292,7 @@ pub fn resolve_cross_module_calls(store: &Store) -> usize {
                             parent: None,
                         });
                     }
-                    staged_idx.insert(
-                        (caller.id.clone(), extern_id.clone()),
-                        staged_edges.len(),
-                    );
+                    staged_idx.insert((caller.id.clone(), extern_id.clone()), staged_edges.len());
                     staged_edges.push((caller.id.clone(), extern_id.clone(), vec![site.rank]));
                     existing_extern.insert((caller.id.clone(), extern_id));
                 }

@@ -128,9 +128,7 @@ impl AdjMaps {
             .iter()
             .enumerate()
             .map(move |(i, callee)| {
-                let ranks = sites
-                    .and_then(|s| s.get(i))
-                    .map_or(&[][..], Vec::as_slice);
+                let ranks = sites.and_then(|s| s.get(i)).map_or(&[][..], Vec::as_slice);
                 (callee, ranks)
             })
     }

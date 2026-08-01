@@ -260,7 +260,15 @@ fn walk(
             continue;
         }
         path.push(to_key);
-        walk(adj, snapshot, callee_id, remaining - 1, external, path, state);
+        walk(
+            adj,
+            snapshot,
+            callee_id,
+            remaining - 1,
+            external,
+            path,
+            state,
+        );
         path.pop();
     }
 
@@ -361,10 +369,13 @@ fn unresolved_leaves(
 
     for (name, sites) in leaves {
         let to_key = format!("unresolved::{}::{name}", from.as_str());
-        state.nodes.entry(to_key.clone()).or_insert_with(|| NodeInfo {
-            label: name.to_owned(),
-            kind: NodeKind::Unresolved,
-        });
+        state
+            .nodes
+            .entry(to_key.clone())
+            .or_insert_with(|| NodeInfo {
+                label: name.to_owned(),
+                kind: NodeKind::Unresolved,
+            });
         state
             .edges
             .entry((from.as_str().to_owned(), to_key))
@@ -670,7 +681,10 @@ mod tests {
             3,
         );
         assert!(out.contains("[\"runApp\"]:::unresolved"), "{out}");
-        assert!(out.contains("|\"2 await\"|"), "rank and marker kept:\n{out}");
+        assert!(
+            out.contains("|\"2 await\"|"),
+            "rank and marker kept:\n{out}"
+        );
     }
 
     /// Two sites sharing their last path segment: one resolved, one not.
@@ -694,7 +708,10 @@ mod tests {
                 render(&adj, &snap, "main", 3, External::NearOnly)
             })
             .expect("render");
-        assert!(out.contains("|\"1\"|"), "resolved site keeps rank 1:\n{out}");
+        assert!(
+            out.contains("|\"1\"|"),
+            "resolved site keeps rank 1:\n{out}"
+        );
         assert!(
             out.contains(":::unresolved") && out.contains("|\"2\"|"),
             "the unresolved twin survives with its own rank:\n{out}"
@@ -705,7 +722,11 @@ mod tests {
     /// rank gap it leaves has no explanation.
     #[test]
     fn skipped_stdlib_calls_are_hidden_but_counted() {
-        let out = flow_of(&[("main", &[("clone", 0), ("unwrap", 0), ("real", 0)])], "main", 3);
+        let out = flow_of(
+            &[("main", &[("clone", 0), ("unwrap", 0), ("real", 0)])],
+            "main",
+            3,
+        );
         assert!(!out.contains("clone"), "{out}");
         assert!(
             out.contains("%% 2 stdlib call(s) hidden (SKIP_CALLS)"),
@@ -746,7 +767,10 @@ mod tests {
             3,
             External::Always,
         );
-        assert!(all.contains("deepUnknown"), "--external always shows it:\n{all}");
+        assert!(
+            all.contains("deepUnknown"),
+            "--external always shows it:\n{all}"
+        );
     }
 
     /// `method_calls` are never resolved, so each is a leaf — but one the
