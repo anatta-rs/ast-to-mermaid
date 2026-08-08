@@ -426,7 +426,22 @@ impl State {
         std::mem::replace(&mut self.steps, saved)
     }
 
+    /// Visit the expression the branch is decided by, before the branch.
+    ///
+    /// Its calls run, and they run FIRST — so they belong in source order,
+    /// ahead of the `alt`/`loop` block rather than nowhere. Without this the
+    /// walker rendered the expression as a caption and dropped every call in
+    /// it, which on a guarded function meant dropping the guards.
+    fn walk_deciding(&mut self, node: &Node, source: &str, depth: usize) {
+        if let Some(deciding) = self.lang.deciding_node(node) {
+            self.walk_expr(&deciding, source, depth);
+        }
+    }
+
     fn lift_loop(&mut self, node: &Node, source: &str, label: &str, depth: usize) {
+        // A `while`'s condition and a `for`'s iterable run before the body.
+        self.walk_deciding(node, source, depth);
+
         let body_node = node.child_by_field_name("body");
         let body = self.walk_into(|s| {
             if let Some(b) = body_node {
@@ -442,6 +457,8 @@ impl State {
     }
 
     fn lift_if(&mut self, node: &Node, source: &str, depth: usize) {
+        self.walk_deciding(node, source, depth);
+
         let cond = format!("if {}", self.lang.if_condition(node, source));
         let then_node = node.child_by_field_name("consequence");
         let then = self.walk_into(|s| {
@@ -474,6 +491,8 @@ impl State {
         // Which field holds the scrutinee, and how an arm is spelled, is
         // per-grammar — so it comes from `SeqLang` rather than a `match`
         // on the language here.
+        self.walk_deciding(node, source, depth);
+
         let spec = self.lang.match_spec();
         let scrutinee = self.lang.match_scrutinee(node, source);
         let cond = format!("match {scrutinee}");
