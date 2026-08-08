@@ -332,11 +332,22 @@ fn python_impact_golden() {
 #[test]
 fn rust_sequence_golden() {
     // `describe` contains a string-literal receiver (`"...".to_string()`)
-    // — it must NOT become a participant; `self` is the only actor.
+    // — it must NOT become a participant. That is what this test guards, and
+    // it still holds: the loop below refuses any quote in a label.
+    //
+    // `p` joined the cast, and that is the fix rather than a regression. The
+    // fixture reads `if p.norm() >= 1.0 { .. }`, so `p.norm()` is a real call
+    // in a real condition — it was simply never visited, the condition being
+    // rendered as a caption. This assertion had been recording that absence.
     let src = fs::read(fixture("mini-rust").join("alpha.rs")).expect("read");
     let d = sequence::extract(&src, "alpha.rs", "describe", Language::Rust).expect("extract");
     let ids: BTreeSet<String> = d.participants.iter().map(|p| p.id.clone()).collect();
-    assert_eq!(ids, labels(&["self"]), "participants: {:?}", d.participants);
+    assert_eq!(
+        ids,
+        labels(&["self", "p"]),
+        "participants: {:?}",
+        d.participants
+    );
     for p in &d.participants {
         assert!(!p.label.contains('"'), "quote in participant label: {p:?}");
     }
