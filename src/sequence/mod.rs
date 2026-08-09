@@ -687,7 +687,17 @@ mod tests {
     #[test]
     fn if_expression_becomes_alt() {
         let d = extract_ok("fn run() { if cond() { yes(); } else { no(); } }\n", "run");
-        let Step::Alt { then, else_, .. } = &d.steps[0] else {
+
+        // The condition's own call comes FIRST, because it runs first. This
+        // used to be dropped: the condition was rendered as a caption and
+        // never visited, so a function whose guards are `if`s lost its guards.
+        assert!(
+            matches!(&d.steps[0], Step::Call { label, .. } if label == "cond"),
+            "the condition's call is missing, got {:?}",
+            d.steps
+        );
+
+        let Step::Alt { then, else_, .. } = &d.steps[1] else {
             panic!("expected alt, got {:?}", d.steps);
         };
         assert!(
@@ -699,6 +709,58 @@ mod tests {
             else_steps
                 .iter()
                 .any(|s| matches!(s, Step::Call { label, .. } if label == "no"))
+        );
+    }
+
+    /// A `while`'s condition runs on every turn, so its calls belong in the
+    /// order — ahead of the body, not nowhere.
+    #[test]
+    fn a_while_condition_is_visited() {
+        let d = extract_ok("fn run() { while going() { step(); } }\n", "run");
+        assert!(
+            matches!(&d.steps[0], Step::Call { label, .. } if label == "going"),
+            "the while condition's call is missing, got {:?}",
+            d.steps
+        );
+    }
+
+    /// And a `match` scrutinee, which runs exactly once, before any arm.
+    #[test]
+    fn a_match_scrutinee_is_visited() {
+        let d = extract_ok(
+            "fn run() { match chosen() { 1 => one(), _ => () } }\n",
+            "run",
+        );
+        assert!(
+            matches!(&d.steps[0], Step::Call { label, .. } if label == "chosen"),
+            "the match scrutinee's call is missing, got {:?}",
+            d.steps
+        );
+    }
+
+    /// A `for`'s iterable runs once, before the first turn — the same rule,
+    /// and the one place where it is an expression rather than a test.
+    #[test]
+    fn a_for_iterable_is_visited() {
+        let d = extract_ok("fn run() { for x in items() { use_it(x); } }\n", "run");
+        assert!(
+            matches!(&d.steps[0], Step::Call { label, .. } if label == "items"),
+            "the for iterable's call is missing, got {:?}",
+            d.steps
+        );
+    }
+
+    /// `loop` decides nothing, so nothing is inserted ahead of it.
+    ///
+    /// Here to keep the fix from over-reaching: a step invented before a
+    /// `loop` would be a call that never happened.
+    #[test]
+    fn a_bare_loop_gains_nothing() {
+        let d = extract_ok("fn run() { loop { step(); } }\n", "run");
+        assert!(
+            matches!(&d.steps[0], Step::Loop { .. }),
+            "something was inserted before a bare loop, got {:?}",
+            d.steps
         );
     }
 
@@ -843,7 +905,15 @@ mod tests {
             "def run():\n    if cond():\n        yes()\n    else:\n        no()\n",
             "run",
         );
-        let Step::Alt { then, else_, .. } = &d.steps[0] else {
+
+        // Same rule, and the same field name in this grammar.
+        assert!(
+            matches!(&d.steps[0], Step::Call { label, .. } if label == "cond"),
+            "the condition's call is missing, got {:?}",
+            d.steps
+        );
+
+        let Step::Alt { then, else_, .. } = &d.steps[1] else {
             panic!("expected alt, got {:?}", d.steps);
         };
         assert!(

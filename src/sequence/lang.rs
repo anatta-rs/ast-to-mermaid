@@ -101,6 +101,23 @@ pub(super) trait SeqLang {
     /// and Dart additionally wraps it in parentheses that belong to the
     /// syntax, which are stripped so captions read alike.
     fn match_scrutinee(self, node: &Node, source: &str) -> String;
+
+    /// The expression a branch is decided by: an `if`/`while` condition, a
+    /// `match` scrutinee, a `for` iterable.
+    ///
+    /// It exists because the calls inside it RUN, and before the branch. The
+    /// walker used to render that expression as a caption and never visit it,
+    /// so `if store.allowed()` showed the branch and lost the call — on a
+    /// function whose guards are `if`s, the guards were exactly what vanished.
+    /// A caption is not a visit, and the two had been the same thing here.
+    ///
+    /// Keyed by node kind rather than by a method per construct: they differ
+    /// by which field holds it, never by what it means.
+    ///
+    /// `loop` has none, and neither does an `if` whose condition a grammar
+    /// leaves positional and unnamed — hence `Option` rather than a node that
+    /// would sometimes be the branch body itself.
+    fn deciding_node<'t>(self, node: &Node<'t>) -> Option<Node<'t>>;
 }
 
 impl SeqLang for Language {
@@ -238,6 +255,47 @@ impl SeqLang for Language {
                 arm_body_field: None,
             },
         }
+    }
+
+    fn deciding_node<'t>(self, node: &Node<'t>) -> Option<Node<'t>> {
+        // Grouped by the field that holds it rather than by language: the
+        // grammars disagree on the NAME, never on which expression decides.
+        let field = match (self, node.kind()) {
+            (Self::Rust, "if_expression" | "while_expression")
+            | (Self::Python, "if_statement" | "while_statement")
+            | (Self::Dart, "while_statement" | "switch_statement") => "condition",
+
+            // A `for`'s iterable runs once, before the first turn — the same
+            // rule, and the one place where it is an expression rather than
+            // a test.
+            (Self::Rust, "match_expression" | "for_expression") | (Self::Dart, "for_statement") => {
+                "value"
+            }
+
+            (Self::Python, "match_statement") => "subject",
+            (Self::Python, "for_statement") => "right",
+
+            // Dart's `if_statement` leaves the test positional, exactly as
+            // `if_condition` already documents: the first named child that is
+            // not a branch body. Reading a field here would find nothing.
+            (Self::Dart, "if_statement") => {
+                let is_branch = |n: &Node| {
+                    ["consequence", "alternative"].iter().any(|f| {
+                        node.child_by_field_name(f)
+                            .is_some_and(|b| b.id() == n.id())
+                    })
+                };
+                let mut cursor = node.walk();
+                return node
+                    .children(&mut cursor)
+                    .find(|c| c.is_named() && !is_branch(c));
+            }
+
+            // `loop { .. }` decides nothing, and anything unrecognised is
+            // better left unvisited than guessed at.
+            _ => return None,
+        };
+        node.child_by_field_name(field)
     }
 
     fn match_scrutinee(self, node: &Node, source: &str) -> String {
