@@ -8,6 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.1](https://github.com/anatta-rs/ast-to-mermaid/compare/v0.10.0...v0.10.1) - 2026-08-09
+
+### Bug fixes
+
+- *(sequence)* Visit the expression a branch is decided by ([#199](https://github.com/anatta-rs/ast-to-mermaid/pull/199))
+
 ## [0.10.0](https://github.com/anatta-rs/ast-to-mermaid/compare/v0.9.0...v0.10.0) - 2026-08-01
 
 ### Bug fixes
