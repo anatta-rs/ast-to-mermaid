@@ -33,6 +33,7 @@ fn distinct_unit(seed: usize) -> ParseUnit {
             calls: vec![],
             method_calls: vec![],
             parent: None,
+            refs: ast_to_mermaid::model::AtomRefs::default(),
         }],
         edges: vec![],
     }

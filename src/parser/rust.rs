@@ -25,19 +25,42 @@ pub(super) struct UseDecl {
 
 /// Collect every `use_declaration` reachable from `root` — including `use`
 /// items nested inside `mod { … }` blocks. Skips `pub use` re-exports
-/// (they don't introduce a name in *this* file's scope).
+/// (they don't introduce a name in *this* file's scope); those are read by
+/// [`extract_pub_use_decls`].
 ///
 /// Group forms (`use foo::{a, b}`), aliases (`use foo as bar`), wildcards
 /// (`use foo::*`), and nested paths are all unfolded into one [`UseDecl`]
 /// per leaf by [`flatten_use`].
 pub(super) fn extract_use_decls(root: Node, source: &str) -> Vec<UseDecl> {
+    collect_use_decls(root, source, false, false)
+}
+
+/// The file's own imports — `use` and `pub use` at the top of the file,
+/// not those of an inline `mod tests { use super::*; }`, whose paths are
+/// relative to a module the graph does not model.
+pub(super) fn extract_file_imports(root: Node, source: &str) -> Vec<UseDecl> {
+    let mut out = collect_use_decls(root, source, false, true);
+    out.extend(collect_use_decls(root, source, true, true));
+    out
+}
+
+/// The `pub use` / `pub(crate) use` declarations of a file: the names it
+/// re-exports, which is what lets `crate::render::mermaid_to_dot` reach a
+/// function defined in `render/dot.rs`.
+pub(super) fn extract_pub_use_decls(root: Node, source: &str) -> Vec<UseDecl> {
+    collect_use_decls(root, source, true, true)
+}
+
+fn collect_use_decls(root: Node, source: &str, public: bool, top_level: bool) -> Vec<UseDecl> {
     let mut out: Vec<UseDecl> = Vec::new();
     let mut cursor = QueryCursor::new();
     let mut matches = cursor.matches(&queries::RUST.uses, root, source.as_bytes());
     while let Some(m) = matches.next() {
         for cap in m.captures {
             let n = cap.node;
-            if has_visibility_modifier(n) {
+            if has_visibility_modifier(n) != public
+                || (top_level && n.parent().is_some_and(|p| p.kind() != "source_file"))
+            {
                 continue;
             }
             if let Some(arg) = use_argument(&n) {
@@ -46,6 +69,16 @@ pub(super) fn extract_use_decls(root: Node, source: &str) -> Vec<UseDecl> {
         }
     }
     out
+}
+
+/// What a Rust file tells the call extractor beyond a body's own text.
+#[derive(Debug, Default)]
+pub(super) struct RustScope {
+    /// `use` map: local name → path as written (see [`use_decls_to_imports`]).
+    pub imports: HashMap<String, String>,
+    /// Field types of the structs this file declares: struct → field →
+    /// type. Types `self.field.method()`.
+    pub fields: HashMap<String, HashMap<String, String>>,
 }
 
 /// Convert a [`UseDecl`] list into the `bare_name → qualified_path` lookup
@@ -246,14 +279,18 @@ fn split_doc_lines(source: &str) -> Vec<&str> {
 /// Extract every Rust call site within `node`'s subtree into `out`.
 ///
 /// Bare-name calls (e.g. `foo()` after `use crate::other::foo`) are
-/// normalised to their fully-qualified path via `imports`; qualified inline
-/// calls (`module::foo`, `crate::path::foo`) are kept verbatim. Receiver-
-/// style calls (`obj.method()`) are routed into `out.method_calls` instead
-/// of `out.calls` so the cross-module resolver never matches them by name.
+/// normalised to their fully-qualified path via the file's imports, and so
+/// is the first segment of a qualified call (`render::foo()` after
+/// `use crate::render`). Receiver-style calls (`obj.method()`) become
+/// `Type::method` when the receiver's type is declared — a typed `let`, a
+/// parameter, `self`, or a field of `self` — and are otherwise routed into
+/// `out.method_calls` so the cross-module resolver never matches them by
+/// name.
 pub(super) fn extract_calls(
     node: &Node,
     source: &str,
-    imports: &HashMap<String, String>,
+    scope: &RustScope,
+    self_type: Option<&str>,
     out: &mut ExtractedCalls,
 ) {
     let query = &queries::RUST.calls;
@@ -261,6 +298,7 @@ pub(super) fn extract_calls(
     // capture role (`@call.fn`, `@call.field`).
     let cn_call_fn = query.capture_index_for_name("call.fn");
     let cn_call_field = query.capture_index_for_name("call.field");
+    let locals = local_types(*node, source, self_type);
     let mut cursor = QueryCursor::new();
     let bytes = source.as_bytes();
     let mut matches = cursor.matches(query, *node, bytes);
@@ -276,27 +314,511 @@ pub(super) fn extract_calls(
                 match cap.node.kind() {
                     "identifier" => {
                         // Bare call: expand via use imports if available.
-                        let resolved = imports
+                        let resolved = scope
+                            .imports
                             .get(text)
                             .map_or_else(|| text.to_owned(), String::clone);
                         out.push_call(resolved, &cap.node, Language::Rust);
                     }
                     "scoped_identifier" => {
-                        // Qualified — keep verbatim so the resolver
-                        // can disambiguate by module / type.
-                        out.push_call(text.to_owned(), &cap.node, Language::Rust);
+                        // Qualified — keep the path so the resolver can
+                        // disambiguate by module / type, with its head
+                        // expanded through the imports when it names one.
+                        out.push_call(expand_head(text, &scope.imports), &cap.node, Language::Rust);
                     }
                     _ => {}
                 }
             } else if Some(cap.index) == cn_call_field {
-                // `obj.method` → `method`. Receiver type is
-                // unknown, so this never feeds the resolver — it
-                // only powers intra-container `self.method()`
-                // linking.
-                out.push_method_call(text.to_owned(), &cap.node, Language::Rust);
+                let owner = cap
+                    .node
+                    .parent()
+                    .and_then(|fe| fe.child_by_field_name("value"))
+                    .and_then(|recv| receiver_type(recv, source, &locals, scope, self_type, 0));
+                if let Some(owner) = owner {
+                    out.push_typed_call(format!("{owner}::{text}"), &cap.node, Language::Rust);
+                } else {
+                    // `obj.method` → `method`. Receiver type is
+                    // unknown, so this never feeds the resolver — it
+                    // only powers intra-container linking.
+                    out.push_method_call(text.to_owned(), &cap.node, Language::Rust);
+                }
             }
         }
     }
+    macro_calls(*node, source, scope, out);
+}
+
+/// Calls written inside macro arguments: `eprintln!("{}", summary(x))`,
+/// `assert_eq!(parse(s), …)`, `vec![Foo::new()]`.
+///
+/// tree-sitter does not parse a macro's arguments — they are a flat
+/// `token_tree` — so the query above never sees them, and a function
+/// called only from a `format!` looked dead. Here a call is read off the
+/// tokens: a path (`a`, `a::b`) directly followed by a parenthesised
+/// group. After a `.` it is a method call, kept untyped. A path followed
+/// by `!` is a nested macro, not a call.
+fn macro_calls(node: Node, source: &str, scope: &RustScope, out: &mut ExtractedCalls) {
+    let bytes = source.as_bytes();
+    let mut stack = vec![node];
+    let mut visited = 0usize;
+    while let Some(n) = stack.pop() {
+        visited += 1;
+        if visited > 200_000 {
+            break;
+        }
+        if n.kind() == "token_tree" {
+            let mut c = n.walk();
+            let tokens: Vec<Node> = n.children(&mut c).collect();
+            let mut i = 0;
+            while i < tokens.len() {
+                let t = tokens[i];
+                if t.kind() == "token_tree" {
+                    if t.child(0).is_some_and(|o| o.kind() == "(")
+                        && let Some(end) = i.checked_sub(1)
+                        && tokens[end].kind() == "identifier"
+                    {
+                        // Walk back over `ident (:: ident)*`.
+                        let mut start = end;
+                        while start >= 2
+                            && tokens[start - 1].kind() == "::"
+                            && tokens[start - 2].kind() == "identifier"
+                        {
+                            start -= 2;
+                        }
+                        let path: Vec<&str> = (start..=end)
+                            .step_by(2)
+                            .filter_map(|k| tokens[k].utf8_text(bytes).ok())
+                            .collect();
+                        let callee = tokens[end];
+                        let after_dot = start
+                            .checked_sub(1)
+                            .is_some_and(|k| tokens[k].kind() == ".");
+                        if after_dot {
+                            out.push_method_call(path.join("::"), &callee, Language::Rust);
+                        } else if path.len() == 1 {
+                            let name = path[0];
+                            let resolved = scope
+                                .imports
+                                .get(name)
+                                .map_or_else(|| name.to_owned(), String::clone);
+                            out.push_call(resolved, &callee, Language::Rust);
+                        } else {
+                            out.push_call(
+                                expand_head(&path.join("::"), &scope.imports),
+                                &callee,
+                                Language::Rust,
+                            );
+                        }
+                    }
+                    stack.push(t);
+                }
+                i += 1;
+            }
+            continue;
+        }
+        let mut c = n.walk();
+        for child in n.children(&mut c) {
+            stack.push(child);
+        }
+    }
+}
+
+/// Expand the head of a qualified path through the file's imports:
+/// `render::foo` after `use crate::render` → `crate::render::foo`.
+/// Path roots (`crate`, `self`, `super`, `Self`) are never rewritten.
+fn expand_head(path: &str, imports: &HashMap<String, String>) -> String {
+    let (head, rest) = path.split_once("::").unwrap_or((path, ""));
+    if rest.is_empty() || matches!(head, "crate" | "self" | "super" | "Self") {
+        return path.to_owned();
+    }
+    match imports.get(head) {
+        Some(full) => format!("{full}::{rest}"),
+        None => path.to_owned(),
+    }
+}
+
+/// Type a call receiver evaluates to, when the source declares it.
+///
+/// `self` → the impl owner; a name → its typed `let` / parameter;
+/// `recv.field` → the field's declared type on `recv`'s struct. Anything
+/// else (a call result, an index, a closure parameter) is unknown.
+fn receiver_type(
+    recv: Node,
+    source: &str,
+    locals: &HashMap<String, Option<String>>,
+    scope: &RustScope,
+    self_type: Option<&str>,
+    depth: usize,
+) -> Option<String> {
+    if depth > 4 {
+        return None;
+    }
+    match recv.kind() {
+        "self" => self_type.map(str::to_owned),
+        "identifier" => locals.get(recv.utf8_text(source.as_bytes()).ok()?)?.clone(),
+        "field_expression" => {
+            let base = recv.child_by_field_name("value")?;
+            let field = recv.child_by_field_name("field")?;
+            let owner = receiver_type(base, source, locals, scope, self_type, depth + 1)?;
+            scope
+                .fields
+                .get(&owner)?
+                .get(field.utf8_text(source.as_bytes()).ok()?)
+                .cloned()
+        }
+        _ => None,
+    }
+}
+
+/// Name → declared type for every binding in `body` whose type is
+/// spelled out: typed parameters, `let x: T`, `let x = T::f(..)`,
+/// `let x = T { .. }`.
+///
+/// Flat over the body, not scoped: a name bound to two different types
+/// maps to `None` and is never used — a wrong type would bind a call to
+/// the wrong method, which is worse than no edge.
+fn local_types(
+    body: Node,
+    source: &str,
+    self_type: Option<&str>,
+) -> HashMap<String, Option<String>> {
+    let mut out: HashMap<String, Option<String>> = HashMap::new();
+    let record = |out: &mut HashMap<String, Option<String>>, name: &str, ty: Option<String>| {
+        let Some(ty) = ty else { return };
+        out.entry(name.to_owned())
+            .and_modify(|e| {
+                if e.as_deref() != Some(ty.as_str()) {
+                    *e = None;
+                }
+            })
+            .or_insert(Some(ty));
+    };
+    let mut unwrapped: Vec<Node> = Vec::new();
+    // Bindings declared `Option<T>` / `Result<T, _>`, mapped to `T`.
+    let mut inner: HashMap<String, Option<String>> = HashMap::new();
+    let mut stack = vec![body];
+    let mut visited = 0usize;
+    while let Some(n) = stack.pop() {
+        visited += 1;
+        if visited > 200_000 {
+            break;
+        }
+        match n.kind() {
+            "parameter" => {
+                if let (Some(pat), Some(ty)) = (
+                    n.child_by_field_name("pattern"),
+                    n.child_by_field_name("type"),
+                ) && let Some(name) = binding_name(pat, source)
+                {
+                    record(&mut out, name, type_name(ty, source, self_type));
+                    record(
+                        &mut inner,
+                        name,
+                        type_name_inner(ty, source, self_type, true),
+                    );
+                }
+            }
+            "let_declaration" => {
+                if let Some(name) = n
+                    .child_by_field_name("pattern")
+                    .and_then(|p| binding_name(p, source))
+                {
+                    let ty = match n.child_by_field_name("type") {
+                        Some(t) => {
+                            record(
+                                &mut inner,
+                                name,
+                                type_name_inner(t, source, self_type, true),
+                            );
+                            type_name(t, source, self_type)
+                        }
+                        None => n
+                            .child_by_field_name("value")
+                            .and_then(|v| value_type(v, source, self_type, 0)),
+                    };
+                    record(&mut out, name, ty);
+                } else if n.child_by_field_name("type").is_none() {
+                    unwrapped.push(n);
+                }
+            }
+            "let_condition" => unwrapped.push(n),
+            _ => {}
+        }
+        let mut c = n.walk();
+        for child in n.children(&mut c) {
+            stack.push(child);
+        }
+    }
+    // `if let Some(c) = cache` / `let Ok(f) = File::open(p) else { … }`:
+    // `c` has the type the value has, seen through `Option` / `Result`.
+    // Read after the main pass so the value's own binding is known.
+    for n in unwrapped {
+        let (Some(pat), Some(value)) = (
+            n.child_by_field_name("pattern"),
+            n.child_by_field_name("value"),
+        ) else {
+            continue;
+        };
+        let Some(name) = unwrapping_binding(pat, source) else {
+            continue;
+        };
+        let ty = match value.kind() {
+            "identifier" => value
+                .utf8_text(source.as_bytes())
+                .ok()
+                .and_then(|v| inner.get(v).cloned().flatten()),
+            _ => value_type(value, source, self_type, 0),
+        };
+        record(&mut out, name, ty);
+    }
+    out
+}
+
+/// The identifier bound by `Some(x)` / `Ok(x)` / `Some(mut x)`.
+fn unwrapping_binding<'a>(pat: Node, source: &'a str) -> Option<&'a str> {
+    if pat.kind() != "tuple_struct_pattern" {
+        return None;
+    }
+    let ctor = pat
+        .child_by_field_name("type")?
+        .utf8_text(source.as_bytes())
+        .ok()?;
+    if !matches!(ctor, "Some" | "Ok") {
+        return None;
+    }
+    let mut c = pat.walk();
+    let inner: Vec<Node> = pat.named_children(&mut c).skip(1).collect();
+    match inner.as_slice() {
+        [one] => binding_name(*one, source),
+        _ => None,
+    }
+}
+
+/// The identifier a pattern binds: `x`, or `mut x`.
+fn binding_name<'a>(pat: Node, source: &'a str) -> Option<&'a str> {
+    match pat.kind() {
+        "identifier" => pat.utf8_text(source.as_bytes()).ok(),
+        "mut_pattern" => {
+            let mut c = pat.walk();
+            pat.named_children(&mut c)
+                .find(|n| n.kind() == "identifier")
+                .and_then(|n| n.utf8_text(source.as_bytes()).ok())
+        }
+        _ => None,
+    }
+}
+
+/// Type a value expression is known to produce: `T::f(..)` (an associated
+/// function of a capitalised path), `T { .. }`, and those behind `?`,
+/// `&` or `.await`. `Arc::new(x)` / `Box::new(x)` / `Rc::new(x)` see
+/// through to `x` — method calls auto-deref.
+fn value_type(v: Node, source: &str, self_type: Option<&str>, depth: usize) -> Option<String> {
+    if depth > 4 {
+        return None;
+    }
+    match v.kind() {
+        "call_expression" => {
+            let func = v.child_by_field_name("function")?;
+            if func.kind() != "scoped_identifier" {
+                return None;
+            }
+            let owner = func.child_by_field_name("path")?;
+            let owner = owner.utf8_text(source.as_bytes()).ok()?;
+            let owner = owner.rsplit("::").next().unwrap_or(owner);
+            let owner = owner.split('<').next().unwrap_or(owner);
+            if matches!(owner, "Arc" | "Rc" | "Box") {
+                let args = v.child_by_field_name("arguments")?;
+                let mut c = args.walk();
+                let first = args.named_children(&mut c).next()?;
+                return value_type(first, source, self_type, depth + 1);
+            }
+            capitalised(owner, self_type)
+        }
+        "struct_expression" => {
+            let name = v.child_by_field_name("name")?;
+            let text = name.utf8_text(source.as_bytes()).ok()?;
+            capitalised(text.rsplit("::").next().unwrap_or(text), self_type)
+        }
+        // Every arm producing the same known type: `match lang {
+        // Rust => CodeParser::rust(), … }`.
+        "match_expression" => {
+            let body = v.child_by_field_name("body")?;
+            let mut c = body.walk();
+            let mut ty: Option<String> = None;
+            for arm in body.named_children(&mut c) {
+                if arm.kind() != "match_arm" {
+                    continue;
+                }
+                let t = value_type(
+                    arm.child_by_field_name("value")?,
+                    source,
+                    self_type,
+                    depth + 1,
+                )?;
+                if ty.as_ref().is_some_and(|prev| *prev != t) {
+                    return None;
+                }
+                ty = Some(t);
+            }
+            ty
+        }
+        "try_expression" | "reference_expression" | "await_expression" => {
+            let mut c = v.walk();
+            let inner = v.named_children(&mut c).next()?;
+            value_type(inner, source, self_type, depth + 1)
+        }
+        _ => None,
+    }
+}
+
+/// `Self` → the impl owner; a capitalised name → itself; else `None`.
+fn capitalised(name: &str, self_type: Option<&str>) -> Option<String> {
+    if name == "Self" {
+        return self_type.map(str::to_owned);
+    }
+    name.chars()
+        .next()
+        .is_some_and(char::is_uppercase)
+        .then(|| name.to_owned())
+}
+
+/// The type whose methods a value of type `ty` exposes: `T`, `&T`,
+/// `&mut T`, `path::T`, `T<..>`, and `Arc<T>` / `Rc<T>` / `Box<T>`
+/// (auto-deref). `None` for primitives, tuples, `dyn` and `impl` types.
+pub(super) fn type_name(ty: Node, source: &str, self_type: Option<&str>) -> Option<String> {
+    type_name_inner(ty, source, self_type, false)
+}
+
+/// [`type_name`], or with `unwrap` the type inside an `Option` /
+/// `Result`.
+fn type_name_inner(
+    ty: Node,
+    source: &str,
+    self_type: Option<&str>,
+    unwrap: bool,
+) -> Option<String> {
+    let mut n = ty;
+    for _ in 0..8 {
+        match n.kind() {
+            "type_identifier" => {
+                return capitalised(n.utf8_text(source.as_bytes()).ok()?, self_type);
+            }
+            "scoped_type_identifier" => n = n.child_by_field_name("name")?,
+            "reference_type" => n = n.child_by_field_name("type")?,
+            "generic_type" => {
+                let outer = n.child_by_field_name("type")?;
+                let outer_text = outer.utf8_text(source.as_bytes()).ok()?;
+                let outer_name = outer_text.rsplit("::").next().unwrap_or(outer_text);
+                // Auto-deref wrappers. `Option` / `Result` only when the
+                // caller is unwrapping (`if let Some(x) = opt`): calling
+                // `opt.take()` is `Option::take`, not the inner type's.
+                if matches!(outer_name, "Arc" | "Rc" | "Box")
+                    || (unwrap && matches!(outer_name, "Option" | "Result"))
+                {
+                    let args = n.child_by_field_name("type_arguments")?;
+                    let mut c = args.walk();
+                    n = args.named_children(&mut c).next()?;
+                } else {
+                    n = outer;
+                }
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// Field types of every `struct` in the file: struct → field → type.
+pub(super) fn collect_struct_fields(
+    root: Node,
+    source: &str,
+) -> HashMap<String, HashMap<String, String>> {
+    let mut out: HashMap<String, HashMap<String, String>> = HashMap::new();
+    let mut stack = vec![root];
+    while let Some(n) = stack.pop() {
+        if n.kind() == "struct_item" {
+            let name = n
+                .child_by_field_name("name")
+                .and_then(|x| x.utf8_text(source.as_bytes()).ok());
+            let body = n.child_by_field_name("body");
+            if let (Some(name), Some(body)) = (name, body) {
+                let mut fields = HashMap::new();
+                let mut c = body.walk();
+                for f in body.named_children(&mut c) {
+                    if f.kind() != "field_declaration" {
+                        continue;
+                    }
+                    let fname = f
+                        .child_by_field_name("name")
+                        .and_then(|x| x.utf8_text(source.as_bytes()).ok());
+                    let fty = f
+                        .child_by_field_name("type")
+                        .and_then(|t| type_name(t, source, Some(name)));
+                    if let (Some(fname), Some(fty)) = (fname, fty) {
+                        fields.insert(fname.to_owned(), fty);
+                    }
+                }
+                out.insert(name.to_owned(), fields);
+            }
+            continue;
+        }
+        // Items only live at module level or inside `mod { }` blocks.
+        if matches!(n.kind(), "source_file" | "mod_item" | "declaration_list") {
+            let mut c = n.walk();
+            for child in n.children(&mut c) {
+                stack.push(child);
+            }
+        }
+    }
+    out
+}
+
+/// Types named in an item's declaration — struct / enum fields, a fn's
+/// parameters and return type, a type alias' target. Names the file
+/// imports carry their `use` path (`crate::graph::Store`), so the resolver
+/// can bind them exactly; others stay bare.
+pub(super) fn type_refs(
+    item: Node,
+    source: &str,
+    imports: &HashMap<String, String>,
+) -> Vec<String> {
+    let roots: Vec<Node> = match item.kind() {
+        "function_item" | "function_signature_item" => ["parameters", "return_type"]
+            .iter()
+            .filter_map(|f| item.child_by_field_name(f))
+            .collect(),
+        "struct_item" | "enum_item" | "union_item" => {
+            item.child_by_field_name("body").into_iter().collect()
+        }
+        "type_item" => item.child_by_field_name("type").into_iter().collect(),
+        _ => Vec::new(),
+    };
+    let mut out: Vec<String> = Vec::new();
+    let mut stack = roots;
+    let mut visited = 0usize;
+    while let Some(n) = stack.pop() {
+        visited += 1;
+        if visited > 10_000 {
+            break;
+        }
+        if n.kind() == "type_identifier"
+            && let Ok(name) = n.utf8_text(source.as_bytes())
+            && name != "Self"
+        {
+            let full = imports
+                .get(name)
+                .cloned()
+                .unwrap_or_else(|| name.to_owned());
+            if !out.contains(&full) {
+                out.push(full);
+            }
+        }
+        let mut c = n.walk();
+        for child in n.children(&mut c) {
+            stack.push(child);
+        }
+    }
+    out
 }
 
 #[cfg(test)]

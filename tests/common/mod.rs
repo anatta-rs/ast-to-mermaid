@@ -6,7 +6,7 @@ use std::path::Path;
 use ast_to_mermaid::graph::Store;
 use ast_to_mermaid::parser::{CodeParser, Language};
 use ast_to_mermaid::pipeline::walk_for_languages;
-use ast_to_mermaid::resolve::resolve_cross_module_calls;
+use ast_to_mermaid::resolve::resolve_all;
 
 /// Walk `root`, parse every supported source file, apply the result to a
 /// fresh [`Store`], and run the cross-module resolver. Mirrors the bundle
@@ -31,6 +31,6 @@ pub fn build_store(root: &Path) -> Store {
             .expect("parse")
             .apply_to(&store);
     }
-    resolve_cross_module_calls(&store);
+    resolve_all(&store);
     store
 }

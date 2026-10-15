@@ -6,6 +6,7 @@
 //! a2m module   ./src --target render/mod.rs       # one module, fully linked
 //! a2m function ./src --target analyze             # callers back + direct callees
 //! a2m impact   ./src --target analyze             # blast radius (3 hops)
+//! a2m graph    ./src                              # whole-project knowledge graph
 //! a2m sequence ./src --target run_diff            # statement-ordered Mermaid sequenceDiagram
 //! a2m walk     ./src                              # list source files
 //! a2m bundle   ./src --out ./.artifacts           # full 4-layer bundle
@@ -15,9 +16,9 @@
 #![deny(unsafe_code)]
 
 use ast_to_mermaid::cli::{
-    AnalyzeFlags, BundleFlags, DiffFlags, ExitCode, FlowFlags, GcFlags, IndexFlags, SequenceFlags,
-    WalkFlags, run_analyze, run_bundle, run_diff, run_flow, run_gc, run_index, run_sequence,
-    run_walk,
+    AnalyzeFlags, BundleFlags, DiffFlags, ExitCode, FlowFlags, GcFlags, GraphFlags, IndexFlags,
+    SequenceFlags, WalkFlags, run_analyze, run_bundle, run_diff, run_flow, run_gc, run_graph,
+    run_index, run_sequence, run_walk,
 };
 use ast_to_mermaid::render::Level;
 use clap::{Parser, Subcommand};
@@ -64,6 +65,10 @@ enum Command {
     /// `impact` (both directions, no order) and `sequence` (one body,
     /// full order).
     Flow(FlowFlags),
+    /// Render the whole project as one knowledge graph: files grouped by
+    /// directory, their key items, and typed `calls` / `imports` /
+    /// `references` / `implements` / `depends on` edges.
+    Graph(GraphFlags),
     /// List source files under a path (no parsing).
     Walk(WalkFlags),
     /// Produce the 4-layer artifact bundle for a project.
@@ -90,6 +95,7 @@ fn main() -> std::process::ExitCode {
         Command::Impact(f) => run_analyze(Level::Impact, &f),
         Command::Sequence(f) => run_sequence(&f),
         Command::Flow(f) => run_flow(&f),
+        Command::Graph(f) => run_graph(&f),
         Command::Walk(f) => run_walk(&f),
         Command::Bundle(f) => run_bundle(&f),
         Command::Index(f) => run_index(&f),

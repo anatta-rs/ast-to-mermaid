@@ -10,7 +10,7 @@ use crate::git_source;
 use crate::graph::Store;
 use crate::parser::{CodeParser, Language, ParseFailure, ParseUnit, git_blob_sha1};
 use crate::render::{AdjMaps, AtomSnapshot, Level, render};
-use crate::resolve::{resolve_cross_module_calls, resolve_implements_edges};
+use crate::resolve::resolve_all;
 use rayon::prelude::*;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -58,6 +58,8 @@ pub struct AnalyzeOptions {
     pub flow_depth: u8,
     /// How [`Level::Flow`] treats calls into code outside the graph.
     pub flow_external: crate::render::flow::External,
+    /// Options for [`Level::Graph`]. Ignored by every other level.
+    pub graph: crate::render::graph::GraphOptions,
 }
 
 impl Default for AnalyzeOptions {
@@ -73,6 +75,7 @@ impl Default for AnalyzeOptions {
             include_generated: false,
             flow_depth: crate::render::flow::DEFAULT_DEPTH,
             flow_external: crate::render::flow::External::NearOnly,
+            graph: crate::render::graph::GraphOptions::default(),
         }
     }
 }
@@ -93,6 +96,7 @@ impl std::fmt::Debug for AnalyzeOptions {
             .field("include_generated", &self.include_generated)
             .field("flow_depth", &self.flow_depth)
             .field("flow_external", &self.flow_external)
+            .field("graph", &self.graph)
             .finish()
     }
 }
@@ -283,6 +287,9 @@ pub fn analyze(root: &Path, opts: &AnalyzeOptions) -> Result<AnalyzeReport> {
                 opts.flow_external,
             );
         }
+        if opts.level == Level::Graph {
+            return Ok(crate::render::graph::render(&adj, &snapshot, &opts.graph));
+        }
         render(opts.level, &adj, &snapshot, opts.target.as_deref())
     })?;
 
@@ -444,7 +451,7 @@ fn resolve_phase(store: &Store, atoms: usize) -> usize {
     let _enter = span.enter();
     let started = std::time::Instant::now();
 
-    let edges_resolved = resolve_cross_module_calls(store) + resolve_implements_edges(store);
+    let edges_resolved = resolve_all(store);
 
     let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
     tracing::info!(edges = edges_resolved, elapsed_ms, "resolve_phase done");
@@ -919,6 +926,7 @@ mod tests {
                 include_generated: false,
                 flow_depth: crate::render::flow::DEFAULT_DEPTH,
                 flow_external: crate::render::flow::External::NearOnly,
+                graph: crate::render::graph::GraphOptions::default(),
                 with_sequences: false,
                 allow_empty: false,
             },

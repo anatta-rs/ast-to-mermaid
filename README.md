@@ -295,7 +295,7 @@ a2m project ./my-repo --exclude vendor,generated
 a2m project ./my-repo --trace=info
 ```
 
-## The twelve subcommands
+## The thirteen subcommands
 
 | Subcommand | Output | Needs `--target` |
 |---|---|---|
@@ -306,6 +306,7 @@ a2m project ./my-repo --trace=info
 | `a2m impact` | Forward + backward call chain from a function (default 3 hops) | yes — function name |
 | `a2m sequence` | One function body as a Mermaid `sequenceDiagram` (statement order, lifelines per receiver) | yes — function name, or `--all` |
 | `a2m flow` | Forward call graph from an entry point, each edge annotated with call order and control flow (`await` / `alt` / `loop`) | yes — function name |
+| `a2m graph` | The whole project as one knowledge graph: files grouped by directory, their key items, typed `calls` / `imports` / `references` / `implements` / `depends on` edges | no |
 | `a2m walk` | List source files under a path (no parsing) — handy for shell pipelines | no |
 | `a2m bundle` | Full 4-layer artifact bundle (`+ sequences/` with `--with-sequences`, see below) | no — needs `--out` |
 | `a2m index` | Materialize a bundle for a git ref into the cache (`./.a2m/cache/refs/<sha>/`) | no — defaults to working tree |
@@ -353,6 +354,143 @@ Stdlib noise (`clone`, `unwrap`, `len`, `push` — 74 names) stays out, as it do
 Ranks follow **source order**, including through a chain: in `jsonDecode(x).map(f).toList()` they read 1, 2, 3 left to right. Source order is not evaluation order — an argument evaluates before the call it is passed to — so `setTheme` above precedes the `_parseThemeMode` whose result it receives.
 
 Recursion is shown, not hidden: the nodes of a cycle are styled, expansion stops at the return edge, and a cycle that `--depth` would have truncated still emits a dotted `cycle (depth limit)` edge — otherwise the graph would look acyclic.
+
+### The whole project, entity by entity: `a2m graph`
+
+`project` and `overview` aggregate (one node per crate / module, call counts); `module`, `function`, `impact` and `flow` zoom in on one target. `a2m graph` draws the project the way you would on a whiteboard:
+
+- one `subgraph` per directory (down to `--group-depth`, default 2), one per file holding the file node and its items;
+- one class per kind — file, function, type, external dependency — so the diagram reads at a glance;
+- typed, labelled edges: `calls` (function → function), `imports` (file → file, only where no item edge already links the two files), `references` (an item → a type its declaration names), `implements` (type → trait), `depends on` (file → external crate);
+- every node defined before the first edge.
+
+Items are ranked by cross-file degree and cut at `--max-nodes` (default 150 — items plus the files holding them; external crates come on top). Private items with no cross-file edge are hidden unless `--include-private`. `--kinds` and `--edges` narrow the view; `--format dot` takes over when it is still too big.
+
+The edges come from what the resolver knows, so they are only as good as it is. It follows Rust module paths and `pub use` re-exports to the defining file (`crate::render::mermaid_to_dot` → `render/dot.rs`), types receivers from their declarations (`let s = Store::new(); s.add()`, `fn f(s: &Store)`, `self.field.m()`, Python `x = Cls()` / `x: Cls` / `self.x = Cls()`), and reads calls written inside macros. On this crate that took the functions with no known caller from 118 of 344 to 60 of 409 (the crate grew with the change) — what remains is test-only helpers and trait methods called implicitly.
+
+<details>
+<summary>Real output — <code>a2m graph ./src --max-nodes 30 --group-depth 1</code> on this crate</summary>
+
+```mermaid
+graph TD
+    %% a2m graph: 14 files, 16 items, 3 external deps
+    %% truncated 345 lower-ranked items (raise --max-nodes, narrow --kinds, or use --format dot)
+    classDef fileNode fill:#FFFACD,stroke:#DAA520,stroke-width:2px,color:#000
+    classDef functionNode fill:#87CEEB,stroke:#4682B4,stroke-width:2px,color:#000
+    classDef classNode fill:#DDA0DD,stroke:#8A2BE2,stroke-width:2px,color:#000
+    classDef dependencyNode fill:#90EE90,stroke:#2E8B57,stroke-width:2px,color:#000
+    subgraph dir_cli["cli/"]
+        subgraph file_cli_flags_rs_Habdd2d88["cli/flags.rs"]
+            code_cli_flags_rs_Hbc41a166["flags.rs"]:::fileNode
+            code_cli_flags_rs__enum__ExitCode_H8034749a["enum ExitCode"]:::classNode
+        end
+        subgraph file_cli_run_analyze_rs_Hfa679670["cli/run/analyze.rs"]
+            code_cli_run_analyze_rs_H694d7cbf["analyze.rs"]:::fileNode
+            code_cli_run_analyze_rs__function__run_analyze_H6d59bc85("run_analyze()"):::functionNode
+        end
+        subgraph file_cli_run_diff_rs_Ha5f4220b["cli/run/diff.rs"]
+            code_cli_run_diff_rs_Hc55eeb0d["diff.rs"]:::fileNode
+            code_cli_run_diff_rs__function__ensure_indexed_H1918b823("ensure_indexed()"):::functionNode
+        end
+    end
+    subgraph dir_n_graph["graph/"]
+        subgraph file_graph_memory_rs_H94022d49["graph/memory.rs"]
+            code_graph_memory_rs_Hfbce2854["memory.rs"]:::fileNode
+            code_graph_memory_rs__struct__Store_He4038d69["struct Store"]:::classNode
+        end
+    end
+    subgraph dir_parser["parser/"]
+        subgraph file_parser_mod_rs_H9b804503["parser/mod.rs"]
+            code_parser_mod_rs_H6e37b48e["mod.rs"]:::fileNode
+            code_parser_mod_rs__enum__Language_H1a373c77["enum Language"]:::classNode
+            code_parser_mod_rs__function__CodeParser__parse_H75b263b9("CodeParser::parse()"):::functionNode
+        end
+    end
+    subgraph dir_render["render/"]
+        subgraph file_render_adj_rs_Hafe27cfe["render/adj.rs"]
+            code_render_adj_rs_H8e869378["adj.rs"]:::fileNode
+            code_render_adj_rs__struct__AdjMaps_H123981fc["struct AdjMaps"]:::classNode
+        end
+        subgraph file_render_graph_rs_Ha101ee3f["render/graph.rs"]
+            code_render_graph_rs_Hd9a9d095["graph.rs"]:::fileNode
+            code_render_graph_rs__function__render_H601f45f8("render()"):::functionNode
+        end
+        subgraph file_render_mod_rs_Habdef66a["render/mod.rs"]
+            code_render_mod_rs_Hae3e8ec0["mod.rs"]:::fileNode
+            code_render_mod_rs__function__render_Hbbcc4b53("render()"):::functionNode
+        end
+        subgraph file_render_module_rs_H9580af71["render/module.rs"]
+            code_render_module_rs_Ha84f3157["module.rs"]:::fileNode
+            code_render_module_rs__function__render_Ha9ba08ed("render()"):::functionNode
+        end
+        subgraph file_render_snapshot_rs_Hd573e120["render/snapshot.rs"]
+            code_render_snapshot_rs_H2a40743e["snapshot.rs"]:::fileNode
+            code_render_snapshot_rs__struct__AtomSnapshot_Hd1990d77["struct AtomSnapshot"]:::classNode
+        end
+        subgraph file_render_util_rs_Hf33e9e24["render/util.rs"]
+            code_render_util_rs_Hb77721dd["util.rs"]:::fileNode
+            code_render_util_rs__function__sanitize_id_Hac8deb9e("sanitize_id()"):::functionNode
+        end
+    end
+    subgraph file_error_rs_Ha311c240["error.rs"]
+        code_error_rs_H90995b0f["error.rs"]:::fileNode
+        code_error_rs__type_alias__Result_Ha1dabcb9["type Result"]:::classNode
+    end
+    subgraph file_model_rs_H40cbef87["model.rs"]
+        code_model_rs_Ha23d0b37["model.rs"]:::fileNode
+        code_model_rs__struct__EntityId_Hdcb18383["struct EntityId"]:::classNode
+        code_model_rs__struct__CodeAtom_Hcbab17aa["struct CodeAtom"]:::classNode
+    end
+    subgraph file_pipeline_rs_H011aa006["pipeline.rs"]
+        code_pipeline_rs_Hb61e6eed["pipeline.rs"]:::fileNode
+        code_pipeline_rs__function__analyze_H6cd428af("analyze()"):::functionNode
+    end
+    dep_hex(["hex"]):::dependencyNode
+    dep_serde_json(["serde_json"]):::dependencyNode
+    dep_sha2(["sha2"]):::dependencyNode
+    code_cli_run_analyze_rs_H694d7cbf --"imports"--> code_render_mod_rs_Hae3e8ec0
+    code_cli_run_analyze_rs__function__run_analyze_H6d59bc85 --"calls"--> code_pipeline_rs__function__analyze_H6cd428af
+    code_cli_run_analyze_rs__function__run_analyze_H6d59bc85 --"references"--> code_cli_flags_rs__enum__ExitCode_H8034749a
+    code_cli_run_diff_rs_Hc55eeb0d --"depends on"--> dep_serde_json
+    code_cli_run_diff_rs_Hc55eeb0d --"imports"--> code_cli_flags_rs_Hbc41a166
+    code_cli_run_diff_rs_Hc55eeb0d --"imports"--> code_pipeline_rs_Hb61e6eed
+    code_cli_run_diff_rs__function__ensure_indexed_H1918b823 --"references"--> code_error_rs__type_alias__Result_Ha1dabcb9
+    code_graph_memory_rs_Hfbce2854 --"imports"--> code_model_rs_Ha23d0b37
+    code_model_rs__struct__CodeAtom_Hcbab17aa --"references"--> code_model_rs__struct__EntityId_Hdcb18383
+    code_parser_mod_rs_H6e37b48e --"depends on"--> dep_hex
+    code_parser_mod_rs_H6e37b48e --"imports"--> code_graph_memory_rs_Hfbce2854
+    code_parser_mod_rs_H6e37b48e --"imports"--> code_model_rs_Ha23d0b37
+    code_parser_mod_rs__function__CodeParser__parse_H75b263b9 --"references"--> code_error_rs__type_alias__Result_Ha1dabcb9
+    code_pipeline_rs_Hb61e6eed --"imports"--> code_graph_memory_rs_Hfbce2854
+    code_pipeline_rs_Hb61e6eed --"imports"--> code_parser_mod_rs_H6e37b48e
+    code_pipeline_rs_Hb61e6eed --"imports"--> code_render_adj_rs_H8e869378
+    code_pipeline_rs_Hb61e6eed --"imports"--> code_render_snapshot_rs_H2a40743e
+    code_pipeline_rs__function__analyze_H6cd428af --"calls"--> code_render_graph_rs__function__render_H601f45f8
+    code_pipeline_rs__function__analyze_H6cd428af --"calls"--> code_render_mod_rs__function__render_Hbbcc4b53
+    code_pipeline_rs__function__analyze_H6cd428af --"references"--> code_error_rs__type_alias__Result_Ha1dabcb9
+    code_render_adj_rs_H8e869378 --"imports"--> code_graph_memory_rs_Hfbce2854
+    code_render_adj_rs__struct__AdjMaps_H123981fc --"references"--> code_model_rs__struct__EntityId_Hdcb18383
+    code_render_graph_rs_Hd9a9d095 --"imports"--> code_model_rs_Ha23d0b37
+    code_render_graph_rs__function__render_H601f45f8 --"calls"--> code_render_util_rs__function__sanitize_id_Hac8deb9e
+    code_render_graph_rs__function__render_H601f45f8 --"references"--> code_render_adj_rs__struct__AdjMaps_H123981fc
+    code_render_graph_rs__function__render_H601f45f8 --"references"--> code_render_snapshot_rs__struct__AtomSnapshot_Hd1990d77
+    code_render_mod_rs_Hae3e8ec0 --"imports"--> code_graph_memory_rs_Hfbce2854
+    code_render_mod_rs__function__render_Hbbcc4b53 --"calls"--> code_render_graph_rs__function__render_H601f45f8
+    code_render_mod_rs__function__render_Hbbcc4b53 --"calls"--> code_render_module_rs__function__render_Ha9ba08ed
+    code_render_mod_rs__function__render_Hbbcc4b53 --"references"--> code_error_rs__type_alias__Result_Ha1dabcb9
+    code_render_mod_rs__function__render_Hbbcc4b53 --"references"--> code_render_adj_rs__struct__AdjMaps_H123981fc
+    code_render_mod_rs__function__render_Hbbcc4b53 --"references"--> code_render_snapshot_rs__struct__AtomSnapshot_Hd1990d77
+    code_render_module_rs_Ha84f3157 --"imports"--> code_model_rs_Ha23d0b37
+    code_render_module_rs__function__render_Ha9ba08ed --"calls"--> code_render_util_rs__function__sanitize_id_Hac8deb9e
+    code_render_module_rs__function__render_Ha9ba08ed --"references"--> code_error_rs__type_alias__Result_Ha1dabcb9
+    code_render_module_rs__function__render_Ha9ba08ed --"references"--> code_render_adj_rs__struct__AdjMaps_H123981fc
+    code_render_module_rs__function__render_Ha9ba08ed --"references"--> code_render_snapshot_rs__struct__AtomSnapshot_Hd1990d77
+    code_render_snapshot_rs__struct__AtomSnapshot_Hd1990d77 --"references"--> code_model_rs__struct__CodeAtom_Hcbab17aa
+    code_render_snapshot_rs__struct__AtomSnapshot_Hd1990d77 --"references"--> code_model_rs__struct__EntityId_Hdcb18383
+    code_render_util_rs_Hb77721dd --"depends on"--> dep_sha2
+```
+
+</details>
 
 ## When the graph is too big for Mermaid
 

@@ -21,8 +21,9 @@ pub mod run;
 
 pub use flags::{
     AnalyzeFlags, AnalyzeFormat, BundleFlags, CacheArgs, DiffFlags, DiffFormat, ExitCode,
-    FlowFlags, GcFlags, IndexFlags, SequenceFlags, WalkFlags,
+    FlowFlags, GcFlags, GraphFlags, IndexFlags, SequenceFlags, WalkFlags,
 };
 pub use run::{
-    run_analyze, run_bundle, run_diff, run_flow, run_gc, run_index, run_sequence, run_walk,
+    run_analyze, run_bundle, run_diff, run_flow, run_gc, run_graph, run_index, run_sequence,
+    run_walk,
 };

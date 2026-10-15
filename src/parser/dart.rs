@@ -40,6 +40,11 @@ pub(super) struct DartImports {
     /// `import '…/user.dart' as models;` → `models` → `user`.
     /// Rewrites `models.fn()` → `user::fn`.
     pub modules: HashMap<String, String>,
+    /// URI of every `import` / `export` outside the SDK, as written
+    /// (`package:app/models/user.dart`, `../models/user.dart`). Bare
+    /// imports included: they bind no name we can rewrite, but they are
+    /// still a dependency between files.
+    pub uris: Vec<String>,
 }
 
 /// Walk every `import` / `export` directive reachable from `root` and
@@ -69,6 +74,12 @@ fn handle_directive(node: &Node, source: &str, out: &mut DartImports) {
     let Some(stem) = uri_stem(node, source) else {
         return;
     };
+    if let Some(raw) = find_uri_text(node, source) {
+        let uri = raw.trim_matches(['\'', '"']).to_owned();
+        if !out.uris.contains(&uri) {
+            out.uris.push(uri);
+        }
+    }
 
     let mut cursor = node.walk();
     let mut alias: Option<String> = None;
@@ -479,6 +490,37 @@ fn member_root_method<'a>(node: &Node, source: &'a str) -> Option<(Option<&'a st
 
 fn node_text<'a>(node: &Node, source: &'a str) -> Option<&'a str> {
     node.utf8_text(source.as_bytes()).ok()
+}
+
+/// Types named in a declaration's signature — parameters, return type,
+/// `extends` / `implements` clauses — never in a body.
+pub(super) fn type_refs(item: Node, source: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut stack = vec![item];
+    let mut visited = 0usize;
+    while let Some(n) = stack.pop() {
+        visited += 1;
+        if visited > 10_000 {
+            break;
+        }
+        if n.kind() == "type_identifier"
+            && let Some(name) = node_text(&n, source)
+            && is_type_name(name)
+            && !out.iter().any(|o| o == name)
+        {
+            out.push(name.to_owned());
+        }
+        let mut c = n.walk();
+        for child in n.children(&mut c) {
+            if !matches!(
+                child.kind(),
+                "function_body" | "block" | "class_body" | "enum_body" | "extension_body"
+            ) {
+                stack.push(child);
+            }
+        }
+    }
+    out
 }
 
 #[cfg(test)]

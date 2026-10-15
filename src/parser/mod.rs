@@ -22,7 +22,7 @@
 use crate::error::{AstToMermaidError, Result};
 use crate::graph::Store;
 use crate::limits::max_ast_depth;
-use crate::model::{CallSite, CodeAtom, Edge, EdgeKind, EntityId};
+use crate::model::{AtomRefs, CallSite, CodeAtom, Edge, EdgeKind, EntityId, ReExport};
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
@@ -330,6 +330,7 @@ impl CodeParser {
             calls: Vec::new(),
             method_calls: Vec::new(),
             parent: None,
+            refs: crate::model::AtomRefs::default(),
         });
 
         // ── File-scope imports ────────────────────────────────────────────────
@@ -338,10 +339,53 @@ impl CodeParser {
         let imports: Imports = match self.language {
             Language::Rust => {
                 let decls = rust::extract_use_decls(root, text);
-                Imports::Rust(rust::use_decls_to_imports(&decls))
+                let pub_decls = rust::extract_pub_use_decls(root, text);
+                let refs = &mut atoms[0].refs;
+                for d in &rust::extract_file_imports(root, text) {
+                    if !refs.imports.contains(&d.path) {
+                        refs.imports.push(d.path.clone());
+                    }
+                }
+                refs.reexports = pub_decls
+                    .iter()
+                    .map(|d| ReExport {
+                        name: d.local.clone(),
+                        path: d.path.clone(),
+                        glob: d.glob,
+                    })
+                    .collect();
+                Imports::Rust(rust::RustScope {
+                    imports: rust::use_decls_to_imports(&decls),
+                    fields: rust::collect_struct_fields(root, text),
+                })
             }
-            Language::Python => Imports::Python(python::extract_imports(root, text)),
-            Language::Dart => Imports::Dart(dart::extract_imports(root, text)),
+            Language::Python => {
+                let py = python::extract_imports(root, text);
+                let refs = &mut atoms[0].refs;
+                refs.imports.clone_from(&py.targets);
+                // A package's `__init__.py` is how its submodules' names
+                // reach `from pkg import name`: everything it imports is
+                // importable from it.
+                if file_path.rsplit('/').next() == Some("__init__.py") {
+                    let mut reexports: Vec<ReExport> = py
+                        .symbols
+                        .iter()
+                        .map(|(name, path)| ReExport {
+                            name: name.clone(),
+                            path: path.clone(),
+                            glob: false,
+                        })
+                        .collect();
+                    reexports.sort_by(|a, b| a.name.cmp(&b.name));
+                    refs.reexports = reexports;
+                }
+                Imports::Python(py)
+            }
+            Language::Dart => {
+                let d = dart::extract_imports(root, text);
+                atoms[0].refs.imports.clone_from(&d.uris);
+                Imports::Dart(d)
+            }
         };
 
         // ── Item atoms ────────────────────────────────────────────────────────
@@ -518,10 +562,11 @@ fn extract_item(
     // into the same hole: whatever it maps to `"function"` gets its calls
     // read, with no second list to remember to update.
     let extracted = if language.map_node_kind(ts_kind) == Some("function") {
-        extract_calls(&node, source, language, imports)
+        extract_calls(&node, source, language, imports, None)
     } else {
         ExtractedCalls::default()
     };
+    let types = type_refs(&node, source, language, imports);
 
     let item_id = EntityId::new(format!("code:{file_path}::{atom_kind}::{item_name}"));
 
@@ -538,6 +583,10 @@ fn extract_item(
         calls: extracted.calls.clone(),
         method_calls: extracted.method_calls.clone(),
         parent: None,
+        refs: AtomRefs {
+            types,
+            ..AtomRefs::default()
+        },
     };
 
     Some((atom, extracted.calls))
@@ -606,6 +655,10 @@ fn extract_methods(
         imports,
     } = *ctx;
 
+    // The type `self` stands for, generics dropped (`Store<T>` → `Store`):
+    // what a typed receiver call is qualified with.
+    let owner_bare = parent_type.split('<').next().unwrap_or(parent_type).trim();
+
     // Pass 1: extract every method, build the container-local name lookup.
     let mut method_id_by_name: HashMap<String, EntityId> = HashMap::new();
     let mut pending: Vec<(EntityId, CodeAtom, ExtractedCalls)> = Vec::new();
@@ -640,7 +693,8 @@ fn extract_methods(
                 .trim()
                 .to_owned();
             let doc = doc_for(language, &inner, source);
-            let extracted = extract_calls(&inner, source, language, imports);
+            let extracted = extract_calls(&inner, source, language, imports, Some(owner_bare));
+            let types = type_refs(&inner, source, language, imports);
 
             let id = EntityId::new(format!(
                 "code:{file_path}::function::{container_name}::{method_name}"
@@ -658,6 +712,10 @@ fn extract_methods(
                 calls: extracted.calls.clone(),
                 method_calls: extracted.method_calls.clone(),
                 parent: Some(parent_type.to_owned()),
+                refs: AtomRefs {
+                    types,
+                    ..AtomRefs::default()
+                },
             };
             method_id_by_name.insert(method_name, id.clone());
             pending.push((id, atom, extracted));
@@ -667,6 +725,7 @@ fn extract_methods(
     // Pass 2: emit atoms + Contains edges + intra-container Calls edges.
     let owner_prefix = format!("{container_name}::");
     let parent_prefix = format!("{parent_type}::");
+    let bare_prefix = format!("{owner_bare}::");
     let mut out: Vec<(EntityId, Vec<CallSite>)> = Vec::with_capacity(pending.len());
     for (method_id, atom, extracted) in pending {
         out_edges.push(Edge::new(
@@ -698,8 +757,11 @@ fn extract_methods(
                 Some(call_name)
             } else if let Some(rest) = call_name.strip_prefix(&owner_prefix) {
                 Some(rest)
+            } else if let Some(rest) = call_name.strip_prefix(&parent_prefix) {
+                Some(rest)
             } else {
-                call_name.strip_prefix(&parent_prefix)
+                // `self.foo()` typed as `Owner::foo` by the extractor.
+                call_name.strip_prefix(&bare_prefix)
             };
             let Some(target_name) = local_target else {
                 continue;
@@ -818,6 +880,14 @@ impl ExtractedCalls {
         self.calls.push(site);
     }
 
+    /// Record a receiver-style call the extractor typed from the
+    /// receiver's declaration, as `Type::method`.
+    pub(super) fn push_typed_call(&mut self, name: String, callee: &Node, language: Language) {
+        let mut site = self.site(name, callee, language);
+        site.flags |= crate::model::call_flags::TYPED_RECEIVER;
+        self.calls.push(site);
+    }
+
     /// Record a receiver-style call whose type is unknown.
     pub(super) fn push_method_call(&mut self, name: String, callee: &Node, language: Language) {
         let site = self.site(name, callee, language);
@@ -868,8 +938,8 @@ impl ExtractedCalls {
 /// Module-private: built in [`CodeParser::parse`] and threaded only through
 /// the parser's own extraction helpers.
 enum Imports {
-    /// Rust `use` map: local name → fully-qualified path.
-    Rust(HashMap<String, String>),
+    /// Rust `use` map and struct field types.
+    Rust(rust::RustScope),
     /// Python `import` maps (symbol + module aliases).
     Python(python::PyImports),
     /// Dart `import` maps (`show` symbols + `as` aliases).
@@ -884,19 +954,25 @@ enum Imports {
 /// one site, and no consumer could tell. De-duplication belongs on the
 /// *edges* (one edge per caller→callee pair, carrying every rank that
 /// produced it), not on the record of what the body does.
+///
+/// `self_type` is the enclosing impl / class (generics dropped) when
+/// `node` is a method: it types `self.method()`.
 fn extract_calls(
     node: &Node,
     source: &str,
     language: Language,
     imports: &Imports,
+    self_type: Option<&str>,
 ) -> ExtractedCalls {
     let mut out = ExtractedCalls::default();
     // The `(language, imports)` pair is always constructed in lock-step in
     // `CodeParser::parse`, so the cross arms are unreachable.
     match (language, imports) {
-        (Language::Rust, Imports::Rust(map)) => rust::extract_calls(node, source, map, &mut out),
+        (Language::Rust, Imports::Rust(scope)) => {
+            rust::extract_calls(node, source, scope, self_type, &mut out);
+        }
         (Language::Python, Imports::Python(py)) => {
-            python::extract_calls(node, source, py, &mut out);
+            python::extract_calls(node, source, py, self_type, &mut out);
         }
         (Language::Dart, Imports::Dart(d)) => {
             dart::extract_calls(node, source, d, &mut out);
@@ -905,6 +981,17 @@ fn extract_calls(
     }
     out.sort_by_source_order();
     out
+}
+
+/// Types an item's declaration names, per language (see each
+/// extractor's `type_refs`).
+fn type_refs(node: &Node, source: &str, language: Language, imports: &Imports) -> Vec<String> {
+    match (language, imports) {
+        (Language::Rust, Imports::Rust(scope)) => rust::type_refs(*node, source, &scope.imports),
+        (Language::Python, _) => python::type_refs(*node, source),
+        (Language::Dart, _) => dart::type_refs(*node, source),
+        _ => Vec::new(),
+    }
 }
 
 /// Control-flow context of a call site, found by walking up from the

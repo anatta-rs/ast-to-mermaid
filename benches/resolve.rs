@@ -35,6 +35,7 @@ fn module_atom(file_path: &str, name: &str) -> CodeAtom {
         calls: Vec::new(),
         method_calls: Vec::new(),
         parent: None,
+        refs: ast_to_mermaid::model::AtomRefs::default(),
     }
 }
 
@@ -52,6 +53,7 @@ fn function_atom(file_path: &str, name: &str, calls: Vec<String>) -> CodeAtom {
         calls: calls.into_iter().map(CallSite::bare).collect(),
         method_calls: Vec::new(),
         parent: None,
+        refs: ast_to_mermaid::model::AtomRefs::default(),
     }
 }
 

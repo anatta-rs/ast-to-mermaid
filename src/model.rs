@@ -122,6 +122,11 @@ pub mod call_flags {
     pub const CONDITIONAL: u8 = 1 << 1;
     /// The call sits in a loop and may run many times.
     pub const REPEATED: u8 = 1 << 2;
+    /// The call is `recv.method()` and the parser rewrote it to
+    /// `Type::method` from the receiver's declared type. The resolver
+    /// links such a site only to an in-graph method and never mints an
+    /// `extern` atom for it: `Vec::push` is not a dependency worth a node.
+    pub const TYPED_RECEIVER: u8 = 1 << 3;
 }
 
 /// One call site in an atom's body: what it calls, where, and under what
@@ -195,8 +200,8 @@ pub struct CodeAtom {
     pub doc: String,
     /// Declaration signature (e.g. `pub fn foo(x: u32) -> bool`).
     pub signature: String,
-    /// Git blob SHA-1 hex hash of the atom's source text (`SHA1("blob N\0" + content)`).
-    /// Same value as `git hash-object` on the enclosing source slice.
+    /// SHA-256 of the atom's source text: `sha256:<hex>` for items, bare
+    /// hex for module atoms (hash of the whole file).
     pub content_hash: String,
     /// Call sites in this atom's body, in source order. Each carries the
     /// resolver-eligible name plus its rank and control-flow context —
@@ -226,6 +231,56 @@ pub struct CodeAtom {
     /// of unrelated types — only qualified `Owner::method` calls do.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent: Option<String>,
+    /// Unresolved references to other files, as the parser read them.
+    /// The resolver turns them into `Imports` / `Uses` edges and uses the
+    /// re-exports to follow `pub use` chains.
+    #[serde(default, skip_serializing_if = "AtomRefs::is_empty")]
+    pub refs: AtomRefs,
+}
+
+/// Cross-file references recorded on an atom at parse time.
+///
+/// A file is parsed alone (its result is cached by blob SHA), so nothing
+/// here can name another file's atom yet: every entry is a path or a name
+/// as written in the source, bound later by [`crate::resolve`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AtomRefs {
+    /// Module atoms only: what the file imports. Rust `use` paths
+    /// (`crate::render::Level`, globs as `crate::render`), Python dotted
+    /// modules with their leading dots (`..pkg.mod`), Dart import URIs.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub imports: Vec<String>,
+    /// Module atoms only: names other files can reach *through* this one
+    /// — Rust `pub use`, and the imports of a Python `__init__.py`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reexports: Vec<ReExport>,
+    /// Types named in the item's declaration: struct / enum fields,
+    /// parameters, return type. Rust names imported by `use` carry their
+    /// full path; anything else is the bare name.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub types: Vec<String>,
+}
+
+impl AtomRefs {
+    /// Whether no reference was recorded.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.imports.is_empty() && self.reexports.is_empty() && self.types.is_empty()
+    }
+}
+
+/// One name a module re-exports.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReExport {
+    /// Name visible from outside (the alias for `pub use a::b as c`).
+    /// `"*"` for a glob.
+    pub name: String,
+    /// Path as written in the re-exporting file: `dot::mermaid_to_dot`
+    /// for Rust, `mod::sym` for Python.
+    pub path: String,
+    /// `pub use path::*`: every public name of `path`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub glob: bool,
 }
 
 // ── Edges ────────────────────────────────────────────────────────────────────
@@ -242,6 +297,8 @@ pub enum EdgeKind {
     Implements,
     /// `from` contains `to` (module → item).
     Contains,
+    /// Module `from` imports module `to`.
+    Imports,
 }
 
 impl EdgeKind {
@@ -253,6 +310,7 @@ impl EdgeKind {
             Self::Uses => "uses",
             Self::Implements => "implements",
             Self::Contains => "contains",
+            Self::Imports => "imports",
         }
     }
 
@@ -263,6 +321,7 @@ impl EdgeKind {
             "calls" => Self::Calls,
             "implements" => Self::Implements,
             "contains" => Self::Contains,
+            "imports" => Self::Imports,
             _ => Self::Uses,
         }
     }

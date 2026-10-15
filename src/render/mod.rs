@@ -13,11 +13,15 @@
 //!   node with direct callers (in) and callees (out).
 //! - [`Level::Impact`] (target = function name or id) — reverse call chain
 //!   walked back N hops (default 3) — answers "who breaks if I change this?".
+//! - [`Level::Graph`] — the whole project at entity level: files grouped
+//!   by directory, their key items, typed `calls` / `imports` /
+//!   `references` / `implements` edges (see [`graph`]).
 
 pub mod adj;
 pub mod dot;
 pub mod flow;
 mod function;
+pub mod graph;
 mod impact;
 pub mod lookup;
 mod module;
@@ -56,6 +60,9 @@ pub enum Level {
     /// dispatcher does not carry — `pipeline::analyze` branches on it
     /// before reaching the dispatcher.
     Flow,
+    /// Whole-project knowledge graph. Rendered by [`graph::render`], whose
+    /// options (`max_nodes`, `kinds`, …) travel the same way as `Flow`'s.
+    Graph,
 }
 
 impl Level {
@@ -69,6 +76,7 @@ impl Level {
             Self::Function => "function",
             Self::Impact => "impact",
             Self::Flow => "flow",
+            Self::Graph => "graph",
         }
     }
 
@@ -145,6 +153,8 @@ pub fn render(
             flow::DEFAULT_DEPTH,
             flow::External::NearOnly,
         )?,
+        // Same: `pipeline::analyze` passes the caller's options.
+        Level::Graph => graph::render(adj, snapshot, &graph::GraphOptions::default()),
     };
     Ok(s)
 }
@@ -212,9 +222,9 @@ mod tests {
 
     #[test]
     fn level_from_str_unknown_errors() {
-        let err = "graph".parse::<Level>().expect_err("unknown");
+        let err = "galaxy".parse::<Level>().expect_err("unknown");
         assert!(matches!(err, AstToMermaidError::InvalidInput(_)));
-        assert!(err.to_string().contains("graph"));
+        assert!(err.to_string().contains("galaxy"));
     }
 
     #[test]
@@ -224,6 +234,7 @@ mod tests {
         assert!(Level::Module.requires_target());
         assert!(Level::Function.requires_target());
         assert!(Level::Impact.requires_target());
+        assert!(!Level::Graph.requires_target());
     }
 
     #[test]

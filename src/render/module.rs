@@ -254,6 +254,7 @@ mod tests {
             calls: Vec::new(),
             method_calls: Vec::new(),
             parent: None,
+            refs: crate::model::AtomRefs::default(),
         }
     }
 
@@ -271,6 +272,7 @@ mod tests {
             calls: Vec::new(),
             method_calls: Vec::new(),
             parent: None,
+            refs: crate::model::AtomRefs::default(),
         }
     }
 
@@ -459,6 +461,7 @@ mod tests {
             calls: Vec::new(),
             method_calls: Vec::new(),
             parent: None,
+            refs: crate::model::AtomRefs::default(),
         };
         let m2 = CodeAtom {
             id: EntityId::new("code:src/foo.rs::function::Foo::update"),
@@ -473,6 +476,7 @@ mod tests {
             calls: Vec::new(),
             method_calls: Vec::new(),
             parent: None,
+            refs: crate::model::AtomRefs::default(),
         };
         store.add_edge(Edge::new(
             m.id.clone(),
@@ -527,6 +531,7 @@ mod tests {
             calls: Vec::new(),
             method_calls: Vec::new(),
             parent: Some("Translator".to_owned()),
+            refs: crate::model::AtomRefs::default(),
         };
         store.add_edge(Edge::new(
             m.id.clone(),
@@ -587,6 +592,7 @@ mod tests {
             calls: Vec::new(),
             method_calls: Vec::new(),
             parent: None,
+            refs: crate::model::AtomRefs::default(),
         };
         store.add_edge(Edge::new(
             m.id.clone(),
