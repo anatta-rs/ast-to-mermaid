@@ -26,6 +26,13 @@ use crate::resolve::EXTERN_KIND;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt::Write as _;
 
+/// Atom kinds an `impl … for <Type>` can name.
+const TYPE_KINDS: &[&str] = &["struct", "enum", "union", "type_alias"];
+
+/// Label of a trait method → implementation edge (drawn with
+/// `implements`).
+const DISPATCHES: &str = "dispatches to";
+
 /// Default cap on rendered nodes. GitHub renders about 500 edges; past
 /// ~150 nodes a `graph TD` stops being readable anyway.
 pub const DEFAULT_MAX_NODES: usize = 150;
@@ -324,18 +331,55 @@ pub fn render(adj: &AdjMaps, snapshot: &AtomSnapshot<'_>, opts: &GraphOptions) -
     }
     if wants(GraphEdge::Implements) {
         // The edge leaves the `impl` block, which is rarely shown; draw it
-        // from the implementing type instead, found in the impl's file.
+        // from the implementing type instead. The impl often lives in a
+        // third file (`impl AuthStore for SqliteStore` in `sqlite/auth.rs`,
+        // the struct in `sqlite/mod.rs`): look in the impl's file first,
+        // then in the files it imports, then for a unique type of that name.
+        let types: Vec<&CodeAtom> = shown
+            .iter()
+            .copied()
+            .filter(|s| s.parent.is_none() && TYPE_KINDS.contains(&s.kind.as_str()))
+            .collect();
         for atom in snapshot.iter().filter(|a| a.kind == "impl") {
             let Some((_, ty)) = atom.name.split_once(" for ") else {
                 continue;
             };
             let ty = ty.split('<').next().unwrap_or(ty).trim();
-            let owner = shown
+            let ty = ty.rsplit("::").next().unwrap_or(ty);
+            let named: Vec<&CodeAtom> = types.iter().copied().filter(|s| s.name == ty).collect();
+            let imported: Vec<&str> = adj
+                .imports_out(&EntityId::new(format!("code:{}", atom.file_path)))
                 .iter()
-                .find(|s| s.name == ty && s.file_path == atom.file_path && s.parent.is_none());
+                .filter_map(|m| snapshot.get(m))
+                .map(|m| m.file_path.as_str())
+                .collect();
+            let local: Vec<&CodeAtom> = named
+                .iter()
+                .copied()
+                .filter(|s| s.file_path == atom.file_path)
+                .collect();
+            let via_import: Vec<&CodeAtom> = named
+                .iter()
+                .copied()
+                .filter(|s| imported.contains(&s.file_path.as_str()))
+                .collect();
+            let owner = match (local.as_slice(), via_import.as_slice(), named.as_slice()) {
+                ([one], _, _) | ([], [one], _) | ([], [], [one]) => Some(*one),
+                _ => None,
+            };
             for tr in adj.implements_out(&atom.id) {
                 if let (Some(owner), Some(t)) = (owner, shown_ids.get(tr.as_ref())) {
                     edges.insert((node(owner), GraphEdge::Implements.label(), node(t)));
+                }
+            }
+        }
+        // Method level: a trait method dispatches to each implementation.
+        for atom in &shown {
+            for tr in adj.implements_out(&atom.id) {
+                if let Some(t) = shown_ids.get(tr.as_ref())
+                    && t.kind == "function"
+                {
+                    edges.insert((node(t), DISPATCHES, node(atom)));
                 }
             }
         }
@@ -687,6 +731,82 @@ mod tests {
             render(&adj, &AtomSnapshot::build(atoms), &GraphOptions::default())
         });
         assert!(!out.contains("code_cache_rs"), "{out}");
+    }
+
+    #[test]
+    fn implements_is_drawn_from_a_type_declared_in_another_file() {
+        // `impl T for S` in b.rs, `S` in a.rs, `T` in t.rs; b.rs imports a.rs.
+        let store = Store::new();
+        for (file, kind, name, sig) in [
+            ("a.rs", "struct", "S", "pub struct S"),
+            ("t.rs", "trait", "T", "pub trait T"),
+            ("b.rs", "impl", "T for S", "impl T for S"),
+        ] {
+            store.add_atom(atom(&format!("code:{file}"), "module", file, file, ""));
+            store.add_atom(atom(
+                &format!("code:{file}::{kind}::{name}"),
+                kind,
+                name,
+                file,
+                sig,
+            ));
+        }
+        let mut f = atom(
+            "code:t.rs::function::T::f",
+            "function",
+            "f",
+            "t.rs",
+            "fn f(&self);",
+        );
+        f.parent = Some("T".to_owned());
+        store.add_atom(f);
+        let mut g = atom(
+            "code:b.rs::function::T for S::f",
+            "function",
+            "f",
+            "b.rs",
+            "fn f(&self) {}",
+        );
+        g.parent = Some("S".to_owned());
+        store.add_atom(g);
+        for (from, to, kind) in [
+            (
+                "code:b.rs::impl::T for S",
+                "code:t.rs::trait::T",
+                EdgeKind::Implements,
+            ),
+            (
+                "code:b.rs::function::T for S::f",
+                "code:t.rs::function::T::f",
+                EdgeKind::Implements,
+            ),
+            ("code:b.rs", "code:a.rs", EdgeKind::Imports),
+        ] {
+            store.add_edge(Edge::new(EntityId::new(from), EntityId::new(to), kind));
+        }
+        let adj = AdjMaps::build(&store);
+        let out = store.with_atoms(|atoms| {
+            render(
+                &adj,
+                &AtomSnapshot::build(atoms),
+                &GraphOptions {
+                    include_private: true,
+                    ..GraphOptions::default()
+                },
+            )
+        });
+        let s = sanitize_id("code:a.rs::struct::S");
+        let t = sanitize_id("code:t.rs::trait::T");
+        assert!(
+            out.contains(&format!("{s} --\"implements\"--> {t}")),
+            "{out}"
+        );
+        let tf = sanitize_id("code:t.rs::function::T::f");
+        let sf = sanitize_id("code:b.rs::function::T for S::f");
+        assert!(
+            out.contains(&format!("{tf} --\"dispatches to\"--> {sf}")),
+            "{out}"
+        );
     }
 
     #[test]

@@ -728,7 +728,8 @@ fn is_unknown_dart_type(
 }
 
 /// Walk the store, resolve `impl Trait for Type` blocks to their target
-/// trait atoms, and add `Implements` edges.
+/// trait atoms, and add `Implements` edges — impl → trait, and each impl
+/// method → the trait method of the same name.
 ///
 /// An `impl` atom whose `name` has the form `Trait for Type` is a trait
 /// impl; if a trait atom with name `Trait` (or matching the last `::`
@@ -754,6 +755,24 @@ pub fn resolve_implements_edges(store: &Store) -> usize {
             return;
         }
 
+        // Methods by id prefix (`code:{file}::function::{owner}::`), to
+        // pair an impl's methods with its trait's.
+        let mut methods: HashMap<&str, Vec<(&str, &EntityId)>> = HashMap::new();
+        for a in atoms
+            .iter()
+            .filter(|a| a.kind == "function" && a.parent.is_some())
+        {
+            if let Some(prefix) =
+                a.id.as_str()
+                    .strip_suffix(a.name.as_str())
+                    .filter(|p| p.ends_with("::"))
+            {
+                methods
+                    .entry(prefix)
+                    .or_default()
+                    .push((a.name.as_str(), &a.id));
+            }
+        }
         let mut trait_by_name: HashMap<&str, Vec<usize>> = HashMap::new();
         for (idx, atom) in traits.iter().enumerate() {
             trait_by_name
@@ -798,6 +817,25 @@ pub fn resolve_implements_edges(store: &Store) -> usize {
             };
             if let Some(idx) = target_idx {
                 staged.push((impl_atom.id.clone(), traits[idx].id.clone()));
+                // Each method of the impl implements the trait's method of
+                // the same name: the edge `dyn Trait` dispatch follows.
+                let impl_prefix = format!(
+                    "code:{}::function::{}::",
+                    impl_atom.file_path, impl_atom.name
+                );
+                let trait_prefix = format!(
+                    "code:{}::function::{}::",
+                    traits[idx].file_path, traits[idx].name
+                );
+                let impl_methods = methods.get(impl_prefix.as_str());
+                for (name, trait_method) in methods.get(trait_prefix.as_str()).into_iter().flatten()
+                {
+                    if let Some((_, impl_method)) =
+                        impl_methods.into_iter().flatten().find(|(n, _)| n == name)
+                    {
+                        staged.push(((*impl_method).clone(), (*trait_method).clone()));
+                    }
+                }
             }
         }
     });

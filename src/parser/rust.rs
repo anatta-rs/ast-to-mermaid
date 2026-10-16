@@ -571,7 +571,130 @@ fn local_types(
         };
         record(&mut out, name, ty);
     }
+    // `fn f<S: Store>(s: &S)`: a binding typed by a generic parameter
+    // exposes the methods of the parameter's trait bound.
+    let bounds = enclosing_bounds(body, source);
+    if !bounds.is_empty() {
+        for ty in out.values_mut().flatten() {
+            if let Some(b) = bounds.get(ty.as_str()) {
+                ty.clone_from(b);
+            }
+        }
+    }
     out
+}
+
+/// Generic parameter → trait bound, for the generics in scope at `node`:
+/// those of the function itself and of its enclosing `impl` / `trait`
+/// (`<S: Store>` and `where S: Store`). Marker traits (`Send`, `Clone`,
+/// …) are skipped; a parameter keeps its first meaningful bound.
+pub(super) fn enclosing_bounds(node: Node, source: &str) -> HashMap<String, String> {
+    let mut out: HashMap<String, String> = HashMap::new();
+    let mut cur = Some(node);
+    for _ in 0..6 {
+        let Some(n) = cur else { break };
+        if matches!(
+            n.kind(),
+            "function_item"
+                | "function_signature_item"
+                | "impl_item"
+                | "trait_item"
+                | "struct_item"
+        ) {
+            generic_bounds(n, source, &mut out);
+        }
+        cur = n.parent();
+    }
+    out
+}
+
+/// Read `<T: Bound>` and `where T: Bound` of one item into `out`.
+fn generic_bounds(item: Node, source: &str, out: &mut HashMap<String, String>) {
+    let mut add = |left: Option<Node>, bounds: Option<Node>| {
+        let (Some(left), Some(bounds)) = (left, bounds) else {
+            return;
+        };
+        let Ok(param) = left.utf8_text(source.as_bytes()) else {
+            return;
+        };
+        let mut c = bounds.walk();
+        let first = bounds
+            .named_children(&mut c)
+            .filter(|b| !is_marker_bound(b, source))
+            .find_map(|b| type_name(b, source, None));
+        if let Some(b) = first {
+            out.entry(param.to_owned()).or_insert(b);
+        }
+    };
+    let mut c = item.walk();
+    for child in item.named_children(&mut c) {
+        match child.kind() {
+            "type_parameters" => {
+                let mut c2 = child.walk();
+                for p in child.named_children(&mut c2) {
+                    match p.kind() {
+                        "type_parameter" => {
+                            add(
+                                p.child_by_field_name("name"),
+                                p.child_by_field_name("bounds"),
+                            );
+                        }
+                        // Older grammars.
+                        "constrained_type_parameter" => {
+                            add(
+                                p.child_by_field_name("left"),
+                                p.child_by_field_name("bounds"),
+                            );
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            "where_clause" => {
+                let mut c2 = child.walk();
+                for p in child.named_children(&mut c2) {
+                    if p.kind() == "where_predicate" {
+                        add(
+                            p.child_by_field_name("left"),
+                            p.child_by_field_name("bounds"),
+                        );
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// `Send`, `Sync`, `Clone`, … and lifetimes: bounds that say nothing
+/// about which methods a receiver has.
+fn is_marker_bound(b: &Node, source: &str) -> bool {
+    if b.kind() == "lifetime" {
+        return true;
+    }
+    let text = b.utf8_text(source.as_bytes()).unwrap_or_default();
+    let name = text
+        .rsplit("::")
+        .next()
+        .unwrap_or(text)
+        .trim_start_matches('?');
+    matches!(
+        name,
+        "Send"
+            | "Sync"
+            | "Sized"
+            | "Unpin"
+            | "Clone"
+            | "Copy"
+            | "Debug"
+            | "Default"
+            | "Eq"
+            | "PartialEq"
+            | "Ord"
+            | "PartialOrd"
+            | "Hash"
+            | "Display"
+    )
 }
 
 /// The identifier bound by `Some(x)` / `Ok(x)` / `Some(mut x)`.
@@ -705,6 +828,15 @@ fn type_name_inner(
             }
             "scoped_type_identifier" => n = n.child_by_field_name("name")?,
             "reference_type" => n = n.child_by_field_name("type")?,
+            // `dyn Store` / `impl Store`: methods are the trait's.
+            "dynamic_type" | "abstract_type" => n = n.child_by_field_name("trait")?,
+            // `dyn Store + Send`: the first bound that is not a marker.
+            "bounded_type" => {
+                let mut c = n.walk();
+                n = n
+                    .named_children(&mut c)
+                    .find(|b| !is_marker_bound(b, source))?;
+            }
             "generic_type" => {
                 let outer = n.child_by_field_name("type")?;
                 let outer_text = outer.utf8_text(source.as_bytes()).ok()?;
@@ -742,6 +874,9 @@ pub(super) fn collect_struct_fields(
                 .and_then(|x| x.utf8_text(source.as_bytes()).ok());
             let body = n.child_by_field_name("body");
             if let (Some(name), Some(body)) = (name, body) {
+                // `struct Svc<S: Store> { store: S }` → `store: Store`.
+                let mut bounds = HashMap::new();
+                generic_bounds(n, source, &mut bounds);
                 let mut fields = HashMap::new();
                 let mut c = body.walk();
                 for f in body.named_children(&mut c) {
@@ -753,7 +888,8 @@ pub(super) fn collect_struct_fields(
                         .and_then(|x| x.utf8_text(source.as_bytes()).ok());
                     let fty = f
                         .child_by_field_name("type")
-                        .and_then(|t| type_name(t, source, Some(name)));
+                        .and_then(|t| type_name(t, source, Some(name)))
+                        .map(|t| bounds.get(&t).cloned().unwrap_or(t));
                     if let (Some(fname), Some(fty)) = (fname, fty) {
                         fields.insert(fname.to_owned(), fty);
                     }

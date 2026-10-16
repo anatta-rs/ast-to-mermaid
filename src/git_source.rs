@@ -372,6 +372,25 @@ impl Drop for BatchReader {
     }
 }
 
+/// Number of files under `dir` that git tracks, `0` when `dir` is not in
+/// a work tree or git is unavailable.
+///
+/// a2m's cache is disposable — it is wiped on a version change and pruned
+/// by GC — so a cache committed to the repository would have its tracked
+/// files deleted by an ordinary run. [`crate::cache::Cache::open`] asks
+/// this first and refuses.
+#[must_use]
+pub fn tracked_files_under(dir: &Path) -> usize {
+    match run_git(dir, &["ls-files", "-z", "--", "."]) {
+        Ok(out) if out.status.success() => out
+            .stdout
+            .split(|b| *b == 0)
+            .filter(|p| !p.is_empty())
+            .count(),
+        _ => 0,
+    }
+}
+
 fn run_git(cwd: &Path, args: &[&str]) -> Result<std::process::Output> {
     let mut cmd = Command::new("git");
     cmd.arg("-C")

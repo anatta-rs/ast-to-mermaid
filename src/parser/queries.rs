@@ -16,6 +16,8 @@ pub(super) struct RustQueries {
     pub items: Query,
     /// Methods inside `impl` blocks.
     pub impl_methods: Query,
+    /// Required and provided methods of a `trait`.
+    pub trait_methods: Query,
     /// Call sites inside a function body.
     pub calls: Query,
     /// `use` declarations anywhere in the file (including nested mods).
@@ -56,6 +58,8 @@ pub(super) static RUST: LazyLock<RustQueries> = LazyLock::new(|| {
             .expect("queries/rust/items.scm must compile"),
         impl_methods: Query::new(&lang, include_str!("queries/rust/impl_methods.scm"))
             .expect("queries/rust/impl_methods.scm must compile"),
+        trait_methods: Query::new(&lang, include_str!("queries/rust/trait_methods.scm"))
+            .expect("queries/rust/trait_methods.scm must compile"),
         calls: Query::new(&lang, include_str!("queries/rust/calls.scm"))
             .expect("queries/rust/calls.scm must compile"),
         uses: Query::new(&lang, include_str!("queries/rust/uses.scm"))

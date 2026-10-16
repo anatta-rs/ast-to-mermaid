@@ -427,6 +427,14 @@ impl CodeParser {
                         impl_owner_type(&item_name),
                         &queries::RUST.impl_methods,
                     )),
+                    // A trait owns its declared methods the way a type owns
+                    // its impl's: `dyn Store` / `S: Store` receivers resolve
+                    // to `Store::get`.
+                    (Language::Rust, "trait_item") => Some((
+                        item_name.as_str(),
+                        item_name.as_str(),
+                        &queries::RUST.trait_methods,
+                    )),
                     (Language::Python, "class_definition") => Some((
                         item_name.as_str(),
                         item_name.as_str(),
