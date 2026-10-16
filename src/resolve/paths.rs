@@ -328,7 +328,10 @@ mod tests {
         };
         assert_eq!(mods.lookup("", "", "run_x", &defines), vec![7]);
         assert_eq!(mods.lookup("", "cli", "run_x", &defines), vec![7]);
-        assert!(mods.lookup("", "cli", "other", &defines).is_empty());
+        assert_eq!(
+            mods.lookup("", "cli", "other", &defines),
+            Vec::<usize>::new()
+        );
     }
 
     #[test]

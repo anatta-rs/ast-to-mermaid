@@ -670,7 +670,7 @@ mod tests {
     fn bare_call_without_import_is_left_alone() {
         let c = calls_of("void f() { helper(); }\n");
         assert_eq!(names(&c.calls), vec!["helper".to_owned()]);
-        assert!(c.method_calls.is_empty());
+        assert_eq!(c.method_calls, vec![]);
     }
 
     /// `show`n symbols rewrite into the `module::symbol` shape the

@@ -435,7 +435,7 @@ mod tests {
             "static",
             "macro",
         ] {
-            assert!(!short_kind(k).is_empty());
+            assert_ne!(short_kind(k), "");
         }
         assert_eq!(short_kind("unknown"), "?");
     }

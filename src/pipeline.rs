@@ -863,7 +863,7 @@ mod tests {
         let tmp = tempdir().expect("tmp");
         let path = tmp.path().join("does-not-exist");
         let files = walk_for_languages(&path).expect("walk silent");
-        assert!(files.is_empty());
+        assert_eq!(files, vec![]);
     }
 
     #[test]

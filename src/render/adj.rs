@@ -277,8 +277,17 @@ mod tests {
     #[test]
     fn unknown_id_returns_empty_slice() {
         let adj = AdjMaps::default();
-        assert!(adj.callees(&EntityId::new("missing")).is_empty());
-        assert!(adj.callers(&EntityId::new("missing")).is_empty());
-        assert!(adj.children(&EntityId::new("missing")).is_empty());
+        assert_eq!(
+            adj.callees(&EntityId::new("missing")),
+            &[] as &[Arc<EntityId>]
+        );
+        assert_eq!(
+            adj.callers(&EntityId::new("missing")),
+            &[] as &[Arc<EntityId>]
+        );
+        assert_eq!(
+            adj.children(&EntityId::new("missing")),
+            &[] as &[Arc<EntityId>]
+        );
     }
 }

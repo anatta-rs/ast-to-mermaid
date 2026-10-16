@@ -765,7 +765,7 @@ mod tests {
         let artifacts = emit_artifacts(&store, "/src");
 
         // overview must be non-empty
-        assert!(!artifacts.overview_mmd.is_empty());
+        assert_ne!(artifacts.overview_mmd, "");
 
         // 3 entities
         assert_eq!(artifacts.entities.len(), 3);

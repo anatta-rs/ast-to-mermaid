@@ -553,7 +553,7 @@ mod tests {
     #[test]
     fn empty_function_yields_no_steps() {
         let d = extract_ok("fn empty() {}\n", "empty");
-        assert!(d.steps.is_empty());
+        assert_eq!(d.steps, vec![]);
         assert!(d.title.contains("empty"));
     }
 
