@@ -30,12 +30,24 @@ pub(super) struct PyImports {
     /// `import m` / `import m as x` / `from . import sub` → local alias →
     /// module last component. Rewrites `x.fn()` → `last::fn`.
     pub modules: HashMap<String, String>,
+    /// Modules the file imports, as written: `lib.catalog`, `.mod`,
+    /// `..pkg.mod`. A `from m import name` records both `m.name` (in case
+    /// `name` is a submodule) and `m`; the resolver keeps whichever
+    /// exists.
+    pub targets: Vec<String>,
+    /// Attribute types of the classes this file declares: class → attr →
+    /// type, from `self.x = Cls(..)` and class-level `x: Cls`. Types
+    /// `self.x.method()`.
+    pub fields: HashMap<String, HashMap<String, String>>,
 }
 
 /// Walk every `import` / `from … import …` statement reachable from `root`
 /// and build the [`PyImports`] rewrite maps.
 pub(super) fn extract_imports(root: Node, source: &str) -> PyImports {
-    let mut out = PyImports::default();
+    let mut out = PyImports {
+        fields: collect_class_fields(root, source),
+        ..PyImports::default()
+    };
     let mut cursor = QueryCursor::new();
     let mut matches = cursor.matches(&queries::PYTHON.imports, root, source.as_bytes());
     while let Some(m) = matches.next() {
@@ -55,6 +67,20 @@ pub(super) fn extract_imports(root: Node, source: &str) -> PyImports {
 /// name is the head (`a`) but the module is the leaf, which we can't map
 /// unambiguously; aliasing or `from` covers the common case.
 fn handle_import(node: &Node, source: &str, out: &mut PyImports) {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        let dotted = match child.kind() {
+            "aliased_import" => child.child_by_field_name("name"),
+            "dotted_name" => Some(child),
+            _ => None,
+        };
+        if let Some(d) = dotted {
+            let full = dotted_segments(&d, source).join(".");
+            if !full.is_empty() && !out.targets.contains(&full) {
+                out.targets.push(full);
+            }
+        }
+    }
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         match child.kind() {
@@ -87,6 +113,39 @@ fn handle_from_import(node: &Node, source: &str, out: &mut PyImports) {
     let module_last = node
         .child_by_field_name("module_name")
         .and_then(|m| module_name_last(&m, source));
+    // The module as written, dots included (`..pkg.mod`): the source of
+    // the file-level `Imports` edge.
+    let module_full: Option<String> = node
+        .child_by_field_name("module_name")
+        .and_then(|m| m.utf8_text(source.as_bytes()).ok())
+        .map(|t| t.chars().filter(|c| !c.is_whitespace()).collect());
+    if let Some(full) = &module_full {
+        let mut cursor = node.walk();
+        let mut seen_import_kw = false;
+        for child in node.children(&mut cursor) {
+            if child.kind() == "import" {
+                seen_import_kw = true;
+                continue;
+            }
+            let name = match child.kind() {
+                "dotted_name" if seen_import_kw => dotted_last(&child, source),
+                "aliased_import" if seen_import_kw => child
+                    .child_by_field_name("name")
+                    .and_then(|n| dotted_last(&n, source)),
+                _ => None,
+            };
+            if let Some(name) = name {
+                let sep = if full.ends_with('.') { "" } else { "." };
+                let sub = format!("{full}{sep}{name}");
+                if !out.targets.contains(&sub) {
+                    out.targets.push(sub);
+                }
+            }
+        }
+        if !out.targets.contains(full) {
+            out.targets.push(full.clone());
+        }
+    }
 
     let mut cursor = node.walk();
     // Imported names are the `name`-field children (dotted_name /
@@ -224,9 +283,11 @@ pub(super) fn extract_calls(
     node: &Node,
     source: &str,
     imports: &PyImports,
+    self_type: Option<&str>,
     out: &mut ExtractedCalls,
 ) {
     let query = &queries::PYTHON.calls;
+    let locals = local_types(*node, source, imports);
     let mut cursor = QueryCursor::new();
     let bytes = source.as_bytes();
     let mut matches = cursor.matches(query, *node, bytes);
@@ -247,6 +308,16 @@ pub(super) fn extract_calls(
                     let Some((root, method)) = attribute_root_method(&cap.node, source) else {
                         continue;
                     };
+                    if let Some(owner) =
+                        receiver_type(&cap.node, source, &locals, imports, self_type)
+                    {
+                        out.push_typed_call(
+                            format!("{owner}::{method}"),
+                            &cap.node,
+                            Language::Python,
+                        );
+                        continue;
+                    }
                     let Some(root) = root else {
                         // Receiver is not a name (a chained call, a
                         // subscript): the owner is unknowable, but the
@@ -271,6 +342,265 @@ pub(super) fn extract_calls(
             }
         }
     }
+}
+
+/// Class a callee `recv.method`'s direct receiver is an instance of:
+/// `self` → the enclosing class; a name → its annotated / constructed
+/// type; `self.x` → the attribute's type on the enclosing class.
+fn receiver_type(
+    callee: &Node,
+    source: &str,
+    locals: &HashMap<String, Option<String>>,
+    imports: &PyImports,
+    self_type: Option<&str>,
+) -> Option<String> {
+    let recv = callee.child_by_field_name("object")?;
+    match recv.kind() {
+        "identifier" => {
+            let name = node_text(&recv, source)?;
+            if name == "self" {
+                return self_type.map(str::to_owned);
+            }
+            locals.get(name)?.clone()
+        }
+        "attribute" => {
+            let base = recv.child_by_field_name("object")?;
+            if node_text(&base, source)? != "self" {
+                return None;
+            }
+            let attr = node_text(&recv.child_by_field_name("attribute")?, source)?;
+            imports.fields.get(self_type?)?.get(attr).cloned()
+        }
+        _ => None,
+    }
+}
+
+/// Name → class for every binding in `body` whose class is spelled out:
+/// annotated parameters, `x: Cls`, `x = Cls(..)`. A name seen with two
+/// classes maps to `None` (see the Rust twin, `rust::local_types`).
+fn local_types(body: Node, source: &str, imports: &PyImports) -> HashMap<String, Option<String>> {
+    let mut out: HashMap<String, Option<String>> = HashMap::new();
+    let mut record = |name: &str, ty: Option<String>| {
+        let Some(ty) = ty else { return };
+        out.entry(name.to_owned())
+            .and_modify(|e| {
+                if e.as_deref() != Some(ty.as_str()) {
+                    *e = None;
+                }
+            })
+            .or_insert(Some(ty));
+    };
+    let mut stack = vec![body];
+    let mut visited = 0usize;
+    while let Some(n) = stack.pop() {
+        visited += 1;
+        if visited > 200_000 {
+            break;
+        }
+        match n.kind() {
+            "typed_parameter" => {
+                let name = {
+                    let mut c = n.walk();
+                    n.named_children(&mut c)
+                        .find(|x| x.kind() == "identifier")
+                        .and_then(|x| node_text(&x, source))
+                };
+                if let (Some(name), Some(ty)) = (name, n.child_by_field_name("type")) {
+                    record(name, annotation_class(&ty, source));
+                }
+            }
+            "typed_default_parameter" => {
+                let name = n
+                    .child_by_field_name("name")
+                    .and_then(|x| node_text(&x, source));
+                if let (Some(name), Some(ty)) = (name, n.child_by_field_name("type")) {
+                    record(name, annotation_class(&ty, source));
+                }
+            }
+            "assignment" => {
+                let left = n.child_by_field_name("left");
+                if let Some(left) = left.filter(|l| l.kind() == "identifier")
+                    && let Some(name) = node_text(&left, source)
+                {
+                    let ty = match n.child_by_field_name("type") {
+                        Some(t) => annotation_class(&t, source),
+                        None => n
+                            .child_by_field_name("right")
+                            .and_then(|r| constructed_class(&r, source, imports)),
+                    };
+                    record(name, ty);
+                }
+            }
+            _ => {}
+        }
+        let mut c = n.walk();
+        for child in n.children(&mut c) {
+            stack.push(child);
+        }
+    }
+    out
+}
+
+/// Class named by an annotation, when it is a plain (possibly dotted)
+/// capitalised name: `Cls`, `mod.Cls`, `"Cls"` is not followed.
+fn annotation_class(ty: &Node, source: &str) -> Option<String> {
+    let mut c = ty.walk();
+    let inner = if ty.kind() == "type" {
+        ty.named_children(&mut c).next()?
+    } else {
+        *ty
+    };
+    let name = match inner.kind() {
+        "identifier" => node_text(&inner, source)?,
+        "attribute" => node_text(&inner.child_by_field_name("attribute")?, source)?,
+        _ => return None,
+    };
+    capitalised(name)
+}
+
+/// Class instantiated by `Cls(..)` / `mod.Cls(..)`.
+fn constructed_class(value: &Node, source: &str, imports: &PyImports) -> Option<String> {
+    if value.kind() != "call" {
+        return None;
+    }
+    let func = value.child_by_field_name("function")?;
+    let name = match func.kind() {
+        "identifier" => {
+            let n = node_text(&func, source)?;
+            // `from m import Cls as Alias` → the class is `Cls`.
+            imports
+                .symbols
+                .get(n)
+                .and_then(|q| q.rsplit("::").next())
+                .unwrap_or(n)
+        }
+        "attribute" => node_text(&func.child_by_field_name("attribute")?, source)?,
+        _ => return None,
+    };
+    capitalised(name)
+}
+
+fn capitalised(name: &str) -> Option<String> {
+    name.chars()
+        .next()
+        .is_some_and(char::is_uppercase)
+        .then(|| name.to_owned())
+}
+
+/// Attribute types of every class in the file: `self.x = Cls(..)` in any
+/// method, and class-level `x: Cls`.
+fn collect_class_fields(root: Node, source: &str) -> HashMap<String, HashMap<String, String>> {
+    let empty = PyImports::default();
+    let mut out: HashMap<String, HashMap<String, String>> = HashMap::new();
+    let mut stack = vec![root];
+    let mut visited = 0usize;
+    while let Some(n) = stack.pop() {
+        visited += 1;
+        if visited > 200_000 {
+            break;
+        }
+        if n.kind() == "class_definition"
+            && let Some(class) = n
+                .child_by_field_name("name")
+                .and_then(|x| node_text(&x, source))
+            && let Some(body) = n.child_by_field_name("body")
+        {
+            let fields = out.entry(class.to_owned()).or_default();
+            let mut inner = vec![body];
+            while let Some(m) = inner.pop() {
+                if m.kind() == "class_definition" {
+                    continue;
+                }
+                if m.kind() == "assignment"
+                    && let Some(left) = m.child_by_field_name("left")
+                {
+                    let attr = match left.kind() {
+                        "attribute" => left
+                            .child_by_field_name("object")
+                            .and_then(|o| node_text(&o, source))
+                            .filter(|o| *o == "self")
+                            .and_then(|_| left.child_by_field_name("attribute"))
+                            .and_then(|a| node_text(&a, source)),
+                        // Class-level `x: Cls` — only meaningful annotated.
+                        "identifier" if m.child_by_field_name("type").is_some() => {
+                            node_text(&left, source)
+                        }
+                        _ => None,
+                    };
+                    let ty = match m.child_by_field_name("type") {
+                        Some(t) => annotation_class(&t, source),
+                        None => m
+                            .child_by_field_name("right")
+                            .and_then(|r| constructed_class(&r, source, &empty)),
+                    };
+                    if let (Some(attr), Some(ty)) = (attr, ty) {
+                        fields.insert(attr.to_owned(), ty);
+                    }
+                }
+                let mut c = m.walk();
+                for child in m.children(&mut c) {
+                    inner.push(child);
+                }
+            }
+        }
+        let mut c = n.walk();
+        for child in n.children(&mut c) {
+            stack.push(child);
+        }
+    }
+    out
+}
+
+/// Classes named in a function's parameter and return annotations, or in
+/// a class' annotated attributes.
+pub(super) fn type_refs(item: Node, source: &str) -> Vec<String> {
+    let mut roots: Vec<Node> = Vec::new();
+    match item.kind() {
+        "function_definition" => {
+            roots.extend(item.child_by_field_name("parameters"));
+            roots.extend(item.child_by_field_name("return_type"));
+        }
+        "class_definition" => {
+            if let Some(body) = item.child_by_field_name("body") {
+                let mut c = body.walk();
+                for stmt in body.named_children(&mut c) {
+                    let mut c2 = stmt.walk();
+                    roots.extend(
+                        stmt.named_children(&mut c2)
+                            .filter(|a| a.kind() == "assignment")
+                            .filter_map(|a| a.child_by_field_name("type")),
+                    );
+                }
+            }
+        }
+        _ => {}
+    }
+    let mut out: Vec<String> = Vec::new();
+    let mut stack: Vec<(Node, bool)> = roots.into_iter().map(|r| (r, r.kind() == "type")).collect();
+    let mut visited = 0usize;
+    while let Some((n, in_type)) = stack.pop() {
+        visited += 1;
+        if visited > 10_000 {
+            break;
+        }
+        let in_type = in_type || n.kind() == "type";
+        if in_type
+            && n.kind() == "identifier"
+            && let Some(name) = node_text(&n, source).and_then(capitalised)
+            && !out.contains(&name)
+        {
+            out.push(name);
+        }
+        // Default values are expressions, not annotations.
+        if n.kind() == "default_parameter" {
+            continue;
+        }
+        let mut c = n.walk();
+        for child in n.children(&mut c) {
+            stack.push((child, in_type));
+        }
+    }
+    out
 }
 
 /// From an `attribute` callee (`obj.method`, `a.b.method`,
@@ -331,7 +661,7 @@ mod tests {
     fn calls_of(src: &str, imports: &PyImports) -> ExtractedCalls {
         let tree = parse(src);
         let mut out = ExtractedCalls::default();
-        extract_calls(&tree.root_node(), src, imports, &mut out);
+        extract_calls(&tree.root_node(), src, imports, None, &mut out);
         out
     }
 

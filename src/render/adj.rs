@@ -20,8 +20,8 @@ use crate::model::{EdgeKind, EntityId};
 use std::collections::HashMap;
 use std::sync::Arc;
 
-/// Forward + reverse adjacency for the four edge kinds the renderers care
-/// about (`Calls`, `Contains`, `Uses`, `Implements`).
+/// Forward + reverse adjacency for every edge kind (`Calls`, `Contains`,
+/// `Uses`, `Implements`, `Imports`).
 ///
 /// Lookups take `&EntityId`; the underlying maps are keyed by
 /// `Arc<EntityId>` and yield `&[Arc<EntityId>]` slices.
@@ -39,10 +39,12 @@ pub struct AdjMaps {
     uses_in: HashMap<Arc<EntityId>, Vec<Arc<EntityId>>>,
     implements_out: HashMap<Arc<EntityId>, Vec<Arc<EntityId>>>,
     implements_in: HashMap<Arc<EntityId>, Vec<Arc<EntityId>>>,
+    imports_out: HashMap<Arc<EntityId>, Vec<Arc<EntityId>>>,
+    imports_in: HashMap<Arc<EntityId>, Vec<Arc<EntityId>>>,
 }
 
 impl AdjMaps {
-    /// Build all seven adjacency buckets in a single sweep over `store`'s
+    /// Build every adjacency bucket in a single sweep over `store`'s
     /// edge slice.
     ///
     /// Pre-interns every atom id into an `Arc` so the edge sweep mostly hits
@@ -97,6 +99,13 @@ impl AdjMaps {
                             .or_default()
                             .push(Arc::clone(&to));
                         maps.implements_in.entry(to).or_default().push(from);
+                    }
+                    EdgeKind::Imports => {
+                        maps.imports_out
+                            .entry(Arc::clone(&from))
+                            .or_default()
+                            .push(Arc::clone(&to));
+                        maps.imports_in.entry(to).or_default().push(from);
                     }
                 }
             }
@@ -168,6 +177,18 @@ impl AdjMaps {
     pub fn implements_in(&self, id: &EntityId) -> &[Arc<EntityId>] {
         self.implements_in.get(id).map_or(&[], Vec::as_slice)
     }
+
+    /// Forward `Imports`: modules imported by module `id`.
+    #[must_use]
+    pub fn imports_out(&self, id: &EntityId) -> &[Arc<EntityId>] {
+        self.imports_out.get(id).map_or(&[], Vec::as_slice)
+    }
+
+    /// Reverse `Imports`: modules that import module `id`.
+    #[must_use]
+    pub fn imports_in(&self, id: &EntityId) -> &[Arc<EntityId>] {
+        self.imports_in.get(id).map_or(&[], Vec::as_slice)
+    }
 }
 
 #[cfg(test)]
@@ -189,6 +210,7 @@ mod tests {
             calls: Vec::new(),
             method_calls: Vec::new(),
             parent: None,
+            refs: crate::model::AtomRefs::default(),
         }
     }
 
@@ -255,8 +277,17 @@ mod tests {
     #[test]
     fn unknown_id_returns_empty_slice() {
         let adj = AdjMaps::default();
-        assert!(adj.callees(&EntityId::new("missing")).is_empty());
-        assert!(adj.callers(&EntityId::new("missing")).is_empty());
-        assert!(adj.children(&EntityId::new("missing")).is_empty());
+        assert_eq!(
+            adj.callees(&EntityId::new("missing")),
+            &[] as &[Arc<EntityId>]
+        );
+        assert_eq!(
+            adj.callers(&EntityId::new("missing")),
+            &[] as &[Arc<EntityId>]
+        );
+        assert_eq!(
+            adj.children(&EntityId::new("missing")),
+            &[] as &[Arc<EntityId>]
+        );
     }
 }

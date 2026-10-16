@@ -35,8 +35,14 @@
 //!
 //! Returns the number of new edges added.
 
+mod paths;
+mod refs;
+
+pub use refs::{resolve_import_edges, resolve_type_refs};
+
 use crate::graph::Store;
-use crate::model::{CodeAtom, Edge, EdgeKind, EntityId};
+use crate::model::{AtomRefs, CodeAtom, Edge, EdgeKind, EntityId, ReExport, call_flags};
+use paths::RustModules;
 use std::collections::{HashMap, HashSet};
 
 /// Atom kind used for synthetic atoms representing calls into external
@@ -132,6 +138,16 @@ pub const SKIP_CALLS: &[&str] = &[
     "isinstance",
 ];
 
+/// Run every resolver pass — calls, trait impls, imports, type uses —
+/// and return the number of edges added. Calls run first: they are the
+/// only pass that adds atoms (externs).
+pub fn resolve_all(store: &Store) -> usize {
+    resolve_cross_module_calls(store)
+        + resolve_implements_edges(store)
+        + resolve_import_edges(store)
+        + resolve_type_refs(store)
+}
+
 /// Walk the store, resolve cross-module calls, and add `calls` edges.
 ///
 /// Returns the number of new edges emitted.
@@ -180,25 +196,7 @@ pub fn resolve_cross_module_calls(store: &Store) -> usize {
             .map(|(i, a)| (&a.id, i))
             .collect();
 
-        // Two indices: free fns by name (`parent == None`) and methods by
-        // `(parent, name)`. Splitting them is what makes bare-name calls
-        // (`obj.method()`) refuse to bind to lifted methods of unrelated
-        // types — the central fix this module exists to enforce. Keys are
-        // `&str` borrowed from the atoms — no `String` allocation here.
-        let mut free_fns_by_name: HashMap<&str, Vec<usize>> = HashMap::new();
-        let mut methods_by_owner_name: HashMap<(&str, &str), Vec<usize>> = HashMap::new();
-        for (idx, atom) in functions.iter().enumerate() {
-            match &atom.parent {
-                None => free_fns_by_name
-                    .entry(atom.name.as_str())
-                    .or_default()
-                    .push(idx),
-                Some(owner) => methods_by_owner_name
-                    .entry((owner.as_str(), atom.name.as_str()))
-                    .or_default()
-                    .push(idx),
-            }
-        }
+        let index = Index::build(atoms, &functions);
 
         // Translate the existing-edges snapshot. Function-to-function
         // pairs become `(usize, usize)` for the hot-path lookup; edges
@@ -232,20 +230,23 @@ pub fn resolve_cross_module_calls(store: &Store) -> usize {
 
             for site in &caller.calls {
                 let (path_prefix, fn_name) = split_call_name(&site.name);
-                if skip_set.contains(fn_name) {
+                // Stdlib-shaped names (`new`, `get`, `insert`, …) are noise
+                // when nothing says whose they are — but `Store::get` with
+                // `Store` an in-graph type is a precise, wanted edge.
+                if skip_set.contains(fn_name) && !index.owner_has_method(path_prefix, fn_name) {
                     continue;
                 }
 
-                let pick = pick_target(
-                    fn_name,
-                    path_prefix,
-                    caller_idx,
-                    caller_crate.as_deref(),
-                    caller_lang,
-                    &functions,
-                    &free_fns_by_name,
-                    &methods_by_owner_name,
+                let pick = index.pick_target(
+                    &Query {
+                        fn_name,
+                        path_prefix,
+                        caller_idx,
+                        caller_crate: caller_crate.as_deref(),
+                        caller_lang,
+                    },
                     &existing_fn,
+                    0,
                 );
 
                 if let Some(target_idx) = pick.target {
@@ -262,8 +263,12 @@ pub fn resolve_cross_module_calls(store: &Store) -> usize {
                         staged_edges.push((key.0, key.1, vec![site.rank]));
                     }
                 } else if !pick.suppress_extern
+                    // A receiver typed by the parser names a type, not a
+                    // dependency: `Vec::push` earns no node.
+                    && !site.has(call_flags::TYPED_RECEIVER)
                     && let Some(prefix) = path_prefix.filter(|p| is_external_qualifier(p))
-                    && !is_unknown_dart_type(caller_lang, prefix, &methods_by_owner_name)
+                    && !index.names_local_type(prefix)
+                    && !is_unknown_dart_type(caller_lang, prefix, &index.methods_by_owner_name)
                 {
                     let extern_id = EntityId::new(format!("extern:{prefix}::{fn_name}"));
                     if existing_extern.contains(&(caller.id.clone(), extern_id.clone())) {
@@ -290,6 +295,7 @@ pub fn resolve_cross_module_calls(store: &Store) -> usize {
                             calls: Vec::new(),
                             method_calls: Vec::new(),
                             parent: None,
+                            refs: AtomRefs::default(),
                         });
                     }
                     staged_idx.insert((caller.id.clone(), extern_id.clone()), staged_edges.len());
@@ -344,134 +350,314 @@ impl Pick {
     }
 }
 
-/// Pick the local-atom index that a call should resolve to, given the call
-/// name's qualifier prefix and the available candidates.
-#[allow(clippy::too_many_arguments)]
-fn pick_target(
-    fn_name: &str,
-    path_prefix: Option<&str>,
+/// One call to resolve: what [`Index::pick_target`] needs to know about
+/// the site and its caller.
+struct Query<'q> {
+    fn_name: &'q str,
+    path_prefix: Option<&'q str>,
     caller_idx: usize,
-    caller_crate: Option<&str>,
-    caller_lang: &str,
-    functions: &[&CodeAtom],
-    free_fns_by_name: &HashMap<&str, Vec<usize>>,
-    methods_by_owner_name: &HashMap<(&str, &str), Vec<usize>>,
-    existing: &HashSet<(usize, usize)>,
-) -> Pick {
-    let filter_viable = |cands: &[usize]| -> Vec<usize> {
-        cands
+    caller_crate: Option<&'q str>,
+    caller_lang: &'q str,
+}
+
+/// Lookup tables over the function atoms, built once per resolve pass.
+struct Index<'a> {
+    functions: &'a [&'a CodeAtom],
+    /// Free functions (`parent == None`) by name.
+    free_fns_by_name: HashMap<&'a str, Vec<usize>>,
+    /// Methods by `(owner, name)`, the owner's generics dropped
+    /// (`Store<T>` → `Store`) since call sites never spell them.
+    ///
+    /// Splitting free fns from methods is what makes bare-name calls
+    /// (`obj.method()`) refuse to bind to lifted methods of unrelated
+    /// types — the central fix this module exists to enforce.
+    methods_by_owner_name: HashMap<(&'a str, &'a str), Vec<usize>>,
+    /// Free functions by `(file, name)`: what a module defines.
+    free_fns_by_file: HashMap<(&'a str, &'a str), Vec<usize>>,
+    /// Rust module tree, for exact `crate::a::b::f` resolution.
+    rust_mods: RustModules<'a>,
+    /// Re-exports of Python packages (`__init__.py`), by package name.
+    py_reexports: HashMap<&'a str, Vec<&'a ReExport>>,
+    /// Names of the types the graph defines (struct, enum, trait, …).
+    /// `Imports::Rust(..)` on a local enum is a variant, not a call into
+    /// a crate named `Imports`.
+    local_types: HashSet<&'a str>,
+}
+
+impl<'a> Index<'a> {
+    fn build(atoms: &'a [CodeAtom], functions: &'a [&'a CodeAtom]) -> Self {
+        let mut free_fns_by_name: HashMap<&str, Vec<usize>> = HashMap::new();
+        let mut methods_by_owner_name: HashMap<(&str, &str), Vec<usize>> = HashMap::new();
+        let mut free_fns_by_file: HashMap<(&str, &str), Vec<usize>> = HashMap::new();
+        for (idx, atom) in functions.iter().enumerate() {
+            match &atom.parent {
+                None => {
+                    free_fns_by_name
+                        .entry(atom.name.as_str())
+                        .or_default()
+                        .push(idx);
+                    free_fns_by_file
+                        .entry((atom.file_path.as_str(), atom.name.as_str()))
+                        .or_default()
+                        .push(idx);
+                }
+                Some(owner) => methods_by_owner_name
+                    .entry((strip_generics(owner), atom.name.as_str()))
+                    .or_default()
+                    .push(idx),
+            }
+        }
+        let modules: Vec<&CodeAtom> = atoms.iter().filter(|a| a.kind == "module").collect();
+        let rust_mods = RustModules::build(&modules);
+        let mut py_reexports: HashMap<&str, Vec<&ReExport>> = HashMap::new();
+        for m in &modules {
+            if lang_of(&m.file_path) == "py" && !m.refs.reexports.is_empty() {
+                py_reexports
+                    .entry(file_module_name(&m.file_path))
+                    .or_default()
+                    .extend(m.refs.reexports.iter());
+            }
+        }
+        let local_types = atoms
             .iter()
-            .copied()
-            .filter(|&idx| {
-                // Cross-language filtering: a Python caller can never
-                // resolve to a Rust target by bare-name match (or vice
-                // versa). They share neither namespace nor linkage —
-                // any same-name hit is a coincidence.
-                //
-                // The existing-edge check is a `(usize, usize)` slot
-                // pair lookup — no `EntityId` clone per candidate.
-                idx != caller_idx
-                    && lang_of(&functions[idx].file_path) == caller_lang
-                    && !existing.contains(&(caller_idx, idx))
+            .filter(|a| {
+                matches!(
+                    a.kind.as_str(),
+                    "struct" | "enum" | "trait" | "type_alias" | "class" | "union"
+                )
             })
-            .collect()
-    };
-    // "Does this name already have a candidate inside the caller's own
-    // file?" — when yes, the call is local by construction and the
-    // resolver must not bind it to a same-named atom in another file.
-    // Two distinct shapes hit this:
-    //   1. The parser's intra-file linker has already linked
-    //      caller → local_target (covers `find_atom` / `l2_sq` / …
-    //      twins).
-    //   2. The bare call is recursive (`fn build_recursive() { …
-    //      build_recursive(); }`) — the intra-file linker filters out
-    //      self-calls, so no `existing` edge would catch it; the
-    //      same-file candidate suffices.
-    let caller_file = functions[caller_idx].file_path.as_str();
-    let same_file_candidate_exists = |cands: &[usize]| -> bool {
-        cands
-            .iter()
-            .any(|&idx| functions[idx].file_path == caller_file)
-    };
-
-    // A qualifier whose final segment is an in-crate path root
-    // (`Self`, `crate`, `self`, `super`) refers to code the parser's
-    // intra-impl / intra-file pass already had a chance to link. It
-    // must NOT fall through to bare-name resolution: a `Self::method`
-    // whose target the intra-impl pass missed (e.g. inherent methods
-    // declared in another file) is better left unresolved than ghost-
-    // bound to an unrelated free fn of the same name. Multi-segment
-    // paths like `crate::render::render` keep their own resolution
-    // path below — only the bare in-crate root is rejected here.
-    if let Some(last) = path_prefix.and_then(|q| q.rsplit("::").next())
-        && matches!(last, "crate" | "self" | "super" | "Self")
-    {
-        return Pick::unresolved();
+            .map(|a| a.name.as_str())
+            .collect();
+        Self {
+            functions,
+            free_fns_by_name,
+            methods_by_owner_name,
+            free_fns_by_file,
+            rust_mods,
+            py_reexports,
+            local_types,
+        }
     }
 
-    if let Some(last_seg) = path_prefix
-        .and_then(|q| q.rsplit("::").next())
-        .filter(|m| !m.is_empty())
-    {
-        // 1) Try the method index — the qualifier may be a type/class
-        //    name (e.g. `DaemonHandle::send`).
-        if let Some(cands) = methods_by_owner_name.get(&(last_seg, fn_name)) {
-            let viable = filter_viable(cands);
-            if let Some(idx) = pick_unique_with_same_crate_pref(&viable, caller_crate, functions) {
-                return Pick::resolved(idx);
-            }
-            if !viable.is_empty() {
-                // Methods matched but ambiguous: type is in-graph, do not
-                // silently pick one *and* do not invent an extern.
-                return Pick::ambiguous();
+    /// Whether the qualifier's last segment is an in-graph type owning a
+    /// method `fn_name`.
+    fn owner_has_method(&self, path_prefix: Option<&str>, fn_name: &str) -> bool {
+        path_prefix
+            .and_then(|q| q.rsplit("::").next())
+            .is_some_and(|owner| {
+                self.methods_by_owner_name
+                    .contains_key(&(strip_generics(owner), fn_name))
+            })
+    }
+
+    /// Whether the qualifier's last segment is a type this graph defines
+    /// (`Imports` in `Imports::Rust(..)`, `crate::model::EdgeKind`): such
+    /// a call is a variant or an associated item of local code, never a
+    /// dependency on an external crate.
+    fn names_local_type(&self, prefix: &str) -> bool {
+        let last = prefix.rsplit("::").next().unwrap_or(prefix);
+        self.local_types.contains(strip_generics(last))
+    }
+
+    /// Pick the local-atom index that a call should resolve to, given the
+    /// call name's qualifier prefix and the available candidates.
+    #[allow(clippy::too_many_lines)]
+    fn pick_target(&self, q: &Query, existing: &HashSet<(usize, usize)>, hops: u8) -> Pick {
+        let functions = self.functions;
+        let Query {
+            fn_name,
+            path_prefix,
+            caller_idx,
+            caller_crate,
+            caller_lang,
+        } = *q;
+        let filter_viable = |cands: &[usize]| -> Vec<usize> {
+            cands
+                .iter()
+                .copied()
+                .filter(|&idx| {
+                    // Cross-language filtering: a Python caller can never
+                    // resolve to a Rust target by bare-name match (or vice
+                    // versa). They share neither namespace nor linkage —
+                    // any same-name hit is a coincidence.
+                    //
+                    // The existing-edge check is a `(usize, usize)` slot
+                    // pair lookup — no `EntityId` clone per candidate.
+                    idx != caller_idx
+                        && lang_of(&functions[idx].file_path) == caller_lang
+                        && !existing.contains(&(caller_idx, idx))
+                })
+                .collect()
+        };
+        // "Does this name already have a candidate inside the caller's own
+        // file?" — when yes, the call is local by construction and the
+        // resolver must not bind it to a same-named atom in another file.
+        // Two distinct shapes hit this:
+        //   1. The parser's intra-file linker has already linked
+        //      caller → local_target (covers `find_atom` / `l2_sq` / …
+        //      twins).
+        //   2. The bare call is recursive (`fn build_recursive() { …
+        //      build_recursive(); }`) — the intra-file linker filters out
+        //      self-calls, so no `existing` edge would catch it; the
+        //      same-file candidate suffices.
+        let caller_file = functions[caller_idx].file_path.as_str();
+        let same_file_candidate_exists = |cands: &[usize]| -> bool {
+            cands
+                .iter()
+                .any(|&idx| functions[idx].file_path == caller_file)
+        };
+
+        // Rust paths are followed exactly through the module tree and the
+        // `pub use` re-exports of the module they land on:
+        // `crate::render::mermaid_to_dot` → `render/dot.rs`,
+        // `super::check_ref_arg` → the parent module.
+        if let Some(qualifier) = path_prefix
+            && let Some(from) = self.rust_mods.pos(caller_file)
+        {
+            let segs: Vec<&str> = qualifier.split("::").collect();
+            if let Some(module) = self.rust_mods.resolve_module(from, &segs) {
+                let defines = |file: &str, name: &str| -> Vec<usize> {
+                    self.free_fns_by_file
+                        .get(&(file, name))
+                        .cloned()
+                        .unwrap_or_default()
+                };
+                let cands = self
+                    .rust_mods
+                    .lookup(&from.krate, &module.path, fn_name, &defines);
+                let viable = filter_viable(&cands);
+                if viable.len() == 1 {
+                    return Pick::resolved(viable[0]);
+                }
+                // An in-crate module, so never an extern — whether the
+                // name is ambiguous, already linked, or produced by a
+                // macro we cannot see. Only a guessed crate name leaves
+                // room for the head to be an external crate after all.
+                if !cands.is_empty() || !module.guessed {
+                    return Pick::ambiguous();
+                }
             }
         }
-        // 2) Fall back to free-fn-by-module-name (the legacy semantics
-        //    for `module::foo` qualifiers). The intra-file linker
-        //    skips qualified calls, so the `already_locally_resolved`
-        //    guard we apply to bare calls below is not needed here —
-        //    the qualifier itself disambiguates.
-        if let Some(cands) = free_fns_by_name.get(fn_name) {
-            let viable: Vec<usize> = filter_viable(cands)
-                .into_iter()
-                .filter(|&idx| file_module_name(&functions[idx].file_path) == last_seg)
-                .collect();
-            if let Some(idx) = pick_unique_with_same_crate_pref(&viable, caller_crate, functions) {
-                return Pick::resolved(idx);
+
+        // A qualifier whose final segment is an in-crate path root
+        // (`Self`, `crate`, `self`, `super`) refers to code the parser's
+        // intra-impl / intra-file pass already had a chance to link — or,
+        // for Rust, that the module walk above just failed to place. It
+        // must NOT fall through to bare-name resolution: a `Self::method`
+        // whose target the intra-impl pass missed (e.g. inherent methods
+        // declared in another file) is better left unresolved than ghost-
+        // bound to an unrelated free fn of the same name. Multi-segment
+        // paths like `crate::render::render` keep their own resolution
+        // path below — only the bare in-crate root is rejected here.
+        if let Some(last) = path_prefix.and_then(|q| q.rsplit("::").next())
+            && matches!(last, "crate" | "self" | "super" | "Self")
+        {
+            return Pick::unresolved();
+        }
+
+        if let Some(last_seg) = path_prefix
+            .and_then(|q| q.rsplit("::").next())
+            .filter(|m| !m.is_empty())
+        {
+            let last_seg = strip_generics(last_seg);
+            // 1) Try the method index — the qualifier may be a type/class
+            //    name (e.g. `DaemonHandle::send`).
+            let mut owner_in_graph = false;
+            if let Some(cands) = self.methods_by_owner_name.get(&(last_seg, fn_name)) {
+                owner_in_graph = true;
+                let viable = filter_viable(cands);
+                if let Some(idx) =
+                    pick_unique_with_same_crate_pref(&viable, caller_crate, functions)
+                {
+                    return Pick::resolved(idx);
+                }
+                if !viable.is_empty() {
+                    // Methods matched but ambiguous: type is in-graph, do not
+                    // silently pick one *and* do not invent an extern.
+                    return Pick::ambiguous();
+                }
             }
-            if !viable.is_empty() {
-                // Module had candidates but ambiguous — same reasoning:
-                // the qualifier is in-graph, suppress extern.
+            // 2) Fall back to free-fn-by-module-name (the legacy semantics
+            //    for `module::foo` qualifiers). The intra-file linker
+            //    skips qualified calls, so the `already_locally_resolved`
+            //    guard we apply to bare calls below is not needed here —
+            //    the qualifier itself disambiguates.
+            if let Some(cands) = self.free_fns_by_name.get(fn_name) {
+                let viable: Vec<usize> = filter_viable(cands)
+                    .into_iter()
+                    .filter(|&idx| file_module_name(&functions[idx].file_path) == last_seg)
+                    .collect();
+                if let Some(idx) =
+                    pick_unique_with_same_crate_pref(&viable, caller_crate, functions)
+                {
+                    return Pick::resolved(idx);
+                }
+                if !viable.is_empty() {
+                    // Module had candidates but ambiguous — same reasoning:
+                    // the qualifier is in-graph, suppress extern.
+                    return Pick::ambiguous();
+                }
+            }
+            // 3) A Python package re-exporting the name from a submodule
+            //    (`pkg/__init__.py`: `from .impl import fn`).
+            if caller_lang == "py" && hops < 4 {
+                let reexported = self
+                    .py_reexports
+                    .get(last_seg)
+                    .into_iter()
+                    .flatten()
+                    .find(|re| re.name == fn_name);
+                if let Some(re) = reexported {
+                    let (prefix, name) = split_call_name(&re.path);
+                    return self.pick_target(
+                        &Query {
+                            fn_name: name,
+                            path_prefix: prefix,
+                            ..*q
+                        },
+                        existing,
+                        hops + 1,
+                    );
+                }
+            }
+            // The owner is an in-graph type whose method we already
+            // linked (or that is ambiguous): never an extern.
+            if owner_in_graph {
                 return Pick::ambiguous();
             }
+            // No method nor module candidate: leave it for the extern path.
+            return Pick::unresolved();
         }
-        // No method nor module candidate: leave it for the extern path.
-        return Pick::unresolved();
-    }
 
-    // Bare call (no qualifier). In a sound program, a bare cross-file
-    // call requires a `use` import (Rust) or `from … import …` (Python)
-    // — both of which the parser already rewrites into a qualified path
-    // when present. So an *unrewritten* bare call here means: a local
-    // binding (closure/parameter), a local fn already linked by the
-    // intra-file pass, or a typo/dead reference. None of those should
-    // ghost-bind to a same-named free fn in some unrelated crate, so we
-    // restrict to same-crate matches only and drop the historical
-    // unique-cross-crate fallback.
-    let Some(cands) = free_fns_by_name.get(fn_name) else {
-        return Pick::unresolved();
-    };
-    if same_file_candidate_exists(cands) {
-        return Pick::unresolved();
+        // Bare call (no qualifier). In a sound program, a bare cross-file
+        // call requires a `use` import (Rust) or `from … import …` (Python)
+        // — both of which the parser already rewrites into a qualified path
+        // when present. So an *unrewritten* bare call here means: a local
+        // binding (closure/parameter), a local fn already linked by the
+        // intra-file pass, or a typo/dead reference. None of those should
+        // ghost-bind to a same-named free fn in some unrelated crate, so we
+        // restrict to same-crate matches only and drop the historical
+        // unique-cross-crate fallback.
+        let Some(cands) = self.free_fns_by_name.get(fn_name) else {
+            return Pick::unresolved();
+        };
+        if same_file_candidate_exists(cands) {
+            return Pick::unresolved();
+        }
+        let viable: Vec<usize> = filter_viable(cands)
+            .into_iter()
+            .filter(|&idx| crate_root(functions[idx]).as_deref() == caller_crate)
+            .collect();
+        match pick_unique_with_same_crate_pref(&viable, caller_crate, functions) {
+            Some(idx) => Pick::resolved(idx),
+            None => Pick::unresolved(),
+        }
     }
-    let viable: Vec<usize> = filter_viable(cands)
-        .into_iter()
-        .filter(|&idx| crate_root(functions[idx]).as_deref() == caller_crate)
-        .collect();
-    match pick_unique_with_same_crate_pref(&viable, caller_crate, functions) {
-        Some(idx) => Pick::resolved(idx),
-        None => Pick::unresolved(),
-    }
+}
+
+/// `Store<T>` → `Store`.
+fn strip_generics(name: &str) -> &str {
+    name.split('<').next().unwrap_or(name).trim()
 }
 
 /// Apply same-crate preference and return the unique resolution if any.
@@ -650,11 +836,12 @@ fn lang_of(file_path: &str) -> &str {
 /// Module name that a file represents:
 ///   `src/foo.rs`         → `"foo"`
 ///   `src/foo/mod.rs`     → `"foo"` (use parent dir, not the literal `"mod"`)
+///   `pkg/__init__.py`    → `"pkg"` (same rule for a Python package)
 ///   `crate_a/src/lib.rs` → `"lib"`
 fn file_module_name(file_path: &str) -> &str {
     let basename = file_path.rsplit('/').next().unwrap_or(file_path);
     let stem = basename.rsplit_once('.').map_or(basename, |(s, _)| s);
-    if stem == "mod" {
+    if stem == "mod" || stem == "__init__" {
         // Walk up one level to find the directory name.
         let parent = file_path.rsplit_once('/').map_or("", |(p, _)| p);
         parent.rsplit('/').next().unwrap_or(parent)
@@ -747,6 +934,7 @@ mod tests {
             calls: calls.iter().map(|s| CallSite::bare(*s)).collect(),
             method_calls: Vec::new(),
             parent: None,
+            refs: AtomRefs::default(),
         }
     }
 
@@ -770,6 +958,7 @@ mod tests {
             calls: Vec::new(),
             method_calls: Vec::new(),
             parent: None,
+            refs: AtomRefs::default(),
         }
     }
 
@@ -1217,6 +1406,7 @@ mod tests {
             calls: Vec::new(),
             method_calls: Vec::new(),
             parent: None,
+            refs: AtomRefs::default(),
         }
     }
 
@@ -1234,6 +1424,7 @@ mod tests {
             calls: Vec::new(),
             method_calls: Vec::new(),
             parent: None,
+            refs: AtomRefs::default(),
         }
     }
 
@@ -1379,6 +1570,7 @@ mod tests {
             calls: calls.iter().map(|s| CallSite::bare(*s)).collect(),
             method_calls: Vec::new(),
             parent: Some(owner.to_owned()),
+            refs: AtomRefs::default(),
         }
     }
 

@@ -37,6 +37,18 @@ impl ModuleMeta {
     }
 }
 
+/// Label for a module node: its name, unless that name is a file
+/// convention shared by many modules (`mod`, `__init__`, `lib`, `main`,
+/// `index`) — six files all labelled `mod` told a reader nothing, so
+/// those show their relative path instead.
+fn display_name(name: &str, file_path: &str) -> String {
+    if matches!(name, "mod" | "__init__" | "lib" | "main" | "index") {
+        file_path.to_owned()
+    } else {
+        name.to_owned()
+    }
+}
+
 /// Render the overview-level Mermaid view.
 ///
 /// One node per module with `(functions, structs, traits)` counts; one edge
@@ -62,7 +74,7 @@ pub fn render(adj: &AdjMaps, snapshot: &AtomSnapshot<'_>) -> String {
         }
         let entry = modules_map
             .entry(m.file_path.clone())
-            .or_insert_with(|| (m.name.clone(), ModuleMeta::default()));
+            .or_insert_with(|| (display_name(&m.name, &m.file_path), ModuleMeta::default()));
         for child_arc in adj.children(&m.id) {
             if let Some(child) = snapshot.get(child_arc) {
                 entry.1.bump(&child.kind);
@@ -142,6 +154,7 @@ mod tests {
             calls: Vec::new(),
             method_calls: Vec::new(),
             parent: None,
+            refs: crate::model::AtomRefs::default(),
         }
     }
 
@@ -159,6 +172,7 @@ mod tests {
             calls: Vec::new(),
             method_calls: Vec::new(),
             parent: None,
+            refs: crate::model::AtomRefs::default(),
         }
     }
 
@@ -193,7 +207,7 @@ mod tests {
         let store = Store::new();
         build_module(&store, "src/lib.rs", "lib", &[]);
         let out = run(&store);
-        assert!(out.contains("lib — 0 fn"), "got: {out}");
+        assert!(out.contains("src/lib.rs — 0 fn"), "got: {out}");
     }
 
     #[test]
@@ -211,7 +225,10 @@ mod tests {
             ],
         );
         let out = run(&store);
-        assert!(out.contains("lib — 2 fn, 1 struct, 1 trait"), "got: {out}");
+        assert!(
+            out.contains("src/lib.rs — 2 fn, 1 struct, 1 trait"),
+            "got: {out}"
+        );
     }
 
     #[test]
@@ -224,9 +241,21 @@ mod tests {
             &[("function", "a"), ("function", "b")],
         );
         let out = run(&store);
-        assert!(out.contains("lib — 2 fn"));
+        assert!(out.contains("src/lib.rs — 2 fn"));
         assert!(!out.contains("struct"));
         assert!(!out.contains("trait"));
+    }
+
+    #[test]
+    fn conventional_file_names_are_labelled_by_path() {
+        let store = Store::new();
+        build_module(&store, "render/mod.rs", "mod", &[("function", "a")]);
+        build_module(&store, "cli/mod.rs", "mod", &[("function", "b")]);
+        build_module(&store, "render/dot.rs", "dot", &[("function", "c")]);
+        let out = run(&store);
+        assert!(out.contains("render/mod.rs — 1 fn"), "got: {out}");
+        assert!(out.contains("cli/mod.rs — 1 fn"), "got: {out}");
+        assert!(out.contains("\"dot — 1 fn\""), "got: {out}");
     }
 
     #[test]
@@ -386,6 +415,7 @@ mod tests {
             calls: Vec::new(),
             method_calls: Vec::new(),
             parent: None,
+            refs: crate::model::AtomRefs::default(),
         };
         store.add_atom(a);
         let out = run(&store);

@@ -542,6 +542,7 @@ mod tests {
                 .collect(),
             method_calls: Vec::new(),
             parent: None,
+            refs: crate::model::AtomRefs::default(),
         }
     }
 

@@ -18,6 +18,7 @@ use std::fmt::Write as _;
 /// Best-effort: nodes lose their Mermaid-specific shape distinction, but
 /// edges, edge labels, ids, and cluster boundaries are preserved.
 #[must_use]
+#[allow(clippy::too_many_lines)]
 pub fn mermaid_to_dot(mermaid: &str) -> String {
     let mut out = String::with_capacity(mermaid.len() * 2);
     out.push_str("digraph G {\n");
@@ -29,6 +30,10 @@ pub fn mermaid_to_dot(mermaid: &str) -> String {
 
     let mut depth: u32 = 0;
     let mut cluster_n: u32 = 0;
+    // `classDef name fill:#..,stroke:#..` → DOT attributes, applied to
+    // nodes tagged `:::name`.
+    let mut class_attrs: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
 
     for raw in mermaid.lines() {
         let line = raw.trim();
@@ -73,6 +78,36 @@ pub fn mermaid_to_dot(mermaid: &str) -> String {
             continue;
         }
 
+        // `%% comment` → DOT comment.
+        if let Some(comment) = line.strip_prefix("%%") {
+            push_indent(&mut out, depth + 1);
+            let _ = writeln!(out, "//{comment}");
+            continue;
+        }
+
+        // `classDef NAME fill:#..,stroke:#..` — remembered for `:::NAME`.
+        if let Some(rest) = line.strip_prefix("classDef ")
+            && let Some((name, style)) = rest.split_once(' ')
+        {
+            class_attrs.insert(name.to_owned(), class_to_dot(style));
+            continue;
+        }
+
+        // `FROM --"LABEL"--> TO` (labeled edge, quoted form).
+        if let Some((from, after)) = line.split_once(" --\"")
+            && let Some((label, to_part)) = after.split_once("\"--> ")
+        {
+            push_indent(&mut out, depth + 1);
+            let _ = writeln!(
+                out,
+                "{} -> {} [label=\"{}\"];",
+                from.trim(),
+                to_part.trim(),
+                esc(label)
+            );
+            continue;
+        }
+
         // `FROM -->|"LABEL"| TO` (labeled edge).
         if let Some((from, after)) = line.split_once(" -->|")
             && let Some((label_part, to_part)) = after.split_once('|')
@@ -91,10 +126,23 @@ pub fn mermaid_to_dot(mermaid: &str) -> String {
             continue;
         }
 
-        // Node declaration in any of the supported Mermaid shapes.
-        if let Some((id, label)) = parse_node(line) {
+        // Node declaration in any of the supported Mermaid shapes,
+        // optionally tagged with a class (`id["label"]:::fileNode`).
+        let (decl, class) = match line.rsplit_once(":::") {
+            Some((d, c))
+                if !c.is_empty() && c.chars().all(|ch| ch.is_alphanumeric() || ch == '_') =>
+            {
+                (d, Some(c))
+            }
+            _ => (line, None),
+        };
+        if let Some((id, label)) = parse_node(decl) {
             push_indent(&mut out, depth + 1);
-            let _ = writeln!(out, "{} [label=\"{}\"];", id, esc(&label));
+            let style = class
+                .and_then(|c| class_attrs.get(c))
+                .map(|a| format!(", {a}"))
+                .unwrap_or_default();
+            let _ = writeln!(out, "{} [label=\"{}\"{style}];", id, esc(&label));
             continue;
         }
 
@@ -113,6 +161,28 @@ pub fn mermaid_to_dot(mermaid: &str) -> String {
     }
     out.push_str("}\n");
     out
+}
+
+/// `fill:#9f9,stroke:#0a0,color:#000` → `style=filled, fillcolor="#9f9",
+/// color="#0a0", fontcolor="#000"`. Unknown properties are dropped.
+fn class_to_dot(style: &str) -> String {
+    let mut attrs: Vec<String> = Vec::new();
+    for prop in style.split(',') {
+        let Some((k, v)) = prop.split_once(':') else {
+            continue;
+        };
+        let v = esc(v.trim());
+        match k.trim() {
+            "fill" => {
+                attrs.push("style=filled".to_owned());
+                attrs.push(format!("fillcolor=\"{v}\""));
+            }
+            "stroke" => attrs.push(format!("color=\"{v}\"")),
+            "color" => attrs.push(format!("fontcolor=\"{v}\"")),
+            _ => {}
+        }
+    }
+    attrs.join(", ")
 }
 
 fn push_indent(out: &mut String, level: u32) {
@@ -156,6 +226,7 @@ fn parse_node(line: &str) -> Option<(String, String)> {
         ("((\"", "\"))"), // circle (function/impact target)
         ("([\"", "\"])"), // stadium (module external)
         ("[\"", "\"]"),   // rectangle with quotes (default)
+        ("(\"", "\")"),   // rounded with quotes (graph functions)
         ("[/", "/]"),     // parallelogram (impl)
         ("[(", ")]"),     // cylinder (const/static)
         ("[[", "]]"),     // subroutine (macro)
@@ -178,6 +249,20 @@ fn parse_node(line: &str) -> Option<(String, String)> {
 mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
+
+    #[test]
+    fn classed_nodes_and_quoted_edge_labels_convert() {
+        let out = mermaid_to_dot(
+            "graph TD\n    classDef fileNode fill:#FFFACD,stroke:#DAA520,color:#000\n    a[\"lib.rs\"]:::fileNode\n    b(\"run()\"):::functionNode\n    a --\"imports\"--> b\n",
+        );
+        assert!(!out.contains("unhandled"), "{out}");
+        assert!(
+            out.contains("a [label=\"lib.rs\", style=filled, fillcolor=\"#FFFACD\", color=\"#DAA520\", fontcolor=\"#000\"];"),
+            "{out}"
+        );
+        assert!(out.contains("b [label=\"run()\"];"), "{out}");
+        assert!(out.contains("a -> b [label=\"imports\"];"), "{out}");
+    }
 
     #[test]
     fn empty_graph_renders_minimal_dot() {

@@ -183,6 +183,8 @@ fn python_overview_golden() {
 fn rust_module_golden() {
     // Intra edges (norm → dot between impl siblings, alpha_entry →
     // describe between free fns) AND the cross edge out to beta::entry.
+    // `describe(p: &Point)` calls `p.norm()`: the parameter's declared
+    // type binds it to `Point::norm`.
     let out = view(&fixture("mini-rust"), Level::Module, Some("alpha"));
     assert_eq!(
         edge_set(&out),
@@ -190,6 +192,10 @@ fn rust_module_golden() {
             (
                 "code_alpha_rs__function__Point__norm",
                 "code_alpha_rs__function__Point__dot"
+            ),
+            (
+                "code_alpha_rs__function__describe",
+                "code_alpha_rs__function__Point__norm"
             ),
             (
                 "code_alpha_rs__function__alpha_entry",
@@ -476,5 +482,155 @@ fn rust_diff_golden() {
         arrow_pairs,
         edges(&[(step_two, step_three)]),
         "diff edges:\n{out}"
+    );
+}
+
+// ------------------------------------------------------------------ graph
+
+/// Every `A --"label"--> B` edge of a `graph` view, hash-stripped.
+fn typed_edge_set(mermaid: &str) -> BTreeSet<(String, String, String)> {
+    mermaid
+        .lines()
+        .filter_map(|l| {
+            let (from, rest) = l.trim().split_once(" --\"")?;
+            let (label, to) = rest.split_once("\"--> ")?;
+            Some((
+                strip_hashes(from),
+                label.to_owned(),
+                strip_hashes(to.trim()),
+            ))
+        })
+        .collect()
+}
+
+fn typed(items: &[(&str, &str, &str)]) -> BTreeSet<(String, String, String)> {
+    items
+        .iter()
+        .map(|(f, l, t)| ((*f).to_owned(), (*l).to_owned(), (*t).to_owned()))
+        .collect()
+}
+
+/// The `graph` view's layout contract: class definitions up front, every
+/// node and subgraph before the first edge, balanced subgraphs.
+fn assert_graph_shape(out: &str) {
+    let lines: Vec<&str> = out.lines().map(str::trim).collect();
+    let first_edge = lines.iter().position(|l| l.contains("-->"));
+    let last_def = lines
+        .iter()
+        .rposition(|l| l.contains(":::") || l.starts_with("subgraph") || *l == "end");
+    if let (Some(e), Some(d)) = (first_edge, last_def) {
+        assert!(d < e, "a node is defined after an edge:\n{out}");
+    }
+    for class in ["fileNode", "functionNode", "classNode", "dependencyNode"] {
+        assert!(
+            out.contains(&format!("classDef {class} ")),
+            "missing classDef {class}"
+        );
+    }
+    let opened = lines.iter().filter(|l| l.starts_with("subgraph ")).count();
+    let closed = lines.iter().filter(|l| **l == "end").count();
+    assert_eq!(opened, closed, "unbalanced subgraphs:\n{out}");
+}
+
+#[test]
+fn rust_graph_golden() {
+    let out = view(&fixture("mini-rust"), Level::Graph, None);
+    assert_graph_shape(&out);
+    assert_eq!(
+        label_set(&out),
+        labels(&["alpha.rs", "beta.rs", "struct Point"]),
+        "graph labels:\n{out}"
+    );
+    for f in [
+        "Point::new()",
+        "Point::dot()",
+        "Point::norm()",
+        "describe()",
+        "alpha_entry()",
+        "entry()",
+    ] {
+        assert!(
+            out.contains(&format!("(\"{f}\"):::functionNode")),
+            "{f} missing:\n{out}"
+        );
+    }
+    assert!(
+        strip_hashes(&out).contains("subgraph file_alpha_rs[\"alpha.rs\"]"),
+        "one subgraph per file:\n{out}"
+    );
+    let a = "code_alpha_rs__function__";
+    assert_eq!(
+        typed_edge_set(&out),
+        typed(&[
+            (
+                &format!("{a}Point__norm"),
+                "calls",
+                &format!("{a}Point__dot")
+            ),
+            (&format!("{a}alpha_entry"), "calls", &format!("{a}describe")),
+            (
+                &format!("{a}alpha_entry"),
+                "calls",
+                "code_beta_rs__function__entry"
+            ),
+            (&format!("{a}describe"), "calls", &format!("{a}Point__norm")),
+            (
+                &format!("{a}Point__dot"),
+                "references",
+                "code_alpha_rs__struct__Point"
+            ),
+            (
+                &format!("{a}Point__new"),
+                "references",
+                "code_alpha_rs__struct__Point"
+            ),
+            (
+                &format!("{a}alpha_entry"),
+                "references",
+                "code_alpha_rs__struct__Point"
+            ),
+            (
+                &format!("{a}describe"),
+                "references",
+                "code_alpha_rs__struct__Point"
+            ),
+        ]),
+        "graph edges:\n{out}"
+    );
+}
+
+#[test]
+fn python_graph_golden() {
+    let out = view(&fixture("mini-python"), Level::Graph, None);
+    assert_graph_shape(&out);
+    assert_eq!(
+        label_set(&out),
+        labels(&["alpha.py", "beta.py", "class Point"]),
+        "graph labels:\n{out}"
+    );
+    let b = "code_beta_py__function__";
+    assert_eq!(
+        typed_edge_set(&out),
+        typed(&[
+            (
+                "code_alpha_py__function__Point__norm",
+                "calls",
+                "code_alpha_py__function__Point__dot"
+            ),
+            (
+                "code_alpha_py__function__alpha_entry",
+                "calls",
+                "code_alpha_py__function__describe"
+            ),
+            (
+                "code_alpha_py__function__alpha_entry",
+                "calls",
+                &format!("{b}entry")
+            ),
+            (&format!("{b}entry"), "calls", &format!("{b}step_one")),
+            (&format!("{b}step_one"), "calls", &format!("{b}step_two")),
+            (&format!("{b}step_two"), "calls", &format!("{b}step_three")),
+        ]),
+        "graph edges:\n{out}"
     );
 }

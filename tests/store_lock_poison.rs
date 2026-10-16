@@ -26,6 +26,7 @@ fn atom(id: &str) -> CodeAtom {
         calls: Vec::new(),
         method_calls: Vec::new(),
         parent: None,
+        refs: ast_to_mermaid::model::AtomRefs::default(),
     }
 }
 

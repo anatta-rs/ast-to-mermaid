@@ -114,8 +114,8 @@ mod tests {
     #[test]
     fn parse_csv_exclude_trims_and_drops_empties() {
         assert_eq!(parse_csv_exclude("a,, b ,c"), vec!["a", "b", "c"]);
-        assert!(parse_csv_exclude("").is_empty());
-        assert!(parse_csv_exclude(" , , ").is_empty());
+        assert_eq!(parse_csv_exclude(""), Vec::<String>::new());
+        assert_eq!(parse_csv_exclude(" , , "), Vec::<String>::new());
         assert_eq!(parse_csv_exclude("target"), vec!["target"]);
     }
 

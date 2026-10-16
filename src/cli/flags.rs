@@ -390,3 +390,52 @@ pub struct FlowFlags {
     #[arg(short, long)]
     pub out: Option<PathBuf>,
 }
+
+/// CLI args for the `graph` subcommand.
+#[derive(Debug, Clone, clap::Args)]
+pub struct GraphFlags {
+    /// Path to a source root (file or directory).
+    pub path: PathBuf,
+
+    /// Cap on rendered nodes. File nodes are always kept; items are ranked
+    /// by cross-file degree and the rest cut.
+    #[arg(long, default_value_t = crate::render::graph::DEFAULT_MAX_NODES)]
+    pub max_nodes: usize,
+
+    /// Item kinds to show besides files (comma-separated): `function`,
+    /// `struct`, `enum`, `trait`, `type_alias`, `const`, `static`,
+    /// `macro`, `impl`.
+    #[arg(long, default_value = "function,struct,enum,trait,type_alias")]
+    pub kinds: String,
+
+    /// Edge kinds to draw (comma-separated): `calls`, `imports`,
+    /// `references`, `implements`, `extern`, `defines`.
+    #[arg(long, default_value = "calls,imports,references,implements,extern")]
+    pub edges: String,
+
+    /// Directory levels rendered as nested subgraphs (`0` for none).
+    #[arg(long, default_value_t = crate::render::graph::DEFAULT_GROUP_DEPTH)]
+    pub group_depth: usize,
+
+    /// Also show private items that have no cross-file edge.
+    #[arg(long)]
+    pub include_private: bool,
+
+    /// Extra directory basenames to skip during walk (comma-separated).
+    #[arg(short = 'x', long, default_value = "")]
+    pub exclude: String,
+
+    /// Include generated Dart (`.g.dart`, `.freezed.dart`, `.mocks.dart`,
+    /// `.gr.dart`). Skipped by default.
+    #[arg(long)]
+    pub include_generated: bool,
+
+    /// Output format: Mermaid (default) or Graphviz DOT, for graphs too
+    /// large for a Mermaid renderer.
+    #[arg(long, value_enum, default_value_t = AnalyzeFormat::Mermaid)]
+    pub format: AnalyzeFormat,
+
+    /// Write output to this file instead of stdout.
+    #[arg(short, long)]
+    pub out: Option<PathBuf>,
+}

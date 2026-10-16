@@ -106,7 +106,11 @@ struct BlobEnvelope<'a> {
 /// files share a private helper name" cycle (`l2_sq` in voronoi tree
 /// pairs, `build_request_url` in dork's google/duckduckgo backends,
 /// `find_atom` shared across the ingester parse-test files, etc.).
-const SCHEMA_VERSION: u32 = 6;
+///
+/// V7: the resolver follows Rust module paths and `pub use` re-exports,
+/// binds parser-typed receiver calls, and emits `Imports` and `Uses`
+/// edges. Bundles built before carry none of those edges.
+const SCHEMA_VERSION: u32 = 7;
 
 /// Grammar version. Forces a cold reparse on next run.
 ///
@@ -158,7 +162,14 @@ const SCHEMA_VERSION: u32 = 6;
 /// repeated calls missing and their ranks renumbered. `method_calls` also
 /// changed shape (`Vec<String>` → `Vec<CallSite>`) and would not
 /// deserialise.
-const GRAMMAR_VERSION: u32 = 8;
+///
+/// `9`: Rust and Python receivers typed from their declarations
+/// (`obj.method()` → `Type::method`), only *called* Rust fields captured
+/// (a field read is no longer a call site), qualified Rust calls expanded
+/// through `use`, and atoms carry `refs` (imports, re-exports, type
+/// names). A warm unit would deserialise with empty `refs` and the old
+/// call names, so every file must be reparsed.
+const GRAMMAR_VERSION: u32 = 9;
 
 /// Compute the cache version string written to `<root>/version`.
 fn cache_version() -> String {
@@ -914,6 +925,7 @@ mod tests {
             calls: vec![],
             method_calls: vec![],
             parent: None,
+            refs: crate::model::AtomRefs::default(),
         }
     }
 

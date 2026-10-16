@@ -550,8 +550,10 @@ fn entity_meta(
     let to_strings = |ids: &[Arc<EntityId>]| -> Vec<String> {
         ids.iter().map(|e| e.as_str().to_owned()).collect()
     };
-    let imports = to_strings(adj.uses_out(&atom.id));
-    let imported_by = to_strings(adj.uses_in(&atom.id));
+    let imports = to_strings(adj.imports_out(&atom.id));
+    let imported_by = to_strings(adj.imports_in(&atom.id));
+    let uses = to_strings(adj.uses_out(&atom.id));
+    let used_by = to_strings(adj.uses_in(&atom.id));
     let implements = to_strings(adj.implements_out(&atom.id));
     let implemented_by = to_strings(adj.implements_in(&atom.id));
 
@@ -570,6 +572,8 @@ fn entity_meta(
         "children": children.iter().map(|a| a.as_str()).collect::<Vec<_>>(),
         "imports": imports,
         "imported_by": imported_by,
+        "uses": uses,
+        "used_by": used_by,
         "implements": implements,
         "implemented_by": implemented_by,
     })
@@ -720,6 +724,7 @@ mod tests {
             calls: Vec::new(),
             method_calls: Vec::new(),
             parent: None,
+            refs: crate::model::AtomRefs::default(),
         }
     }
 
@@ -737,6 +742,7 @@ mod tests {
             calls: Vec::new(),
             method_calls: Vec::new(),
             parent: None,
+            refs: crate::model::AtomRefs::default(),
         }
     }
 
@@ -759,7 +765,7 @@ mod tests {
         let artifacts = emit_artifacts(&store, "/src");
 
         // overview must be non-empty
-        assert!(!artifacts.overview_mmd.is_empty());
+        assert_ne!(artifacts.overview_mmd, "");
 
         // 3 entities
         assert_eq!(artifacts.entities.len(), 3);

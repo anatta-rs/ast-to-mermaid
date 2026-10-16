@@ -189,6 +189,7 @@ mod tests {
             calls: Vec::new(),
             method_calls: Vec::new(),
             parent: None,
+            refs: crate::model::AtomRefs::default(),
         }
     }
 
@@ -206,6 +207,7 @@ mod tests {
             calls: Vec::new(),
             method_calls: Vec::new(),
             parent: None,
+            refs: crate::model::AtomRefs::default(),
         }
     }
 
