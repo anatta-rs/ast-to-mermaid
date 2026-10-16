@@ -8,6 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.1](https://github.com/anatta-rs/ast-to-mermaid/compare/v0.11.0...v0.11.1) - 2026-10-16
+
+### Bug fixes
+
+- Trait-object calls, cross-file implements, and a cache that never eats tracked files ([#203](https://github.com/anatta-rs/ast-to-mermaid/pull/203))
+
 ## [0.11.0](https://github.com/anatta-rs/ast-to-mermaid/compare/v0.10.1...v0.11.0) - 2026-10-16
 
 ### Features
