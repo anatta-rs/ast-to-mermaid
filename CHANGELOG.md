@@ -8,6 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.0](https://github.com/anatta-rs/ast-to-mermaid/compare/v0.10.1...v0.11.0) - 2026-10-16
+
+### Features
+
+- *(graph)* Whole-project knowledge graph, backed by a sharper resolver ([#201](https://github.com/anatta-rs/ast-to-mermaid/pull/201))
+
 ## [0.10.1](https://github.com/anatta-rs/ast-to-mermaid/compare/v0.10.0...v0.10.1) - 2026-08-09
 
 ### Bug fixes
