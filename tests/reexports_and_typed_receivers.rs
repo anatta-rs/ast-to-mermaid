@@ -382,3 +382,79 @@ fn python_typed_receivers_and_package_reexports() {
         &EdgeKind::Imports
     ));
 }
+
+#[test]
+fn calls_through_trait_objects_and_bounds_resolve_to_the_trait_method() {
+    // #198: `store.get()` with `store: &dyn Store`, `&impl Store`,
+    // `Box<dyn Store + Send>`, `S: Store`, `where S: Store`, or a field
+    // typed by a bounded generic.
+    let tmp = tempfile::tempdir().expect("tmp");
+    let root = tmp.path();
+    write(
+        root,
+        "src/t.rs",
+        "pub trait Store { fn get(&self) -> u8; fn put(&self) {} }\n",
+    );
+    write(
+        root,
+        "src/d.rs",
+        "use crate::t::Store;\n\
+         pub fn by_dyn(s: &dyn Store) -> u8 { s.get() }\n\
+         pub fn by_impl(s: &impl Store) -> u8 { s.get() }\n\
+         pub fn by_box(s: Box<dyn Store + Send>) { s.put() }\n\
+         pub fn by_bound<S: Store>(s: &S) -> u8 { s.get() }\n\
+         pub fn by_where<S>(s: &S) where S: Clone + Store { s.put() }\n\
+         pub struct Svc<S: Store> { store: S }\n\
+         impl<S: Store> Svc<S> { pub fn run(&self) -> u8 { self.store.get() } }\n",
+    );
+    let store = build_store(root);
+    let get = "code:src/t.rs::function::Store::get";
+    let put = "code:src/t.rs::function::Store::put";
+    let calls = |from: &str, to: &str| store.has_call_edge(&id(from), &id(to));
+    assert!(calls("code:src/d.rs::function::by_dyn", get), "&dyn");
+    assert!(calls("code:src/d.rs::function::by_impl", get), "&impl");
+    assert!(
+        calls("code:src/d.rs::function::by_box", put),
+        "Box<dyn + Send>"
+    );
+    assert!(
+        calls("code:src/d.rs::function::by_bound", get),
+        "<S: Store>"
+    );
+    assert!(
+        calls("code:src/d.rs::function::by_where", put),
+        "where S: Store"
+    );
+    assert!(
+        calls("code:src/d.rs::function::Svc<S>::run", get),
+        "field S: Store"
+    );
+    assert!(externs(&store).is_empty(), "{:?}", externs(&store));
+}
+
+#[test]
+fn impl_in_a_third_file_implements_the_trait_method_by_method() {
+    // Type, trait and `impl Trait for Type` in three different files.
+    let tmp = tempfile::tempdir().expect("tmp");
+    let root = tmp.path();
+    write(root, "src/a.rs", "pub struct S;\n");
+    write(root, "src/t.rs", "pub trait T { fn f(&self); }\n");
+    write(
+        root,
+        "src/b.rs",
+        "use crate::{a::S, t::T};\nimpl T for S { fn f(&self) {} }\n",
+    );
+    let store = build_store(root);
+    assert!(has_edge(
+        &store,
+        "code:src/b.rs::impl::T for S",
+        "code:src/t.rs::trait::T",
+        &EdgeKind::Implements
+    ));
+    assert!(has_edge(
+        &store,
+        "code:src/b.rs::function::T for S::f",
+        "code:src/t.rs::function::T::f",
+        &EdgeKind::Implements
+    ));
+}

@@ -688,7 +688,13 @@ pub(crate) fn is_generated_dart(path: &Path) -> bool {
 
 /// Resolve `<root>` to a snapshot id used as the cache bundle key.
 ///
-/// - If `git_ref` is `Some`, returns the commit SHA from `git rev-parse`.
+/// - If `git_ref` is `Some`, returns the commit SHA from `git rev-parse`,
+///   suffixed with `-<8 hex>` of the analysed subdirectory when `root` is
+///   not the repository's toplevel. A bundle's entity ids are relative to
+///   the analysed root, so the bundle of `src/` at a commit and the bundle
+///   of `.` at the same commit are different bundles: keyed by the SHA
+///   alone, one was served for the other and `a2m diff` reported every
+///   file as renamed.
 /// - If `git_ref` is `None`, walks the working tree and returns
 ///   `wt-<digest>` where `<digest>` is the first 16 hex chars of
 ///   `SHA1(<path>:<blob_sha>\0…)` over all source files sorted by path.
@@ -698,7 +704,19 @@ pub(crate) fn is_generated_dart(path: &Path) -> bool {
 /// I/O errors from the FS walk, or git errors from `rev-parse`.
 pub fn snapshot_id(root: &Path, git_ref: Option<&str>) -> Result<String> {
     if let Some(r) = git_ref {
-        return git_source::rev_parse(root, r);
+        let sha = git_source::rev_parse(root, r)?;
+        let toplevel = git_source::show_toplevel(root)?;
+        let rel = root
+            .canonicalize()
+            .ok()
+            .and_then(|abs| abs.strip_prefix(&toplevel).ok().map(Path::to_path_buf))
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        if rel.is_empty() {
+            return Ok(sha);
+        }
+        let digest = sha1_smol::Sha1::from(rel.as_bytes()).digest().to_string();
+        return Ok(format!("{sha}-{}", &digest[..8]));
     }
     let files = walk_for_languages_with_exclude::<&str>(root, &[])?;
     let mut pairs: Vec<(String, String)> = Vec::with_capacity(files.len());

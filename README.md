@@ -361,12 +361,12 @@ Recursion is shown, not hidden: the nodes of a cycle are styled, expansion stops
 
 - one `subgraph` per directory (down to `--group-depth`, default 2), one per file holding the file node and its items;
 - one class per kind — file, function, type, external dependency — so the diagram reads at a glance;
-- typed, labelled edges: `calls` (function → function), `imports` (file → file, only where no item edge already links the two files), `references` (an item → a type its declaration names), `implements` (type → trait), `depends on` (file → external crate);
+- typed, labelled edges: `calls` (function → function), `imports` (file → file, only where no item edge already links the two files), `references` (an item → a type its declaration names), `implements` (type → trait, wherever the `impl` lives), `dispatches to` (trait method → each implementation), `depends on` (file → external crate);
 - every node defined before the first edge.
 
 Items are ranked by cross-file degree and cut at `--max-nodes` (default 150 — items plus the files holding them; external crates come on top). Private items with no cross-file edge are hidden unless `--include-private`. `--kinds` and `--edges` narrow the view; `--format dot` takes over when it is still too big.
 
-The edges come from what the resolver knows, so they are only as good as it is. It follows Rust module paths and `pub use` re-exports to the defining file (`crate::render::mermaid_to_dot` → `render/dot.rs`), types receivers from their declarations (`let s = Store::new(); s.add()`, `fn f(s: &Store)`, `self.field.m()`, Python `x = Cls()` / `x: Cls` / `self.x = Cls()`), and reads calls written inside macros. On this crate that took the functions with no known caller from 118 of 344 to 60 of 409 (the crate grew with the change) — what remains is test-only helpers and trait methods called implicitly.
+The edges come from what the resolver knows, so they are only as good as it is. It follows Rust module paths and `pub use` re-exports to the defining file (`crate::render::mermaid_to_dot` → `render/dot.rs`), types receivers from their declarations (`let s = Store::new(); s.add()`, `fn f(s: &Store)`, `self.field.m()`, trait objects and bounds — `&dyn Store`, `&impl Store`, `<S: Store>`, `where S: Store` — resolved to the trait's method, Python `x = Cls()` / `x: Cls` / `self.x = Cls()`), and reads calls written inside macros. On this crate that took the functions with no known caller from 118 of 344 to 60 of 409 (the crate grew with the change) — what remains is test-only helpers and trait methods called implicitly.
 
 <details>
 <summary>Real output — <code>a2m graph ./src --max-nodes 30 --group-depth 1</code> on this crate</summary>

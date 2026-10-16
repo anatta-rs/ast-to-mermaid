@@ -122,6 +122,25 @@ mod tests {
     use crate::cli::run::test_helpers::{git, init_rust_repo};
 
     #[test]
+    fn bundle_key_distinguishes_the_analysed_subdirectory() {
+        // Ids are relative to the analysed root: the bundle of `src/` and
+        // the bundle of `.` at one commit must not share a cache slot, or
+        // a diff compares `lib.rs` against `src/lib.rs` and calls it a
+        // rename.
+        let tmp = tempfile::tempdir().expect("tmp");
+        init_rust_repo(tmp.path(), "src/lib.rs", "fn x(){}\n");
+        let whole = snapshot_id(tmp.path(), Some("HEAD")).expect("root id");
+        let sub = snapshot_id(&tmp.path().join("src"), Some("HEAD")).expect("src id");
+        assert_eq!(
+            whole.len(),
+            40,
+            "repository root keeps the bare SHA: {whole}"
+        );
+        assert!(sub.starts_with(&format!("{whole}-")), "{sub}");
+        assert_eq!(sub.len(), 40 + 1 + 8, "{sub}");
+    }
+
+    #[test]
     fn diff_range_without_double_dot_is_usage_error() {
         let tmp = tempfile::tempdir().expect("tmp");
         let flags = DiffFlags {

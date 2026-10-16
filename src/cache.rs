@@ -110,7 +110,10 @@ struct BlobEnvelope<'a> {
 /// V7: the resolver follows Rust module paths and `pub use` re-exports,
 /// binds parser-typed receiver calls, and emits `Imports` and `Uses`
 /// edges. Bundles built before carry none of those edges.
-const SCHEMA_VERSION: u32 = 7;
+///
+/// V8: impl methods get an `Implements` edge to the trait method of the
+/// same name (what `dyn Trait` dispatch reaches).
+const SCHEMA_VERSION: u32 = 8;
 
 /// Grammar version. Forces a cold reparse on next run.
 ///
@@ -169,7 +172,12 @@ const SCHEMA_VERSION: u32 = 7;
 /// through `use`, and atoms carry `refs` (imports, re-exports, type
 /// names). A warm unit would deserialise with empty `refs` and the old
 /// call names, so every file must be reparsed.
-const GRAMMAR_VERSION: u32 = 9;
+///
+/// `10`: methods declared in a Rust `trait` are lifted as atoms, and
+/// receivers typed `&dyn T` / `&impl T` / `Box<dyn T>` / a generic bounded
+/// by `T` (`<S: T>`, `where S: T`, struct and impl generics) emit `T::m`.
+/// Cached units hold neither.
+const GRAMMAR_VERSION: u32 = 10;
 
 /// Compute the cache version string written to `<root>/version`.
 fn cache_version() -> String {
@@ -203,6 +211,21 @@ impl Cache {
         // follow them out of the workspace.
         walk_safe(&root)?;
 
+        // A cache committed to the repository would lose its tracked files
+        // to the version wipe below or to GC — 2 852 of them in one
+        // reported run. Refuse before touching anything.
+        let tracked = crate::git_source::tracked_files_under(&root);
+        if tracked > 0 {
+            return Err(AstToMermaidError::InvalidInput(format!(
+                "refusing to use the a2m cache at {}: {tracked} file(s) in it are tracked by git, \
+                 and a2m clears or prunes this directory at any time. Untrack it \
+                 (`git rm -r --cached {}`; a2m keeps `.a2m/` ignored), or use \
+                 --cache-dir / --no-cache.",
+                root.display(),
+                root.display(),
+            )));
+        }
+
         let version_path = root.join("version");
         let want = cache_version();
         let stale = match fs::read_to_string(&version_path) {
@@ -222,7 +245,13 @@ impl Cache {
 
         sweep_stale_tmp_blobs(&root.join("blobs"))?;
 
-        Ok(Self { root })
+        let cache = Self { root };
+        // The default `<repo>/.a2m/cache` keeps itself out of git. A custom
+        // `--cache-dir` is the caller's to place.
+        if cache.root.parent().and_then(Path::file_name) == Some(std::ffi::OsStr::new(".a2m")) {
+            cache.ensure_gitignore()?;
+        }
+        Ok(cache)
     }
 
     /// Default cache root inside a repo: `<repo_root>/.a2m/cache`.
@@ -987,6 +1016,48 @@ mod tests {
         cache.ensure_gitignore().unwrap();
         let gi = fs::read_to_string(parent.join(".gitignore")).unwrap();
         assert!(gi.contains('*'));
+    }
+
+    fn git(dir: &Path, args: &[&str]) {
+        let ok = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
+            .output()
+            .expect("git")
+            .status
+            .success();
+        assert!(ok, "git {args:?} failed");
+    }
+
+    #[test]
+    fn open_refuses_a_cache_tracked_by_git_and_deletes_nothing() {
+        let tmp = tempdir().unwrap();
+        let repo = tmp.path();
+        git(repo, &["init", "-q"]);
+        let root = repo.join(".a2m").join("cache");
+        fs::create_dir_all(root.join("blobs")).unwrap();
+        fs::write(root.join("version"), "an older a2m").unwrap();
+        fs::write(root.join("blobs").join("x.cbor"), "kept").unwrap();
+        git(repo, &["add", "-f", ".a2m"]);
+
+        let Err(err) = Cache::open(&root) else {
+            panic!("tracked cache must be refused");
+        };
+        assert!(err.to_string().contains("tracked by git"), "{err}");
+        // The version mismatch would have wiped `blobs/`: nothing gone.
+        assert!(root.join("blobs").join("x.cbor").is_file());
+    }
+
+    #[test]
+    fn open_keeps_the_default_cache_out_of_git() {
+        let tmp = tempdir().unwrap();
+        let parent = tmp.path().join(".a2m");
+        Cache::open(parent.join("cache")).unwrap();
+        assert!(parent.join(".gitignore").is_file());
     }
 
     #[test]
