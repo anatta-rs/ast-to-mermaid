@@ -8,6 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.0](https://github.com/anatta-rs/ast-to-mermaid/compare/v0.11.1...v0.12.0) - 2026-10-25
+
+### Bug fixes
+
+- *(parser)* Lift inline-module items, keep docs above attributes ([#205](https://github.com/anatta-rs/ast-to-mermaid/pull/205))
+
 ## [0.11.1](https://github.com/anatta-rs/ast-to-mermaid/compare/v0.11.0...v0.11.1) - 2026-10-16
 
 ### Bug fixes
