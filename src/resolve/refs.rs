@@ -9,7 +9,7 @@
 //! nothing: unlike calls, a dependency on `std::collections` is not worth
 //! an `extern` node.
 
-use super::paths::RustModules;
+use super::paths::{Defines, RustModules};
 use super::{crate_root, lang_of};
 use crate::graph::Store;
 use crate::model::{CodeAtom, Edge, EdgeKind, EntityId};
@@ -38,22 +38,25 @@ pub fn resolve_import_edges(store: &Store) -> usize {
         }
         let module_by_file: HashMap<&str, &CodeAtom> =
             modules.iter().map(|m| (m.file_path.as_str(), *m)).collect();
-        let rust_mods = RustModules::build(&modules);
-        // Rust items by `(file, name)`, to find the file `use a::Item`
-        // lands on through re-exports.
+        let rust_mods = RustModules::build(atoms);
+        // Rust items by `(file, scope, name)`, to find the file
+        // `use a::Item` lands on through re-exports.
         let items: Vec<&CodeAtom> = atoms
             .iter()
             .filter(|a| a.kind != "module" && a.parent.is_none() && !a.file_path.is_empty())
             .collect();
-        let mut item_by_file: HashMap<(&str, &str), Vec<usize>> = HashMap::new();
+        let mut item_by_file: HashMap<(&str, &str, &str), Vec<usize>> = HashMap::new();
         for (i, a) in items.iter().enumerate() {
             item_by_file
-                .entry((a.file_path.as_str(), a.name.as_str()))
+                .entry((a.file_path.as_str(), a.refs.scope.as_str(), a.name.as_str()))
                 .or_default()
                 .push(i);
         }
-        let defines = |file: &str, name: &str| -> Vec<usize> {
-            item_by_file.get(&(file, name)).cloned().unwrap_or_default()
+        let defines = |file: &str, scope: &str, name: &str| -> Vec<usize> {
+            item_by_file
+                .get(&(file, scope, name))
+                .cloned()
+                .unwrap_or_default()
         };
 
         for module in &modules {
@@ -88,7 +91,7 @@ fn rust_import_files<'a>(
     mods: &RustModules<'a>,
     module: &CodeAtom,
     path: &str,
-    defines: &dyn Fn(&str, &str) -> Vec<usize>,
+    defines: &Defines,
     items: &[&'a CodeAtom],
 ) -> Vec<&'a str> {
     let Some(from) = mods.pos(&module.file_path) else {
@@ -99,7 +102,7 @@ fn rust_import_files<'a>(
     // first: the parent's `mod git_source;` declaration is an item of the
     // same name and would otherwise win.
     if let Some(m) = mods.resolve_module(from, &segs) {
-        return mods.files(&from.krate, &m.path).to_vec();
+        return mods.files(&from.krate, &m.path);
     }
     if let Some((name, qualifier)) = segs.split_last()
         && !qualifier.is_empty()
@@ -113,7 +116,7 @@ fn rust_import_files<'a>(
             return files;
         }
         if !m.guessed {
-            return mods.files(&from.krate, &m.path).to_vec();
+            return mods.files(&from.krate, &m.path);
         }
     }
     Vec::new()
@@ -242,18 +245,20 @@ pub fn resolve_type_refs(store: &Store) -> usize {
             return;
         }
         let mut by_name: HashMap<&str, Vec<usize>> = HashMap::new();
-        let mut by_file: HashMap<(&str, &str), Vec<usize>> = HashMap::new();
+        let mut by_file: HashMap<(&str, &str, &str), Vec<usize>> = HashMap::new();
         for (i, t) in types.iter().enumerate() {
             by_name.entry(t.name.as_str()).or_default().push(i);
             by_file
-                .entry((t.file_path.as_str(), t.name.as_str()))
+                .entry((t.file_path.as_str(), t.refs.scope.as_str(), t.name.as_str()))
                 .or_default()
                 .push(i);
         }
-        let modules: Vec<&CodeAtom> = atoms.iter().filter(|a| a.kind == "module").collect();
-        let rust_mods = RustModules::build(&modules);
-        let defines = |file: &str, name: &str| -> Vec<usize> {
-            by_file.get(&(file, name)).cloned().unwrap_or_default()
+        let rust_mods = RustModules::build(atoms);
+        let defines = |file: &str, scope: &str, name: &str| -> Vec<usize> {
+            by_file
+                .get(&(file, scope, name))
+                .cloned()
+                .unwrap_or_default()
         };
 
         for atom in atoms {
@@ -298,7 +303,7 @@ fn pick_type(
     types: &[&CodeAtom],
     by_name: &HashMap<&str, Vec<usize>>,
     rust_mods: &RustModules,
-    defines: &dyn Fn(&str, &str) -> Vec<usize>,
+    defines: &Defines,
 ) -> Option<usize> {
     let (qualifier, name) = match written.rsplit_once("::") {
         Some((q, n)) => (Some(q), n),
@@ -306,10 +311,10 @@ fn pick_type(
     };
     // `crate::graph::Store` — follow the path exactly.
     if let Some(q) = qualifier
-        && let Some(from) = rust_mods.pos(&atom.file_path)
+        && let Some(from) = rust_mods.pos_in(&atom.file_path, &atom.refs.scope)
     {
         let segs: Vec<&str> = q.split("::").collect();
-        if let Some(m) = rust_mods.resolve_module(from, &segs) {
+        if let Some(m) = rust_mods.resolve_module(&from, &segs) {
             let found = rust_mods.lookup(&from.krate, &m.path, name, defines);
             return match found.as_slice() {
                 [one] => Some(*one),

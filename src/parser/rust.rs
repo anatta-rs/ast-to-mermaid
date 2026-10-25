@@ -215,6 +215,56 @@ fn join_path(prefix: &str, tail: &str) -> String {
     }
 }
 
+// ── Inline module scope ───────────────────────────────────────────────────────
+
+/// Inline module path an item is declared in, relative to its file:
+/// `""` at file level, `inner` inside `mod inner { … }`, `a::b` for
+/// nested blocks. `None` when the item sits anywhere the graph does not
+/// lift items from — a function body, an `impl`, a `trait`.
+///
+/// An `extern "C" { … }` block adds no segment: its items belong to the
+/// module that holds it.
+pub(super) fn item_scope(node: &Node, source: &str) -> Option<String> {
+    let mut segs: Vec<&str> = Vec::new();
+    let mut cur = node.parent()?;
+    loop {
+        match cur.kind() {
+            "source_file" => break,
+            "declaration_list" => {
+                let owner = cur.parent()?;
+                match owner.kind() {
+                    "mod_item" => segs.push(
+                        owner
+                            .child_by_field_name("name")
+                            .and_then(|n| n.utf8_text(source.as_bytes()).ok())?,
+                    ),
+                    "foreign_mod_item" => {}
+                    _ => return None,
+                }
+                cur = owner.parent()?;
+            }
+            _ => return None,
+        }
+    }
+    segs.reverse();
+    Some(segs.join("::"))
+}
+
+/// Row a doc comment ends just above: the item's own row, or the row of
+/// the first attribute stacked on it. `/// Doc` then `#[derive(Debug)]`
+/// then `struct S;` documents `S`; scanning up from `struct` alone stops
+/// at the attribute and loses the doc.
+pub(super) fn doc_anchor_row(node: &Node) -> usize {
+    let mut first = *node;
+    while let Some(prev) = first.prev_sibling() {
+        if prev.kind() != "attribute_item" {
+            break;
+        }
+        first = prev;
+    }
+    first.start_position().row
+}
+
 // ── Doc comment extraction ────────────────────────────────────────────────────
 
 pub(super) fn doc_comment(source: &str, item_row: usize) -> String {
@@ -1056,6 +1106,101 @@ pub type Alias = u32;\n";
         let id = EntityId::new("code:src/lib.rs::function::documented");
         let atom = store.get_atom(&id).expect("atom");
         assert!(atom.doc.contains("Does something"), "doc={:?}", atom.doc);
+    }
+
+    #[test]
+    fn rust_doc_comment_survives_attributes() {
+        let store = Store::new();
+        let src = b"/// A point.\n#[derive(Debug)]\n#[allow(dead_code)]\npub struct P;\n";
+        CodeParser::rust()
+            .parse(src, "src/lib.rs")
+            .expect("parse")
+            .apply_to(&store);
+        let atom = store
+            .get_atom(&EntityId::new("code:src/lib.rs::struct::P"))
+            .expect("atom");
+        assert_eq!(atom.doc, "A point.");
+    }
+
+    #[test]
+    fn one_line_fn_signature_stops_at_the_body() {
+        let store = Store::new();
+        let src = b"pub fn f(x: u32) -> u32 { x + 1 }\n";
+        CodeParser::rust()
+            .parse(src, "src/lib.rs")
+            .expect("parse")
+            .apply_to(&store);
+        let atom = store
+            .get_atom(&EntityId::new("code:src/lib.rs::function::f"))
+            .expect("atom");
+        assert_eq!(atom.signature, "pub fn f(x: u32) -> u32");
+    }
+
+    #[test]
+    fn inline_module_items_are_lifted_with_their_scope() {
+        let store = Store::new();
+        let src = b"\
+pub fn top() {}\n\
+mod outer {\n\
+    pub fn top() {}\n\
+    mod inner { pub struct S; impl S { pub fn m(&self) {} } }\n\
+}\n\
+fn host() { fn nested() {} }\n";
+        CodeParser::rust()
+            .parse(src, "src/lib.rs")
+            .expect("parse")
+            .apply_to(&store);
+        let get = |id: &str| store.get_atom(&EntityId::new(id));
+        assert!(get("code:src/lib.rs::function::top").is_some());
+        let outer_top = get("code:src/lib.rs::function::outer::top").expect("outer::top");
+        assert_eq!(outer_top.refs.scope, "outer");
+        let s = get("code:src/lib.rs::struct::outer::inner::S").expect("S");
+        assert_eq!(s.refs.scope, "outer::inner");
+        let m = get("code:src/lib.rs::function::outer::inner::S::m").expect("S::m");
+        assert_eq!(m.refs.scope, "outer::inner");
+        // A function nested in a body is still not an item.
+        assert!(
+            store
+                .atoms_by_kind("function")
+                .iter()
+                .all(|a| a.name != "nested")
+        );
+    }
+
+    #[test]
+    fn bare_call_in_inline_module_binds_its_own_scope_first() {
+        let store = Store::new();
+        let src = b"\
+fn helper() {}\n\
+mod a { fn helper() {} pub fn run() { helper(); } }\n\
+mod tests { use super::*; fn t() { helper(); } }\n";
+        CodeParser::rust()
+            .parse(src, "src/lib.rs")
+            .expect("parse")
+            .apply_to(&store);
+        let id = |s: &str| EntityId::new(format!("code:src/lib.rs::function::{s}"));
+        assert!(store.has_call_edge(&id("a::run"), &id("a::helper")));
+        assert!(!store.has_call_edge(&id("a::run"), &id("helper")));
+        // `mod tests` declares no `helper`: the enclosing module's is meant.
+        assert!(store.has_call_edge(&id("tests::t"), &id("helper")));
+    }
+
+    #[test]
+    fn union_and_extern_block_items_are_lifted() {
+        let store = Store::new();
+        let src = b"pub union U { a: u32, b: f32 }\nextern \"C\" { fn c_abs(x: i32) -> i32; }\n";
+        CodeParser::rust()
+            .parse(src, "src/lib.rs")
+            .expect("parse")
+            .apply_to(&store);
+        let u = store
+            .get_atom(&EntityId::new("code:src/lib.rs::union::U"))
+            .expect("union");
+        assert_eq!(u.kind, "union");
+        let f = store
+            .get_atom(&EntityId::new("code:src/lib.rs::function::c_abs"))
+            .expect("extern fn");
+        assert_eq!(f.refs.scope, "");
     }
 
     #[test]

@@ -13,6 +13,14 @@
 use crate::model::{CodeAtom, ReExport};
 use std::collections::HashMap;
 
+/// Where a module's items are declared: `(file, scope)`, the scope being
+/// the inline `mod` path inside the file (`""` for the file itself).
+type Unit<'a> = (&'a str, &'a str);
+
+/// `defines(file, scope, name)`: the atoms the inline module `scope` of
+/// `file` defines under `name`.
+pub(crate) type Defines<'d> = dyn Fn(&str, &str, &str) -> Vec<usize> + 'd;
+
 /// How many `pub use` hops [`RustModules::lookup`] follows. Real chains
 /// are short (`lib.rs` → `cli/mod.rs` → `cli/run/mod.rs` → the file);
 /// the cap only guards against cycles (`pub use a::*` ↔ `pub use b::*`).
@@ -36,7 +44,8 @@ pub(crate) struct ModPos {
 /// languages.
 ///
 /// `src/a/b.rs` → `a::b`, `src/a/mod.rs` → `a`, `src/lib.rs` → root.
-/// Inline `mod x { … }` blocks are not files and are not modelled.
+/// Inline `mod x { … }` blocks are not files; [`RustModules`] adds them
+/// from the scope recorded on the atoms declared inside them.
 pub(crate) fn rust_mod_pos(file_path: &str) -> Option<ModPos> {
     let rel = file_path.strip_suffix(".rs")?;
     let (krate, rel) = if let Some(i) = rel.find("/src/") {
@@ -72,12 +81,14 @@ pub(crate) struct Resolved {
     pub guessed: bool,
 }
 
-/// Module tree of every Rust file in the graph.
+/// Module tree of every Rust file in the graph, inline modules included.
 pub(crate) struct RustModules<'a> {
-    /// crate → module path → files implementing it. Usually one;
-    /// `lib.rs` and `main.rs` both implement a crate root. Nested so a
+    /// crate → module path → `(file, scope)` pairs implementing it.
+    /// Usually one; `lib.rs` and `main.rs` both implement a crate root.
+    /// `scope` is the inline module path inside the file (`""` for the
+    /// file itself), see [`crate::model::AtomRefs::scope`]. Nested so a
     /// lookup borrows its `&str` keys instead of allocating a tuple.
-    files: HashMap<String, HashMap<String, Vec<&'a str>>>,
+    files: HashMap<String, HashMap<String, Vec<Unit<'a>>>>,
     /// File → its position.
     pos: HashMap<&'a str, ModPos>,
     /// File → what it re-exports.
@@ -85,17 +96,18 @@ pub(crate) struct RustModules<'a> {
 }
 
 impl<'a> RustModules<'a> {
-    /// Index the module atoms of `atoms` that are Rust files.
-    pub(crate) fn build<'b>(atoms: impl IntoIterator<Item = &'b &'a CodeAtom>) -> Self
-    where
-        'a: 'b,
-    {
-        let mut files: HashMap<String, HashMap<String, Vec<&'a str>>> = HashMap::new();
+    /// Index the Rust files of `atoms` (their module atoms), and the
+    /// inline modules named by the scope of every other atom.
+    pub(crate) fn build(atoms: impl IntoIterator<Item = &'a CodeAtom>) -> Self {
+        let mut files: HashMap<String, HashMap<String, Vec<Unit<'a>>>> = HashMap::new();
         let mut pos = HashMap::new();
         let mut reexports = HashMap::new();
+        let mut scoped: Vec<&'a CodeAtom> = Vec::new();
         for atom in atoms {
-            let atom: &'a CodeAtom = atom;
             if atom.kind != "module" {
+                if !atom.refs.scope.is_empty() {
+                    scoped.push(atom);
+                }
                 continue;
             }
             let Some(p) = rust_mod_pos(&atom.file_path) else {
@@ -106,11 +118,36 @@ impl<'a> RustModules<'a> {
                 .or_default()
                 .entry(p.path.clone())
                 .or_default()
-                .push(atom.file_path.as_str());
+                .push((atom.file_path.as_str(), ""));
             if !atom.refs.reexports.is_empty() {
                 reexports.insert(atom.file_path.as_str(), atom.refs.reexports.as_slice());
             }
             pos.insert(atom.file_path.as_str(), p);
+        }
+        // `mod a { mod b { … } }`: an item in `a::b` makes both `a` and
+        // `a::b` modules, even when `a` declares nothing of its own.
+        for atom in scoped {
+            let Some(p) = pos.get(atom.file_path.as_str()) else {
+                continue;
+            };
+            let scope = atom.refs.scope.as_str();
+            let mut end = 0;
+            loop {
+                end = scope[end..].find("::").map_or(scope.len(), |i| end + i);
+                let inline = &scope[..end];
+                let entry = files
+                    .entry(p.krate.clone())
+                    .or_default()
+                    .entry(join(&p.path, inline))
+                    .or_default();
+                if !entry.contains(&(atom.file_path.as_str(), inline)) {
+                    entry.push((atom.file_path.as_str(), inline));
+                }
+                if end == scope.len() {
+                    break;
+                }
+                end += "::".len();
+            }
         }
         Self {
             files,
@@ -124,12 +161,31 @@ impl<'a> RustModules<'a> {
         self.pos.get(file)
     }
 
-    /// Files implementing module `path` of `krate`.
-    pub(crate) fn files(&self, krate: &str, path: &str) -> &[&'a str] {
+    /// Position of the inline module `scope` of a Rust file — the file's
+    /// own position when `scope` is empty.
+    pub(crate) fn pos_in(&self, file: &str, scope: &str) -> Option<ModPos> {
+        let p = self.pos.get(file)?;
+        Some(ModPos {
+            krate: p.krate.clone(),
+            path: join(&p.path, scope),
+            external_target: p.external_target,
+        })
+    }
+
+    /// `(file, scope)` pairs implementing module `path` of `krate`.
+    fn units(&self, krate: &str, path: &str) -> &[Unit<'a>] {
         self.files
             .get(krate)
             .and_then(|m| m.get(path))
             .map_or(&[], Vec::as_slice)
+    }
+
+    /// Files implementing module `path` of `krate` — an inline module
+    /// is implemented by the file that declares it.
+    pub(crate) fn files(&self, krate: &str, path: &str) -> Vec<&'a str> {
+        let mut out: Vec<&'a str> = self.units(krate, path).iter().map(|(f, _)| *f).collect();
+        out.dedup();
+        out
     }
 
     fn exists(&self, krate: &str, path: &str) -> bool {
@@ -185,14 +241,15 @@ impl<'a> RustModules<'a> {
 
     /// Atoms reachable as `module::name` in `krate`: defined by one of
     /// the module's files, or re-exported by it (`pub use`, `pub use *`),
-    /// followed transitively. `defines(file, name)` returns the atoms a
-    /// file itself defines under `name`.
+    /// followed transitively. `defines(file, scope, name)` returns the
+    /// atoms the inline module `scope` of `file` (the file itself for
+    /// `""`) defines under `name`.
     pub(crate) fn lookup(
         &self,
         krate: &str,
         module: &str,
         name: &str,
-        defines: &dyn Fn(&str, &str) -> Vec<usize>,
+        defines: &Defines,
     ) -> Vec<usize> {
         self.lookup_hops(krate, module, name, defines, 0)
     }
@@ -202,14 +259,17 @@ impl<'a> RustModules<'a> {
         krate: &str,
         module: &str,
         name: &str,
-        defines: &dyn Fn(&str, &str) -> Vec<usize>,
+        defines: &Defines,
         hops: u8,
     ) -> Vec<usize> {
-        let files = self.files(krate, module);
-        if files.is_empty() {
+        let units = self.units(krate, module);
+        if units.is_empty() {
             return Vec::new();
         }
-        let mut out: Vec<usize> = files.iter().flat_map(|f| defines(f, name)).collect();
+        let mut out: Vec<usize> = units
+            .iter()
+            .flat_map(|(f, scope)| defines(f, scope, name))
+            .collect();
         if !out.is_empty() || hops >= MAX_REEXPORT_HOPS {
             return out;
         }
@@ -218,7 +278,8 @@ impl<'a> RustModules<'a> {
             path: module.to_owned(),
             external_target: false,
         };
-        for file in files {
+        // Re-exports are read from file-level `pub use` only.
+        for (file, _) in units.iter().filter(|(_, scope)| scope.is_empty()) {
             for re in self.reexports.get(file).copied().unwrap_or_default() {
                 let segs: Vec<&str> = re.path.split("::").collect();
                 if re.glob {
@@ -245,11 +306,13 @@ impl<'a> RustModules<'a> {
     }
 }
 
+/// `a` + `b` → `a::b`; either side may be empty (the crate root, or a
+/// file-level scope).
 fn join(base: &str, seg: &str) -> String {
-    if base.is_empty() {
-        seg.to_owned()
-    } else {
-        format!("{base}::{seg}")
+    match (base.is_empty(), seg.is_empty()) {
+        (true, _) => seg.to_owned(),
+        (false, true) => base.to_owned(),
+        (false, false) => format!("{base}::{seg}"),
     }
 }
 
@@ -317,9 +380,8 @@ mod tests {
             module("cli/run/mod.rs", &[("run_x", "x::run_x", false)]),
             module("cli/run/x.rs", &[]),
         ];
-        let refs: Vec<&CodeAtom> = atoms.iter().collect();
-        let mods = RustModules::build(&refs);
-        let defines = |file: &str, name: &str| -> Vec<usize> {
+        let mods = RustModules::build(&atoms);
+        let defines = |file: &str, _scope: &str, name: &str| -> Vec<usize> {
             if file == "cli/run/x.rs" && name == "run_x" {
                 vec![7]
             } else {
@@ -343,8 +405,7 @@ mod tests {
             module("cli/run/x.rs", &[]),
             module("bin/tool.rs", &[]),
         ];
-        let refs: Vec<&CodeAtom> = atoms.iter().collect();
-        let mods = RustModules::build(&refs);
+        let mods = RustModules::build(&atoms);
         let x = mods.pos("cli/run/x.rs").unwrap().clone();
         let path = |segs: &[&str], from: &ModPos| mods.resolve_module(from, segs).map(|r| r.path);
         assert_eq!(path(&["super"], &x).as_deref(), Some("cli::run"));

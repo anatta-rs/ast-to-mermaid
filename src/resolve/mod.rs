@@ -372,8 +372,9 @@ struct Index<'a> {
     /// (`obj.method()`) refuse to bind to lifted methods of unrelated
     /// types — the central fix this module exists to enforce.
     methods_by_owner_name: HashMap<(&'a str, &'a str), Vec<usize>>,
-    /// Free functions by `(file, name)`: what a module defines.
-    free_fns_by_file: HashMap<(&'a str, &'a str), Vec<usize>>,
+    /// Free functions by `(file, scope, name)`: what a module — a file,
+    /// or an inline `mod` block of one — defines.
+    free_fns_by_file: HashMap<(&'a str, &'a str, &'a str), Vec<usize>>,
     /// Rust module tree, for exact `crate::a::b::f` resolution.
     rust_mods: RustModules<'a>,
     /// Re-exports of Python packages (`__init__.py`), by package name.
@@ -388,7 +389,7 @@ impl<'a> Index<'a> {
     fn build(atoms: &'a [CodeAtom], functions: &'a [&'a CodeAtom]) -> Self {
         let mut free_fns_by_name: HashMap<&str, Vec<usize>> = HashMap::new();
         let mut methods_by_owner_name: HashMap<(&str, &str), Vec<usize>> = HashMap::new();
-        let mut free_fns_by_file: HashMap<(&str, &str), Vec<usize>> = HashMap::new();
+        let mut free_fns_by_file: HashMap<(&str, &str, &str), Vec<usize>> = HashMap::new();
         for (idx, atom) in functions.iter().enumerate() {
             match &atom.parent {
                 None => {
@@ -397,7 +398,11 @@ impl<'a> Index<'a> {
                         .or_default()
                         .push(idx);
                     free_fns_by_file
-                        .entry((atom.file_path.as_str(), atom.name.as_str()))
+                        .entry((
+                            atom.file_path.as_str(),
+                            atom.refs.scope.as_str(),
+                            atom.name.as_str(),
+                        ))
                         .or_default()
                         .push(idx);
                 }
@@ -408,7 +413,7 @@ impl<'a> Index<'a> {
             }
         }
         let modules: Vec<&CodeAtom> = atoms.iter().filter(|a| a.kind == "module").collect();
-        let rust_mods = RustModules::build(&modules);
+        let rust_mods = RustModules::build(atoms);
         let mut py_reexports: HashMap<&str, Vec<&ReExport>> = HashMap::new();
         for m in &modules {
             if lang_of(&m.file_path) == "py" && !m.refs.reexports.is_empty() {
@@ -512,13 +517,15 @@ impl<'a> Index<'a> {
         // `crate::render::mermaid_to_dot` → `render/dot.rs`,
         // `super::check_ref_arg` → the parent module.
         if let Some(qualifier) = path_prefix
-            && let Some(from) = self.rust_mods.pos(caller_file)
+            && let Some(from) = self
+                .rust_mods
+                .pos_in(caller_file, &functions[caller_idx].refs.scope)
         {
             let segs: Vec<&str> = qualifier.split("::").collect();
-            if let Some(module) = self.rust_mods.resolve_module(from, &segs) {
-                let defines = |file: &str, name: &str| -> Vec<usize> {
+            if let Some(module) = self.rust_mods.resolve_module(&from, &segs) {
+                let defines = |file: &str, scope: &str, name: &str| -> Vec<usize> {
                     self.free_fns_by_file
-                        .get(&(file, name))
+                        .get(&(file, scope, name))
                         .cloned()
                         .unwrap_or_default()
                 };
