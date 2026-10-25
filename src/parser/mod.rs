@@ -188,6 +188,8 @@ impl Language {
                 "const_item",
                 "static_item",
                 "macro_definition",
+                "union_item",
+                "function_signature_item",
             ],
             Self::Python => &[
                 "function_definition",
@@ -212,7 +214,7 @@ impl Language {
     /// Map a tree-sitter node kind to a canonical atom kind string.
     fn map_node_kind(self, ts_kind: &str) -> Option<&'static str> {
         match (self, ts_kind) {
-            (Self::Rust, "function_item")
+            (Self::Rust, "function_item" | "function_signature_item")
             | (Self::Python, "function_definition")
             | (Self::Dart, "function_declaration") => Some("function"),
             // Dart's `mixin` and `extension` have no Rust/Python analogue.
@@ -231,6 +233,7 @@ impl Language {
             (Self::Rust, "const_item") => Some("const"),
             (Self::Rust, "static_item") => Some("static"),
             (Self::Rust, "macro_definition") => Some("macro"),
+            (Self::Rust, "union_item") => Some("union"),
             _ => None,
         }
     }
@@ -394,29 +397,44 @@ impl CodeParser {
             Language::Python => &queries::PYTHON.items,
             Language::Dart => &queries::DART.items,
         };
-        let mut name_to_id: HashMap<String, EntityId> = HashMap::new();
-        let mut items: Vec<(EntityId, Vec<CallSite>)> = Vec::new();
+        // Scope (inline module path) → name → item. A bare call is looked
+        // up in the caller's own scope, then in each enclosing one.
+        let mut name_to_id: HashMap<String, HashMap<String, EntityId>> = HashMap::new();
+        let mut items: Vec<(EntityId, String, Vec<CallSite>)> = Vec::new();
 
         let mut cursor = QueryCursor::new();
         let mut matches = cursor.matches(items_query, root, text.as_bytes());
         while let Some(m) = matches.next() {
             for capture in m.captures {
                 let item_node = capture.node;
+                // Rust items are matched at any depth; only those reached
+                // through inline `mod` blocks are kept. Python and Dart
+                // queries are anchored to the file root.
+                let scope = match self.language {
+                    Language::Rust => match rust::item_scope(&item_node, text) {
+                        Some(scope) => scope,
+                        None => continue,
+                    },
+                    Language::Python | Language::Dart => String::new(),
+                };
                 let Some((atom, call_names)) =
-                    extract_item(&item_node, text, file_path, self.language, &imports)
+                    extract_item(&item_node, text, file_path, self.language, &imports, &scope)
                 else {
                     continue;
                 };
                 let item_id = atom.id.clone();
                 let item_name = atom.name.clone();
-                name_to_id.insert(item_name.clone(), item_id.clone());
+                name_to_id
+                    .entry(scope.clone())
+                    .or_default()
+                    .insert(item_name.clone(), item_id.clone());
 
                 edges.push(Edge::new(
                     module_id.clone(),
                     item_id.clone(),
                     EdgeKind::Contains,
                 ));
-                items.push((item_id.clone(), call_names));
+                items.push((item_id.clone(), scope.clone(), call_names));
                 atoms.push(atom);
 
                 // For Rust `impl` blocks and Python `class` definitions,
@@ -467,11 +485,16 @@ impl CodeParser {
                             file_path,
                             language: self.language,
                             imports: &imports,
+                            scope: &scope,
                         },
                         &mut atoms,
                         &mut edges,
                     );
-                    items.extend(methods);
+                    items.extend(
+                        methods
+                            .into_iter()
+                            .map(|(id, calls)| (id, scope.clone(), calls)),
+                    );
                 }
             }
         }
@@ -484,12 +507,12 @@ impl CodeParser {
         // that a body calls the same function twice, while the views
         // that only care about connectivity see one edge as before.
         let mut edge_sites: BTreeMap<(EntityId, EntityId), Vec<u16>> = BTreeMap::new();
-        for (caller_id, call_sites) in items {
+        for (caller_id, scope, call_sites) in items {
             for site in call_sites {
                 if site.name.contains("::") {
                     continue;
                 }
-                if let Some(callee_id) = name_to_id.get(&site.name)
+                if let Some(callee_id) = lookup_in_scope(&name_to_id, &scope, &site.name)
                     && *callee_id != caller_id
                 {
                     edge_sites
@@ -518,6 +541,7 @@ fn extract_item(
     file_path: &str,
     language: Language,
     imports: &Imports,
+    scope: &str,
 ) -> Option<(CodeAtom, Vec<CallSite>)> {
     // Python decorators — unwrap inner definition iteratively. Tree-sitter
     // can in principle hand us arbitrarily nested `decorated_definition`
@@ -547,14 +571,7 @@ fn extract_item(
     let line_start = u32::try_from(node.start_position().row).unwrap_or(u32::MAX) + 1;
     let line_end = u32::try_from(node.end_position().row).unwrap_or(u32::MAX) + 1;
 
-    // Signature: first non-brace line of the item text.
-    let signature = item_text
-        .lines()
-        .next()
-        .unwrap_or_default()
-        .trim_end_matches('{')
-        .trim()
-        .to_owned();
+    let signature = signature_of(&node, source, atom_kind == "function");
 
     let doc = doc_for(language, &node, source);
 
@@ -576,7 +593,10 @@ fn extract_item(
     };
     let types = type_refs(&node, source, language, imports);
 
-    let item_id = EntityId::new(format!("code:{file_path}::{atom_kind}::{item_name}"));
+    let item_id = EntityId::new(format!(
+        "code:{file_path}::{atom_kind}::{}{item_name}",
+        scope_prefix(scope)
+    ));
 
     let atom = CodeAtom {
         id: item_id,
@@ -593,6 +613,7 @@ fn extract_item(
         parent: None,
         refs: AtomRefs {
             types,
+            scope: scope.to_owned(),
             ..AtomRefs::default()
         },
     };
@@ -623,6 +644,8 @@ struct MethodCtx<'a> {
     file_path: &'a str,
     language: Language,
     imports: &'a Imports,
+    /// Inline module the container sits in (see [`AtomRefs::scope`]).
+    scope: &'a str,
 }
 
 /// Walk the body of a method container (Rust `impl_item` or Python
@@ -661,6 +684,7 @@ fn extract_methods(
         file_path,
         language,
         imports,
+        scope,
     } = *ctx;
 
     // The type `self` stands for, generics dropped (`Store<T>` → `Store`):
@@ -693,19 +717,14 @@ fn extract_methods(
             let content_hash = format!("sha256:{}", hex_sha256(item_text.as_bytes()));
             let line_start = u32::try_from(inner.start_position().row).unwrap_or(u32::MAX) + 1;
             let line_end = u32::try_from(inner.end_position().row).unwrap_or(u32::MAX) + 1;
-            let signature = item_text
-                .lines()
-                .next()
-                .unwrap_or_default()
-                .trim_end_matches('{')
-                .trim()
-                .to_owned();
+            let signature = signature_of(&inner, source, true);
             let doc = doc_for(language, &inner, source);
             let extracted = extract_calls(&inner, source, language, imports, Some(owner_bare));
             let types = type_refs(&inner, source, language, imports);
 
             let id = EntityId::new(format!(
-                "code:{file_path}::function::{container_name}::{method_name}"
+                "code:{file_path}::function::{}{container_name}::{method_name}",
+                scope_prefix(scope)
             ));
             let atom = CodeAtom {
                 id: id.clone(),
@@ -722,6 +741,7 @@ fn extract_methods(
                 parent: Some(parent_type.to_owned()),
                 refs: AtomRefs {
                     types,
+                    scope: scope.to_owned(),
                     ..AtomRefs::default()
                 },
             };
@@ -842,13 +862,72 @@ fn signature_name(node: &Node, source: &str) -> Option<String> {
         .find_map(|child| signature_name(&child, source))
 }
 
+// ── Inline module scope ──────────────────────────────────────────────────────
+
+/// `inner` → `inner::`, `""` → `""`: the segment an inline module adds to
+/// an atom id, so `inner::f` and a file-level `f` never share one.
+fn scope_prefix(scope: &str) -> String {
+    if scope.is_empty() {
+        String::new()
+    } else {
+        format!("{scope}::")
+    }
+}
+
+/// The item a bare name denotes from `scope`: declared in that inline
+/// module, else in the nearest enclosing one. Inside a `mod` block a bare
+/// name that is not declared there compiles only through an import, and
+/// `use super::*` — the shape of every `mod tests` — is the import that
+/// brings in the enclosing module's items.
+fn lookup_in_scope<'m>(
+    by_scope: &'m HashMap<String, HashMap<String, EntityId>>,
+    scope: &str,
+    name: &str,
+) -> Option<&'m EntityId> {
+    let mut cur = scope;
+    loop {
+        if let Some(id) = by_scope.get(cur).and_then(|m| m.get(name)) {
+            return Some(id);
+        }
+        if cur.is_empty() {
+            return None;
+        }
+        cur = cur.rsplit_once("::").map_or("", |(parent, _)| parent);
+    }
+}
+
+// ── Signature ────────────────────────────────────────────────────────────────
+
+/// Declaration line of an item: its first line, cut where a function's
+/// body starts so `fn f() -> u32 { 1 }` reads `fn f() -> u32`, not the
+/// body. Non-functions keep the whole first line (a one-line struct's
+/// fields are part of what it declares).
+fn signature_of(node: &Node, source: &str, is_function: bool) -> String {
+    let text = node.utf8_text(source.as_bytes()).unwrap_or_default();
+    let head = if is_function
+        && let Some(body) = node.child_by_field_name("body")
+        && let Some(cut) = body.start_byte().checked_sub(node.start_byte())
+    {
+        text.get(..cut).unwrap_or(text)
+    } else {
+        text
+    };
+    head.lines()
+        .next()
+        .unwrap_or_default()
+        .trim_end_matches('{')
+        .trim()
+        .to_owned()
+}
+
 // ── Doc + call dispatch ──────────────────────────────────────────────────────
 
 fn doc_for(language: Language, node: &Node, source: &str) -> String {
     match language {
         // Dart documents with `///` above the declaration — the same shape
         // Rust uses, so the Rust scanner serves both.
-        Language::Rust | Language::Dart => rust::doc_comment(source, node.start_position().row),
+        Language::Rust => rust::doc_comment(source, rust::doc_anchor_row(node)),
+        Language::Dart => rust::doc_comment(source, node.start_position().row),
         Language::Python => python::docstring(node, source),
     }
 }

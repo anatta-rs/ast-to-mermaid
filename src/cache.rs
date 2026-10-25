@@ -177,7 +177,13 @@ const SCHEMA_VERSION: u32 = 8;
 /// receivers typed `&dyn T` / `&impl T` / `Box<dyn T>` / a generic bounded
 /// by `T` (`<S: T>`, `where S: T`, struct and impl generics) emit `T::m`.
 /// Cached units hold neither.
-const GRAMMAR_VERSION: u32 = 10;
+///
+/// `11`: items inside inline `mod x { … }` blocks (and `extern` blocks,
+/// and `union`s) are lifted, with the inline module path recorded as
+/// `refs.scope` and in their id. Rust docs survive an attribute between
+/// the comment and the item, and a function's signature stops at its
+/// body. Cached units hold none of it.
+const GRAMMAR_VERSION: u32 = 11;
 
 /// Compute the cache version string written to `<root>/version`.
 fn cache_version() -> String {

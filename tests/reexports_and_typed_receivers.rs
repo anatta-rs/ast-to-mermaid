@@ -126,6 +126,42 @@ fn super_path_resolves_to_the_parent_module() {
 }
 
 #[test]
+fn inline_module_paths_resolve_inside_the_file() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let root = tmp.path();
+    write(
+        root,
+        "src/lib.rs",
+        "pub fn helper() {}\n\
+         pub fn entry() { inner::leaf(); }\n\
+         pub mod inner {\n\
+             pub fn leaf() { super::helper(); }\n\
+             pub mod deep { pub fn bottom() { crate::inner::leaf(); } }\n\
+         }\n\
+         #[cfg(test)]\n\
+         mod tests { #[test] fn t() { super::entry(); } }\n",
+    );
+    write(
+        root,
+        "src/other.rs",
+        "pub fn far() { crate::inner::deep::bottom(); }\n",
+    );
+
+    let store = build_store(root);
+    let f = |s: &str| format!("code:src/lib.rs::function::{s}");
+    assert!(store.has_call_edge(&id(&f("entry")), &id(&f("inner::leaf"))));
+    assert!(store.has_call_edge(&id(&f("inner::leaf")), &id(&f("helper"))));
+    assert!(store.has_call_edge(&id(&f("inner::deep::bottom")), &id(&f("inner::leaf"))));
+    assert!(store.has_call_edge(&id(&f("tests::t")), &id(&f("entry"))));
+    assert!(store.has_call_edge(
+        &id("code:src/other.rs::function::far"),
+        &id(&f("inner::deep::bottom")),
+    ));
+    // `inner` is a module of this crate, never an external dependency.
+    assert!(externs(&store).is_empty(), "{:?}", externs(&store));
+}
+
+#[test]
 fn typed_receivers_bind_to_the_declared_type() {
     let tmp = tempfile::tempdir().expect("tmp");
     let root = tmp.path();

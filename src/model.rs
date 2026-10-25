@@ -259,13 +259,23 @@ pub struct AtomRefs {
     /// full path; anything else is the bare name.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub types: Vec<String>,
+    /// Rust only: path of the inline `mod x { … }` the atom is declared
+    /// in, relative to its file (`inner`, `tests`, `a::b`). Empty at file
+    /// level. The resolver joins it to the file's module path, so
+    /// `super::f` and `inner::f` are read from the module the atom
+    /// actually sits in.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub scope: String,
 }
 
 impl AtomRefs {
     /// Whether no reference was recorded.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.imports.is_empty() && self.reexports.is_empty() && self.types.is_empty()
+        self.imports.is_empty()
+            && self.reexports.is_empty()
+            && self.types.is_empty()
+            && self.scope.is_empty()
     }
 }
 
